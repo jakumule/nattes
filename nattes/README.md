@@ -1,1 +1,0 @@
-Simple message queue inspired by NATS

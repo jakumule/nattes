@@ -36,3 +36,14 @@ Cargo.lock
 # .nfs files are created when an open file is removed but is still being accessed
 .nfs*
 
+
+# Devenv
+.devenv*
+devenv.local.nix
+devenv.local.yaml
+
+# direnv
+.direnv
+
+# pre-commit
+.pre-commit-config.yaml

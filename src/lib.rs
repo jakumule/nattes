@@ -1,0 +1,98 @@
+//! Typesafe subject-based message queue inspired by NATS.
+//!
+//! Declare the tree with [`events!`](crate::events), then walk down it with
+//! [`topic!`](crate::topic) to get a [`Channel`] on any part of it. A channel
+//! is a bus rooted at that part: hand a `Channel<events::git::Topic>` to a
+//! component and it publishes and subscribes relative to `git`.
+//!
+//! ```
+//! use futures::StreamExt;
+//! use nattes::channel;
+//! use nattes::{events, topic};
+//!
+//! pub struct PushMsg;
+//! pub struct DeleteMsg;
+//!
+//! events! {
+//!     pub mod events {
+//!         git { push: PushMsg },
+//!         user { id(u32) { delete: DeleteMsg } },
+//!     }
+//! }
+//!
+//! # fn main() {
+//! # futures::executor::block_on(async {
+//! let bus = channel!(events);
+//! let git = topic!(bus, git);                       // git
+//! let pushes = topic!(bus, git.push);               // git.push
+//! let alice_deletes = topic!(bus, user.id(7).delete); // user.7.delete
+//!
+//! let mut git_sub = git.subscribe().await;                     // git.>
+//! let mut deletes = topic!(bus, user.id().delete).subscribe().await; // user.*.delete
+//!
+//! pushes.publish(PushMsg).await;
+//! alice_deletes.publish(DeleteMsg).await;
+//!
+//! assert!(matches!(*git_sub.next().await.unwrap(), events::git::Topic::push(_)));
+//! assert_eq!(deletes.next().await.unwrap().params(), (7,));
+//! # });
+//! # }
+//! ```
+//!
+//! A channel with a wildcard can't publish:
+//!
+//! ```compile_fail,E0599
+//! # use nattes::channel;
+//! # use nattes::{events, topic};
+//! # pub struct DeleteMsg;
+//! # events! { pub mod events { user { id(u32) { delete: DeleteMsg } } } }
+//! # async fn f() {
+//! let bus = channel!(events);
+//! topic!(bus, user.id().delete).publish(DeleteMsg).await;
+//! # }
+//! # fn main() {}
+//! ```
+//!
+//! and each path must start where the channel is:
+//!
+//! ```compile_fail,E0599
+//! # use nattes::channel;
+//! # use nattes::{events, topic};
+//! # pub struct PushMsg;
+//! # events! { pub mod events { git { push: PushMsg }, user { new: PushMsg } } }
+//! # fn main() {
+//! let users = topic!(channel!(events), user);
+//! topic!(users, git.push);
+//! # }
+//! ```
+//!
+//! Parameters are routed by value, so their type must be `Eq + Hash`; floats
+//! can't be parameters:
+//!
+//! ```compile_fail,E0277
+//! # use nattes::events;
+//! # pub struct Reading;
+//! events! { pub mod sensors { reading(f64): Reading } }
+//! # fn main() {}
+//! ```
+
+mod bus;
+mod channel;
+mod macros;
+mod nav;
+mod request;
+mod subscription;
+#[cfg(test)]
+mod tests;
+mod tree;
+
+pub use bus::{Overflow, DEFAULT_BUFFER};
+pub use channel::Channel;
+#[doc(hidden)]
+pub use nav::{Append, AppendParams, ParamStep, Plain, Prism};
+pub use nav::{IntoChannel, Is, Navigable, Param, Wild};
+pub use request::{BusError, Request};
+pub use subscription::{Msg, Subscription, SubscriptionBuilder};
+#[doc(hidden)]
+pub use tree::Step;
+pub use tree::{subject, Node, ParamValue};
