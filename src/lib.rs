@@ -76,8 +76,8 @@
 //! # fn main() {}
 //! ```
 //!
-//! Queue groups are declared on a topic, with `[ … ]` in a subtree
-//! or after a leaf's message type. Each value is a group, so
+//! Queue groups are declared on a topic, with `[ … ]` right after its name:
+//! `git [Mailer] { … }`, `push [Indexer(u32)]: Msg`. Each value is a group, so
 //! `Indexer(0)` and `Indexer(1)` are two groups:
 //!
 //! ```
@@ -85,9 +85,8 @@
 //! # pub struct PushMsg;
 //! events! {
 //!     pub mod events {
-//!         git {
-//!             push: PushMsg [Indexer(u32), Audit],
-//!             [Mailer],
+//!         git [Mailer] {
+//!             push [Indexer(u32), Audit]: PushMsg,
 //!         },
 //!     }
 //! }
@@ -114,7 +113,7 @@
 //! ```compile_fail,E0277
 //! # use nattes::{channel, events, topic};
 //! # pub struct PushMsg;
-//! # events! { pub mod events { git { push: PushMsg, [Mailer] } } }
+//! # events! { pub mod events { git [Mailer] { push: PushMsg } } }
 //! # async fn f() {
 //! let bus = channel!(events);
 //! topic!(bus, git.push).subscribe().queue(events::git::Queue::Mailer).await;
@@ -140,7 +139,7 @@
 //! ```compile_fail,E0308
 //! # use nattes::{channel, events, topic};
 //! # pub struct PushMsg;
-//! # events! { pub mod events { git { push: PushMsg [Indexer(u32)] } } }
+//! # events! { pub mod events { git { push [Indexer(u32)]: PushMsg } } }
 //! # async fn f() {
 //! let bus = channel!(events);
 //! topic!(bus, git.push).subscribe().queue(events::git::PushQueue::Indexer("0")).await;

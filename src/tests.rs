@@ -44,29 +44,23 @@ crate::events! {
 crate::events! {
     #[derive(Debug)]
     #[allow(dead_code)]
-    pub mod events {
-        git {
-            push: GitPushMsg [#![derive(Debug)] Workers, Shard(u32)],
+    pub mod events [Workers] {
+        git [Workers] {
+            push [#![derive(Debug)] Workers, Shard(u32)]: GitPushMsg,
             pull: GitPullMsg,
             new(Uuid): GitNewMsg,
-            count(u32): U32Event,
+            count(u32) [Workers]: U32Event,
             fetch: Request<GitFetchMsg, FetchAck>,
-            [Workers],
         },
         user {
             new: UserNewMsg,
-            id(Uuid) {
+            id(Uuid) [Workers] {
                 update: UserUpdateMsg,
                 delete: UserDeleteMsg,
-                [Workers],
             },
         },
-        repo {
-            id(u64) {
-                delete: RepoDeleteMsg,
-            },
-        },
-        random.arrow.more: VeryNestedMsg,
+        repo.id(u64) [Workers].delete: RepoDeleteMsg,
+        random.arrow [Workers].more: VeryNestedMsg,
         other = other,
     }
 }
@@ -782,4 +776,44 @@ async fn queue_groups_are_forgotten_with_their_last_member() {
     assert_eq!(pushes.core.group_count(), 1);
     drop(w2);
     assert_eq!(pushes.core.group_count(), 0);
+}
+
+#[tokio::test]
+async fn queue_groups_can_be_declared_on_any_node() {
+    let bus = channel!(events);
+    let mut subs = [
+        drain_on(bus.subscribe().queue(events::Queue::Workers).await),
+        drain_on(
+            topic!(bus, git.count(7))
+                .subscribe()
+                .queue(events::git::CountQueue::Workers)
+                .await,
+        ),
+        drain_on(
+            topic!(bus, repo.id())
+                .subscribe()
+                .queue(events::repo::id::Queue::Workers)
+                .await,
+        ),
+        drain_on(
+            topic!(bus, random.arrow)
+                .subscribe()
+                .queue(events::random::arrow::Queue::Workers)
+                .await,
+        ),
+    ];
+
+    topic!(bus, git.count(7)).publish(U32Event).await;
+    topic!(bus, repo.id(1).delete).publish(RepoDeleteMsg).await;
+    topic!(bus, random.arrow.more).publish(VeryNestedMsg).await;
+
+    let counts: Vec<usize> = subs.iter_mut().map(|drain| drain()).collect();
+    // the root group gets all three
+    assert_eq!(counts, [3, 1, 1, 1]);
+}
+
+/// A closure counting what is queued on `sub`, to hold subscriptions of
+/// different types side by side.
+fn drain_on<T: 'static, P: 'static>(mut sub: Subscription<T, P>) -> Box<dyn FnMut() -> usize> {
+    Box::new(move || drain(&mut sub).len())
 }

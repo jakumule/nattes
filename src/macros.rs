@@ -69,9 +69,8 @@ macro_rules! topic {
 ///         },
 ///         random.arrow.more: DeepMsg, // `a.x` is `a { x }`
 ///         other = other,              // mount the tree of another events! module
-///         jobs {
-///             run: JobMsg [Shard(u32)], // queue groups of `jobs.run`
-///             [Mailer],                      // queue groups of `jobs`
+///         jobs [Mailer] {             // queue groups of `jobs`
+///             run [Shard(u32)]: JobMsg, // queue groups of `jobs.run`
 ///         },
 ///     }
 /// }
@@ -84,13 +83,15 @@ macro_rules! topic {
 ///   `Topic::PullRequest`.
 /// - a type `Steps` with one method per child, used by
 ///   [`topic!`](crate::topic).
-/// - for queue groups `[ … ]` in the level, an enum `Queue`,
-///   `events::jobs::Queue`, and for a leaf `run: Msg [ … ]`, an enum named
-///   after it, `events::jobs::RunQueue`. Both derive
+/// - for queue groups `[ … ]` right after a subtree's name (`jobs [Mailer] {`),
+///   an enum `Queue` in its module, `events::jobs::Queue`, and for a leaf
+///   (`run [Shard(u32)]: JobMsg`) an enum named after it,
+///   `events::jobs::RunQueue`. Both derive
 ///   `Clone + PartialEq + Eq + Hash`; inner attributes such as
-///   `[#![derive(Debug)] A, B]` are added. Their values can only be joined
-///   on the topic
-///   that declares them, with [`queue`](crate::SubscriptionBuilder::queue).
+///   `[#![derive(Debug)] A, B]` are added. Their values can only be joined on
+///   the topic that declares them, with
+///   [`queue`](crate::SubscriptionBuilder::queue). The root's groups go on the
+///   `mod` line: `pub mod events [ … ] { … }`.
 ///   A leaf's enum is also the third type parameter of its channel:
 ///   `Channel<JobMsg, (), events::jobs::RunQueue>`.
 ///
@@ -146,15 +147,11 @@ macro_rules! events {
         $($e)*
     };
 
-    // ---------- queue groups of this level:  [Mailer, Indexer(u32)] ----------
-    (@munch $attrs:tt $v:tt [$($e:tt)*] $a:tt $s:tt
-        [$($gv:tt)*] $(, $($rest:tt)*)?) => {
-        $crate::events!(@munch $attrs
-            $v
-            [$($e)* $crate::events!(@group Topic Queue { $($gv)* });]
-            $a
-            $s
-            $($($rest)*)?);
+    // ---------- queue groups:  `git [Mailer] { … }`, `push [Indexer(u32)]: Msg` ----------
+    // `$groups` is `[]` or `[[…]]`: the queue groups of a level, if any.
+    (@groups $scope:ident $g:ident []) => {};
+    (@groups $scope:ident $g:ident [[$($gv:tt)*]]) => {
+        $crate::events!(@group $scope $g { $($gv)* });
     };
     (@group $scope:ident $g:ident { $(#![$gm:meta])* $($gv:ident $(($gp:ty))?),* $(,)? }) => {
         $(#[$gm])*
@@ -165,12 +162,15 @@ macro_rules! events {
         impl $crate::InScope<$scope> for $g {}
     };
 
-    // ---------- `a.rest` is sugar for `a { rest }` ----------
+    // ---------- `a.rest` is sugar for `a { rest }`, also `a(T).rest`, `a [G].rest`, `a(T) [G].rest` ----------
     (@munch $attrs:tt $v:tt $e:tt $a:tt $s:tt $var:ident . $($rest:tt)*) => {
         $crate::events!(@chain $attrs $v $e $a $s [$var] [] $($rest)*);
     };
     (@munch $attrs:tt $v:tt $e:tt $a:tt $s:tt $var:ident $p:tt . $($rest:tt)*) => {
         $crate::events!(@chain $attrs $v $e $a $s [$var $p] [] $($rest)*);
+    };
+    (@munch $attrs:tt $v:tt $e:tt $a:tt $s:tt $var:ident $p:tt $g:tt . $($rest:tt)*) => {
+        $crate::events!(@chain $attrs $v $e $a $s [$var $p $g] [] $($rest)*);
     };
     (@chain $attrs:tt $v:tt $e:tt $a:tt $s:tt [$($head:tt)*] [$($acc:tt)*] , $($rest:tt)*) => {
         $crate::events!(@munch $attrs $v $e $a $s $($head)* { $($acc)* }, $($rest)*);
@@ -206,12 +206,12 @@ macro_rules! events {
         }
     };
 
-    // ---------- subtree:  git { ... } ----------
+    // ---------- subtree:  git { ... }, git [Mailer] { ... } ----------
     (@munch $attrs:tt [$($v:tt)*] [$($e:tt)*] [$($a:tt)*] [$($s:tt)*]
-        $var:ident { $($inner:tt)* } $(, $($rest:tt)*)?) => {
+        $var:ident $([$($gv:tt)*])? { $($inner:tt)* } $(, $($rest:tt)*)?) => {
         $crate::events!(@munch $attrs
             [$($v)* [<$var:camel>]($var::Topic),]
-            [$($e)* $crate::events!(@module $attrs pub $var { $($inner)* });]
+            [$($e)* $crate::events!(@module $attrs [$([$($gv)*])?] pub $var { $($inner)* });]
             [$($a)*
                 Topic::[<$var:camel>](x) => $crate::Step {
                     name: stringify!($var), param: None, next: Some(x),
@@ -225,12 +225,12 @@ macro_rules! events {
             $($($rest)*)?);
     };
 
-    // ---------- param subtree:  id(Uuid) { ... } ----------
+    // ---------- param subtree:  id(Uuid) { ... }, id(Uuid) [Oncall] { ... } ----------
     (@munch $attrs:tt [$($v:tt)*] [$($e:tt)*] [$($a:tt)*] [$($s:tt)*]
-        $var:ident ($p:ty) { $($inner:tt)* } $(, $($rest:tt)*)?) => {
+        $var:ident ($p:ty) $([$($gv:tt)*])? { $($inner:tt)* } $(, $($rest:tt)*)?) => {
         $crate::events!(@munch $attrs
             [$($v)* [<$var:camel>]($p, $var::Topic),]
-            [$($e)* $crate::events!(@module $attrs pub $var { $($inner)* });]
+            [$($e)* $crate::events!(@module $attrs [$([$($gv)*])?] pub $var { $($inner)* });]
             [$($a)*
                 Topic::[<$var:camel>](p, x) => $crate::Step {
                     name: stringify!($var), param: Some(p as &dyn $crate::ParamValue), next: Some(x),
@@ -267,11 +267,11 @@ macro_rules! events {
             $($($rest)*)?);
     };
 
-    // ---------- leaf with queue groups:  push: GitPushMsg [Indexer(u32)] ----------
+    // ---------- leaf with queue groups:  push [Indexer(u32)]: GitPushMsg ----------
     // The group enum is also the leaf's topic type: the message type may be
     // used by other leaves.
     (@munch $attrs:tt [$($v:tt)*] [$($e:tt)*] [$($a:tt)*] [$($s:tt)*]
-        $var:ident : $t:ty [$($gv:tt)*]
+        $var:ident [$($gv:tt)*] : $t:ty
         $(, $($rest:tt)*)?) => {
         $crate::events!(@munch $attrs
             [$($v)* [<$var:camel>]($t),]
@@ -293,9 +293,9 @@ macro_rules! events {
             $($($rest)*)?);
     };
 
-    // ---------- param leaf with queue groups:  new(Uuid): GitNewMsg [Shard(u32)] ----------
+    // ---------- param leaf with queue groups:  new(Uuid) [Shard(u32)]: GitNewMsg ----------
     (@munch $attrs:tt [$($v:tt)*] [$($e:tt)*] [$($a:tt)*] [$($s:tt)*]
-        $var:ident ($p:ty) : $t:ty [$($gv:tt)*]
+        $var:ident ($p:ty) [$($gv:tt)*] : $t:ty
         $(, $($rest:tt)*)?) => {
         $crate::events!(@munch $attrs
             [$($v)* [<$var:camel>]($p, $t),]
@@ -321,7 +321,6 @@ macro_rules! events {
             ]
             $($($rest)*)?);
     };
-
 
     // ---------- leaf:  push: GitPushMsg ----------
     (@munch $attrs:tt [$($v:tt)*] $e:tt [$($a:tt)*] [$($s:tt)*]
@@ -365,16 +364,17 @@ macro_rules! events {
     };
 
     // ---------- one level = one module ----------
-    (@module $attrs:tt $vis:vis $name:ident { $($body:tt)* }) => {
+    (@module $attrs:tt $groups:tt $vis:vis $name:ident { $($body:tt)* }) => {
         $vis mod $name {
             #[allow(unused_imports)]
             use super::*;
+            $crate::events!(@groups Topic Queue $groups);
             $crate::events!(@munch $attrs [] [] [] [] $($body)*);
         }
     };
 
     // ---------- entry ----------
-    ($(#[$m:meta])* $vis:vis mod $name:ident { $($body:tt)* }) => {
-        $crate::events!(@module [$(#[$m])*] $vis $name { $($body)* });
+    ($(#[$m:meta])* $vis:vis mod $name:ident $([$($gv:tt)*])? { $($body:tt)* }) => {
+        $crate::events!(@module [$(#[$m])*] [$([$($gv)*])?] $vis $name { $($body)* });
     };
 }

@@ -15,7 +15,7 @@ pub struct DeleteMsg;
 
 events! {
     pub mod events {
-        git { push: PushMsg [Workers] },
+        git { push [Workers]: PushMsg },
         user { id(u32) { delete: DeleteMsg } },
     }
 }

@@ -74,7 +74,7 @@ pub struct DeleteMsg;
 events! {
     #[derive(Debug)]
     pub mod events {
-        git {
+        git [Mailer] {
             push: PushMsg,
         },
         user {
@@ -115,16 +115,14 @@ events! {
         },
         user {
             new: UserNewMsg,            // same name as in git: fine
-            id(Uuid) {                  // parameter, then subtree
+            id(Uuid) [Oncall] {         // parameter, queue groups, then subtree
                 update: UserUpdateMsg,
                 delete: UserDeleteMsg,
-                [Oncall],               // queue groups of user.<id>
             },
         },
         random.arrow.more: DeepMsg,     // `a.x` is `a { x }`
-        jobs {
-            run: JobMsg [Shard(u32)],   // queue groups of jobs.run
-            [Mailer],                   // queue groups of jobs
+        jobs [Mailer] {                 // queue groups of jobs
+            run [Shard(u32)]: JobMsg,   // queue groups of jobs.run
         },
         other = other,                  // mount the tree of another events! module
     }
@@ -160,8 +158,7 @@ the `Topic` variants: `pull_request` is `Topic::PullRequest`. Rust keywords such
 | `name(Type) { … }` | parameter, then subtree, in module `name` | `Name(Type, name::Topic)` |
 | `name.…` | subtree with a single child, no braces | same as `name { … }` |
 | `name = path::to::module` | mount the tree of another `events!` | `Name(path::to::module::Topic)` |
-| `[A, B(Type)]` | queue groups of this level, enum `Queue` | none |
-| `name: Msg [ … ]` | leaf with queue groups, enum `NameQueue` | `Name(Msg)` |
+| `name [A, B(Type)] …` | queue groups, right after the name (and parameter); enum `Queue` in a subtree's module, `NameQueue` for a leaf | unchanged |
 
 Each module also gets a `Steps` type with one method per child, which is what
 `topic!` uses to navigate (see below).
@@ -280,18 +277,18 @@ while let Some(msg) = sub.next().await {
 
 ## Queue groups
 
-Queue groups are declared in `events!` on the topic they belong to: with
-`[ … ]` inside a subtree, or with `[ … ]` after a leaf's message type. Like
-`Topic`, the generated enum has a fixed name in the level's module: `Queue` for
-the level, and the leaf's name followed by `Queue` for a leaf (`push` gives
-`PushQueue`). Each of its values is one group:
+Queue groups are declared in `events!` on the topic they belong to, with `[ … ]`
+right after its name (after the parameter, if it has one), in chains too:
+`user.id(Uuid) [Oncall].delete: Msg`. Like `Topic`, the generated enum has a
+fixed name: `Queue` in the module of a subtree (and of the root, with
+`pub mod events [ … ] { … }`), and for a leaf its name followed by `Queue`, in its
+parent's module (`push` gives `PushQueue`). Each of its values is one group:
 
 ```rust
 events! {
     pub mod events {
-        git {
-            push: GitPushMsg [Indexer(u32), Audit],
-            [Mailer],
+        git [Mailer] {
+            push [Indexer(u32), Audit]: GitPushMsg,
         },
     }
 }
