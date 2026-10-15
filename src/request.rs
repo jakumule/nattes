@@ -7,7 +7,8 @@
 
 use crate::bus::lock;
 use crate::Channel;
-use futures::{Stream, StreamExt};
+use futures::stream::FusedStream;
+use futures::Stream;
 use std::fmt;
 use std::ops::Deref;
 use std::pin::Pin;
@@ -17,7 +18,7 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum BusError {
     #[error("No subscriber is listening on this topic")]
     NoResponders,
@@ -141,11 +142,33 @@ impl<RP> Stream for Replies<RP> {
     }
 }
 
+impl<RP> FusedStream for Replies<RP> {
+    fn is_terminated(&self) -> bool {
+        self.rx.is_none()
+    }
+}
+
+impl<RP> fmt::Debug for Replies<RP> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Replies")
+            .field("remaining", &self.remaining)
+            .finish()
+    }
+}
+
 /// A channel whose leaf type is `Request<RQ, RP>` is explicitly request-reply:
 /// publishers send an `RQ` and get an `RP` back; subscribers receive the
 /// `Request` (derefs to `RQ`) and call [`Request::respond`].
 impl<RQ: 'static, RP: Send + 'static, S> Channel<Request<RQ, RP>, (), S> {
     /// Send `payload` and wait for the first reply from a subscriber.
+    ///
+    /// It is delivered like [`publish`](Channel::publish) does it: to every
+    /// matching subscriber and one member per queue group. Later replies are
+    /// discarded. Fails with [`BusError::NoResponders`] if no subscription
+    /// queued it, and with [`BusError::NoReply`] once every receiver dropped it
+    /// without answering, including when it was lost from a full buffer or a
+    /// dropped subscription. Waits as long as a receiver holds the request:
+    /// prefer [`request_timeout`](Self::request_timeout).
     pub async fn request(&self, payload: RQ) -> Result<RP, BusError> {
         let (request, rx) = Request::new(payload);
         let event = self.to_event(request);
@@ -156,7 +179,9 @@ impl<RQ: 'static, RP: Send + 'static, S> Channel<Request<RQ, RP>, (), S> {
         rx.await.map_err(|_| BusError::NoReply)
     }
 
-    /// [`request`](Self::request) giving up after `timeout`.
+    /// [`request`](Self::request) giving up after `timeout`, which covers both
+    /// delivery and the reply. After a [`BusError::Timeout`] the request may
+    /// still be handled, but its reply is discarded.
     /// Needs a tokio runtime with the timer enabled.
     pub async fn request_timeout(&self, payload: RQ, timeout: Duration) -> Result<RP, BusError> {
         tokio::time::timeout(timeout, self.request(payload))
@@ -167,7 +192,11 @@ impl<RQ: 'static, RP: Send + 'static, S> Channel<Request<RQ, RP>, (), S> {
     /// Send `payload` to every subscriber and stream their replies, one per
     /// responder (a queue group counts as one responder).
     ///
-    /// The stream ends once every responder answered or dropped the request.
+    /// It is delivered like [`publish`](Channel::publish) does it, and expects
+    /// one reply from each subscription that queued it. The stream ends once
+    /// every responder answered or dropped the request, including when it was
+    /// lost from a full buffer or a dropped subscription. Fails with
+    /// [`BusError::NoResponders`] if no subscription queued it.
     pub async fn scatter(&self, payload: RQ) -> Result<Replies<RP>, BusError> {
         let (request, rx) = Request::scattered(payload);
         let event = self.to_event(request);
@@ -179,20 +208,6 @@ impl<RQ: 'static, RP: Send + 'static, S> Channel<Request<RQ, RP>, (), S> {
             rx: Some(rx),
             remaining,
         })
-    }
-
-    /// [`scatter`](Self::scatter) and collect the replies, returning what came
-    /// back by `timeout`. Needs a tokio runtime with the timer enabled.
-    pub async fn gather(&self, payload: RQ, timeout: Duration) -> Result<Vec<RP>, BusError> {
-        let deadline = tokio::time::Instant::now() + timeout;
-        let mut replies = tokio::time::timeout_at(deadline, self.scatter(payload))
-            .await
-            .map_err(|_| BusError::Timeout)??;
-        let mut gathered = Vec::with_capacity(replies.remaining());
-        while let Ok(Some(reply)) = tokio::time::timeout_at(deadline, replies.next()).await {
-            gathered.push(reply);
-        }
-        Ok(gathered)
     }
 }
 

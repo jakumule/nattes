@@ -96,13 +96,18 @@ impl Queue {
         self.parked.load(Ordering::Relaxed)
     }
 
-    fn try_push(&self, event: Event) -> Push {
+    /// Queue `event`. When the buffer is full, apply the overflow policy if
+    /// `OVERFLOW`, else hand the event back as `Full`.
+    fn try_push<const OVERFLOW: bool>(&self, event: Event) -> Push {
         let mut state = lock(&self.state);
         if state.closed {
             return Push::Closed;
         }
         let mut evicted = false;
         if state.items.len() >= self.capacity {
+            if !OVERFLOW {
+                return Push::Full(event);
+            }
             match self.overflow {
                 Overflow::DropNewest => {
                     self.dropped.fetch_add(1, Ordering::Relaxed);
@@ -139,7 +144,7 @@ impl Queue {
         loop {
             let mut notified = pin!(self.space.notified());
             notified.as_mut().enable();
-            match self.try_push(event) {
+            match self.try_push::<true>(event) {
                 Push::Queued | Push::Evicted => return true,
                 Push::Dropped | Push::Closed => return false,
                 Push::Full(back) => event = back,
@@ -388,29 +393,52 @@ impl Interest {
     }
 }
 
-/// One member of a queue group: the first idle one from the round robin
-/// position (subscription order), or the first that accepts if all are busy.
-/// `member(i)` for `i < len` lists the members found on the subject.
+/// The member of a queue group that gets an event.
+enum Picked<'e> {
+    /// Already queued for a busy member with room.
+    Queued,
+    /// Push to this one: it's idle, or every member that accepts is full and
+    /// its overflow policy applies.
+    Member(&'e Entry),
+    /// No member accepts the event.
+    None,
+}
+
+/// One member of a queue group, from the round robin position (subscription
+/// order): the first idle one that accepts, else the first with room, else the
+/// first that accepts. `member(i)` for `i < len` lists the members found on
+/// the subject.
 fn pick<'e>(
     group: &Group,
     len: usize,
     member: impl Fn(usize) -> &'e Entry,
-    event: &dyn Any,
-) -> Option<&'e Entry> {
+    event: &Event,
+) -> Picked<'e> {
+    let any = &**event as &dyn Any;
     let start = group.next.fetch_add(1, Ordering::Relaxed);
-    let mut busy = None;
+    let at = |i| member((start + i) % len);
+    // An idle member waits in `next()`, so its buffer is empty
     for i in 0..len {
-        let entry = member((start + i) % len);
-        let idle = entry.queue.is_idle();
-        // a busy member's matcher only matters until one busy member accepts
-        if (idle || busy.is_none()) && entry.accepts(event) {
-            if idle {
-                return Some(entry);
-            }
-            busy = Some(entry);
+        let entry = at(i);
+        if entry.queue.is_idle() && entry.accepts(any) {
+            return Picked::Member(entry);
         }
     }
-    busy
+    // Checking for room and queuing take the same lock
+    let mut full = None;
+    for i in 0..len {
+        let entry = at(i);
+        if !entry.queue.is_idle() && entry.accepts(any) {
+            match entry.queue.try_push::<false>(event.clone()) {
+                Push::Queued => return Picked::Queued,
+                Push::Full(_) => {
+                    full.get_or_insert(entry);
+                }
+                Push::Evicted | Push::Dropped | Push::Closed => {}
+            }
+        }
+    }
+    full.map_or(Picked::None, Picked::Member)
 }
 
 #[derive(Default)]
@@ -456,7 +484,7 @@ impl Core {
         let interest = self.interest.load();
         let mut delivered = 0;
         let mut waiting = Vec::new();
-        let mut push = |entry: &Entry| match entry.queue.try_push(event.clone()) {
+        let mut push = |entry: &Entry| match entry.queue.try_push::<true>(event.clone()) {
             Push::Queued => delivered += 1,
             Push::Evicted => {
                 debug!(
@@ -491,6 +519,7 @@ impl Core {
 
         // One member per queue group. A group usually sits on one node; members
         // spread over several nodes of the subject are merged in subscription order
+        let mut queued = 0;
         for (i, members) in groups.iter().enumerate() {
             let same = |m: &&Members| Arc::ptr_eq(&m.group, &members.group);
             if groups[..i].iter().any(same) {
@@ -501,15 +530,18 @@ impl Core {
                     .flat_map(|m| m.entries.iter().map(|e| &**e))
                     .collect();
                 all.sort_unstable_by_key(|entry| entry.id);
-                pick(&members.group, all.len(), |i| all[i], any)
+                pick(&members.group, all.len(), |i| all[i], event)
             } else {
                 let entries = &members.entries;
-                pick(&members.group, entries.len(), |i| &entries[i], any)
+                pick(&members.group, entries.len(), |i| &entries[i], event)
             };
-            if let Some(member) = member {
-                push(member);
+            match member {
+                Picked::Queued => queued += 1,
+                Picked::Member(member) => push(member),
+                Picked::None => {}
             }
         }
+        delivered += queued;
         trace!(
             subject = %Subject(&**event),
             delivered,

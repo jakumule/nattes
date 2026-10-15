@@ -1,10 +1,11 @@
 //! [`Channel`]: a typed view on part of the event tree.
 
 use crate::bus::{Core, Event};
-use crate::nav::{Append, AppendParams, Key, Navigable, Prism};
+use crate::nav::{Append, AppendParams, Key, Navigable, Pattern, Prism};
 use crate::subscription::SubscriptionBuilder;
 use crate::{Node, Overflow, DEFAULT_BUFFER};
 use std::any::Any;
+use std::fmt;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
@@ -109,6 +110,16 @@ impl<T, P, S> Clone for Channel<T, P, S> {
     }
 }
 
+impl<T, P, S> fmt::Debug for Channel<T, P, S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut path = Vec::new();
+        self.route.path(&mut path);
+        f.debug_tuple("Channel")
+            .field(&format_args!("{}", Pattern(&path)))
+            .finish()
+    }
+}
+
 impl<R: Node> Channel<R> {
     /// New bus with `R` as its root.
     pub fn new() -> Self {
@@ -182,7 +193,13 @@ impl<T: 'static, P: 'static, S> Channel<T, P, S> {
 }
 
 impl<T: 'static, S> Channel<T, (), S> {
-    /// Publish `msg` here. Returns how many subscribers received it.
+    /// Publish `msg` here. Returns how many subscriptions queued it.
+    ///
+    /// The message is first queued for every subscriber with room in its
+    /// buffer. Only then does `publish` wait for room in the full buffers of
+    /// [`Overflow::Wait`] subscribers. If this future is dropped during that
+    /// wait, those subscribers miss the message. Delivery is at most once:
+    /// see [delivery guarantees](crate#delivery-guarantees).
     pub async fn publish(&self, msg: T) -> usize {
         let event = self.to_event(msg);
         self.core.deliver(event).await

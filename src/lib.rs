@@ -155,6 +155,32 @@
 //! # }
 //! # fn main() {}
 //! ```
+//!
+//! # Delivery guarantees
+//!
+//! Delivery is **at most once**, in memory. A message only lives in subscriber
+//! buffers: nothing is persisted, acknowledged or redelivered. "Delivered" means
+//! queued in a subscription's buffer, not handled. This holds for
+//! [`publish`](Channel::publish), [`request`](Channel::request),
+//! [`request_timeout`](Channel::request_timeout) and [`scatter`](Channel::scatter):
+//!
+//! - Nothing is sent until the returned future is polled.
+//! - The message goes to every subscription that matches the subject and whose
+//!   filters accept it, and to one member per queue group. A subscription counts
+//!   once its [`SubscriptionBuilder`] has been awaited. Earlier messages are
+//!   not replayed.
+//! - A message is lost for a subscriber when:
+//!   - its buffer is full with [`Overflow::DropNewest`] or [`Overflow::DropOldest`].
+//!     In a queue group, only when every member's buffer is full: the message
+//!     goes to a member with room first;
+//!   - one of its filters rejects the message or panics;
+//!   - it drops the [`Subscription`] before reading the message;
+//!   - the sending future is dropped while it waits for an [`Overflow::Wait`]
+//!     subscriber, which then misses the message.
+//! - The messages of one publisher, awaiting each call before the next, reach
+//!   each subscriber in the order they were sent, minus the ones lost.
+//!   Concurrent publishers have no common order, and members of a queue group
+//!   can handle consecutive messages in any order.
 
 mod bus;
 mod channel;

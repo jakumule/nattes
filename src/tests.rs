@@ -2,6 +2,7 @@ use super::*;
 use crate::{channel, topic};
 use events::git::{PushQueue, Queue as GitQueue};
 use events::user::id::Queue as AdminQueue;
+use futures::stream::FusedStream;
 use futures::{FutureExt, StreamExt};
 use std::pin::pin;
 use uuid::Uuid;
@@ -204,6 +205,20 @@ async fn queue_groups_share_messages() {
 }
 
 #[tokio::test]
+async fn subscriptions_go_straight_into_select() {
+    let pushes = push_channel();
+    let mut push_sub = pushes.subscribe().await;
+    let mut fetch_sub = fetch_channel().subscribe().await;
+    pushes.publish(GitPushMsg("main".into())).await;
+
+    let got = futures::select! {
+        msg = push_sub.next() => msg.map(|msg| msg.0.clone()),
+        _ = fetch_sub.next() => None,
+    };
+    assert_eq!(got.as_deref(), Some("main"));
+}
+
+#[tokio::test]
 async fn filter() {
     let pushes = push_channel();
     let mut long = pushes.subscribe().filter(|_, m| m.0.len() > 3).await;
@@ -317,6 +332,7 @@ async fn scatter_stops_listening_once_everyone_replied() -> anyhow::Result<()> {
     assert!(msg.respond(FetchAck(1)));
     // Still held by the responder, but the one expected reply is in
     assert_eq!(replies.next().await, Some(FetchAck(1)));
+    assert!(replies.is_terminated());
     assert_eq!(replies.next().await, None);
     assert!(!msg.is_pending());
     assert!(!msg.respond(FetchAck(2)));
@@ -324,7 +340,7 @@ async fn scatter_stops_listening_once_everyone_replied() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn gather_returns_replies_received_before_timeout() -> anyhow::Result<()> {
+async fn scatter_replies_until_a_deadline() -> anyhow::Result<()> {
     let fetches = fetch_channel();
     let mut fast = fetches.subscribe().await;
     tokio::spawn(async move {
@@ -334,12 +350,13 @@ async fn gather_returns_replies_received_before_timeout() -> anyhow::Result<()> 
     });
     let _silent = fetches.subscribe().await;
 
-    let acks = fetches
-        .gather(
-            GitFetchMsg("main".into()),
-            std::time::Duration::from_millis(20),
-        )
-        .await?;
+    let deadline = tokio::time::sleep(std::time::Duration::from_millis(20));
+    let acks: Vec<_> = fetches
+        .scatter(GitFetchMsg("main".into()))
+        .await?
+        .take_until(deadline)
+        .collect()
+        .await;
     assert_eq!(acks, [FetchAck(1)]);
     Ok(())
 }
@@ -481,7 +498,6 @@ fn handles_are_send_and_sync() {
     assert_send(pushes.publish(GitPushMsg("a".into())));
     assert_send(fetch_channel().request(GitFetchMsg("a".into())));
     assert_send(fetch_channel().scatter(GitFetchMsg("a".into())));
-    assert_send(fetch_channel().gather(GitFetchMsg("a".into()), Default::default()));
     assert_send_sync::<Replies<FetchAck>>();
     assert_send_sync::<Msg<Request<GitFetchMsg, FetchAck>, ()>>();
 }
@@ -569,6 +585,39 @@ async fn queue_groups_are_told_apart_by_type() {
 }
 
 #[tokio::test]
+async fn queue_group_passes_over_full_members() {
+    let pushes = push_channel();
+    let mut w1 = pushes.subscribe().queue(PushQueue::Workers).buffer(1).await;
+    let mut w2 = pushes.subscribe().queue(PushQueue::Workers).buffer(2).await;
+
+    assert_eq!(pushes.publish(GitPushMsg("a".into())).await, 1); // w1
+    assert_eq!(pushes.publish(GitPushMsg("b".into())).await, 1); // w2
+    // w1's turn, but its buffer is full: w2 has room
+    assert_eq!(pushes.publish(GitPushMsg("c".into())).await, 1);
+    // both full: w2's turn, and its overflow policy drops it
+    assert_eq!(pushes.publish(GitPushMsg("d".into())).await, 0);
+    assert_eq!((w1.dropped(), w2.dropped()), (0, 1));
+    assert_eq!(drain(&mut w1).len(), 1);
+    let w2_got: Vec<String> = drain(&mut w2).iter().map(|msg| msg.0.clone()).collect();
+    assert_eq!(w2_got, ["b", "c"]);
+}
+
+#[tokio::test]
+async fn cancelled_publish_skips_the_subscribers_it_waited_for() {
+    let pushes = push_channel();
+    let mut fast = pushes.subscribe().await;
+    let mut slow = pushes.subscribe().buffer(1).on_full(Overflow::Wait).await;
+    pushes.publish(GitPushMsg("0".into())).await;
+
+    let mut blocked = Box::pin(pushes.publish(GitPushMsg("1".into())));
+    assert!(blocked.as_mut().now_or_never().is_none());
+    drop(blocked);
+
+    assert_eq!(drain(&mut fast).len(), 2, "queued before waiting");
+    assert_eq!(drain(&mut slow).len(), 1);
+}
+
+#[tokio::test]
 async fn queue_group_prefers_idle_members() {
     let pushes = push_channel();
     let mut w1 = pushes.subscribe().queue(PushQueue::Workers).await;
@@ -605,6 +654,47 @@ async fn waiting_publishers_resume_once_the_buffer_drains_to_half() {
     sub.next().await;
     assert_eq!(blocked.await, 1);
     assert_eq!(drain(&mut sub).len(), 3);
+}
+
+#[tokio::test]
+async fn requests_stack_up_while_the_responder_is_busy() -> anyhow::Result<()> {
+    let fetches = fetch_channel();
+    let mut responder = fetches.subscribe().await;
+    let mut requests =
+        ["a", "bb", "ccc"].map(|branch| Box::pin(fetches.request(GitFetchMsg(branch.into()))));
+    for request in &mut requests {
+        assert!(
+            request.as_mut().now_or_never().is_none(),
+            "sent, no reply yet"
+        );
+    }
+
+    let batch = (&mut responder).ready_chunks(16).next().await.unwrap();
+    assert_eq!(batch.len(), 3);
+    for msg in &batch {
+        msg.respond(FetchAck(msg.0.len()));
+    }
+    let mut acks = Vec::new();
+    for request in requests {
+        acks.push(request.await?);
+    }
+    assert_eq!(acks, [FetchAck(1), FetchAck(2), FetchAck(3)]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn debug_shows_subjects() {
+    let pushes = push_channel();
+    let mut sub = pushes.subscribe().await;
+    pushes.publish(GitPushMsg("main".into())).await;
+    let msg = sub.next().await.unwrap();
+
+    assert_eq!(format!("{pushes:?}"), "Channel(git.push.>)");
+    assert!(format!("{sub:?}").contains("subject: git.push.>, dropped: 0"));
+    assert_eq!(
+        format!("{msg:?}"),
+        r#"Msg { subject: git.push, msg: GitPushMsg("main") }"#
+    );
 }
 
 #[tokio::test]

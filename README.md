@@ -221,7 +221,7 @@ let any_delete    = topic!(any_user, delete);               // user.*.delete, fr
 | `user.*.delete` | `topic!(bus, user.id().delete).subscribe()` |
 | queue group | `.subscribe().queue(jobs::Queue::Mailer)` |
 | request/reply | `channel.request(msg)` / `msg.respond(reply)` |
-| scatter-gather | `channel.scatter(msg)` / `channel.gather(msg, timeout)` |
+| scatter-gather | `channel.scatter(msg)` (a stream of replies) |
 
 ## Publishing
 
@@ -240,7 +240,8 @@ the `*` with.
 
 `publish` only waits if a matching subscriber chose `Overflow::Wait` and its buffer
 is full. Even then, every other subscriber has already received the message by the
-time it waits.
+time it waits. See [Delivery guarantees](#delivery-guarantees) for when a message
+can be lost and in which order it arrives.
 
 ## Subscribing
 
@@ -267,8 +268,9 @@ while let Some(msg) = sub.next().await {
 
 - **Queue groups.** Subscribers with the same `.queue(group)` on the same bus share
   the messages: each one goes to a single member. A member waiting in `next()` is
-  picked first. If none is waiting, members take turns (round robin). See
-  [Queue groups](#queue-groups).
+  picked first. If none is waiting, members with room in their buffer take turns
+  (round robin). Only when every member's buffer is full does the overflow policy
+  of the member whose turn it is apply. See [Queue groups](#queue-groups).
 - **Slow subscribers.** Each subscription has its own buffer. When it's full, the
   `.on_full(...)` policy applies:
 
@@ -279,11 +281,30 @@ while let Some(msg) = sub.next().await {
   | `Wait` | `publish` waits for room, then resumes once the buffer has drained to half. Use it for work queues that must not lose messages. |
 
   `sub.dropped()` counts the messages lost so far.
+- **Batches.** `StreamExt::ready_chunks(max)` waits for a message, then returns it
+  with the others already buffered (up to `max`), oldest first. What arrives while
+  you handle a batch stacks up for the next one, e.g. to answer pending requests
+  together:
+
+  ```rust
+  let mut batches = fetches_sub.ready_chunks(64);
+  while let Some(batch) = batches.next().await {
+      let acks = fetch_all(batch.iter().map(|req| &req.branch)).await;
+      for (req, ack) in batch.iter().zip(acks) {
+          req.respond(ack);
+      }
+  }
+  ```
+
+  The buffer size and `on_full` policy still apply while messages stack up.
 - **Routing.** Subscriptions are indexed by subject in an interest graph, like
   the NATS sublist, so `publish` only looks at subscribers on its subject's path
   (with wildcards). Its cost doesn't grow with subscribers on unrelated subjects.
 - **Filters.** Filters run outside the bus's internal lock. A filter that panics
   counts as "no match" and doesn't affect other subscribers or publishers.
+- **Streams.** A subscription never ends and is a `FusedStream`, so every
+  `StreamExt` adapter applies and it goes straight into `futures::select!`
+  without `.fuse()`.
 - **Unsubscribing.** Drop the subscription. Publishers waiting on it are released.
 - **Subjects.** `msg.subject()` gives a NATS-style subject for logging, built from
   names and parameter values, e.g. `user.id.42.delete`. `msg.root()` gives the whole
@@ -386,8 +407,8 @@ prefer `request_timeout` unless you know a responder will answer.
 `scatter` sends the request to every subscriber and streams their replies, one per
 responder (a queue group counts as one responder). The stream ends once each of
 them answered or dropped the request; `replies.remaining()` tells how many are
-still expected. `gather` collects the replies until they are all in or the timeout
-runs out, and returns whatever came back:
+still expected. `Replies` is a `FusedStream`, so `StreamExt` adapters cover the
+rest, e.g. a deadline with `take_until`:
 
 ```rust
 let mut replies = pushes.scatter(GitPushMsg { branch: "main".into() }).await?;
@@ -395,15 +416,64 @@ while let Some(ack) = replies.next().await {
     // one `PushAck` per responder
 }
 
+// What came back within a second
 let acks: Vec<PushAck> = pushes
-    .gather(GitPushMsg { branch: "main".into() }, Duration::from_secs(1))
-    .await?;
+    .scatter(GitPushMsg { branch: "main".into() })
+    .await?
+    .take_until(tokio::time::sleep(Duration::from_secs(1)))
+    .collect()
+    .await;
 ```
 
 Responders use the same `msg.respond(reply)`, and should answer once: an extra
 reply takes the place of another responder's. Both fail with
 `BusError::NoResponders` when nobody is subscribed; dropping the stream makes
 `respond` return `false` and `is_pending` turn `false`.
+
+## Delivery guarantees
+
+nattes delivers **at most once**, in memory. A message only lives in subscriber
+buffers: nothing is persisted, acknowledged or redelivered. "Delivered" means
+queued in a subscription's buffer, not handled.
+
+These hold for every way of sending:
+
+- **Nothing is sent until you await.** `publish`, `request` and `scatter` are lazy
+  futures.
+- **Who gets it.** Every subscription that matches the subject and whose filters
+  accept the message, but only one member per queue group. A subscription
+  counts once its builder has been awaited. Messages sent before that are not
+  replayed.
+- **When it is lost.** A message is lost for a subscriber when:
+  - its buffer is full with `DropNewest` (the new message) or `DropOldest` (the
+    oldest one in the buffer). In a queue group, this only happens when every
+    member's buffer is full: the message goes to a member with room first;
+  - one of its filters rejects the message or panics;
+  - it drops the subscription before reading the message: buffered messages
+    are discarded;
+  - the sending future is dropped while it waits for an `Overflow::Wait`
+    subscriber: the subscribers it waited for miss the message, the others
+    already have it.
+- **Order.** The messages of one publisher, awaiting each call before the next,
+  reach each subscriber in the order they were sent, minus the ones lost.
+  Concurrent publishers have no common order, so two subscribers can see their
+  messages in different orders. Consecutive messages to a queue group can go to
+  different members, which can handle them in any order.
+
+Per method:
+
+| Method | Returns | Waits for |
+|---|---|---|
+| `publish` | How many subscriptions queued the message. | Room in full `Overflow::Wait` buffers. |
+| `request` | The first reply. `NoResponders` if nobody queued it, `NoReply` once every receiver dropped it without answering. | Delivery, then a reply, with no time limit. |
+| `request_timeout` | Same as `request`, or `Timeout`. | Delivery and the reply, both within the timeout. |
+| `scatter` | A stream of replies, at most one per receiver, or `NoResponders`. | Delivery. The stream ends once every receiver answered or dropped the request. |
+
+A request goes to every matching subscriber, like any message, and only the
+first reply counts. To have exactly one handler, subscribe through a queue group.
+A request that is lost from a buffer counts as dropped without a reply. After a
+`Timeout`, the request may still sit in buffers and be handled, but its reply is
+discarded: `respond` returns `false`.
 
 ## Sub-channels as roots
 
@@ -516,7 +586,7 @@ pushes.subscribe().queue(PushQueue::Indexer("0"));
   'static`.
 - `events!` must be used at module level, because its modules find your types
   through `use super::*`.
-- `request_timeout` and `gather` need a tokio runtime with the timer enabled. Everything else
+- `request_timeout` needs a tokio runtime with the timer enabled. Everything else
   runs on any executor.
 - Containing panicking filters relies on unwinding, so it doesn't work with
   `panic = "abort"`.

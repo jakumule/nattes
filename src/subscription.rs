@@ -3,10 +3,13 @@
 use crate::bus::{Core, Event, Matcher, Queue};
 use crate::channel::Route;
 use crate::group::{GroupKey, InScope, QueueGroup};
-use crate::nav::Key;
+use crate::nav::{Key, Pattern};
+use crate::tree::Subject;
 use crate::{subject, Channel, Overflow};
+use futures::stream::FusedStream;
 use futures::Stream;
 use std::any::Any;
+use std::fmt;
 use std::future::{ready, IntoFuture, Ready};
 use std::ops::Deref;
 use std::pin::Pin;
@@ -127,11 +130,28 @@ impl<T, P> Stream for Subscription<T, P> {
     }
 }
 
+/// A subscription never ends, so it can go straight into `futures::select!`.
+impl<T, P> FusedStream for Subscription<T, P> {
+    fn is_terminated(&self) -> bool {
+        false
+    }
+}
+
 impl<T, P> Drop for Subscription<T, P> {
     fn drop(&mut self) {
         self.core
             .unsubscribe(&self.path, self.id, self.group.as_ref());
         self.queue.close();
+    }
+}
+
+impl<T, P> fmt::Debug for Subscription<T, P> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Subscription")
+            .field("id", &self.id)
+            .field("subject", &format_args!("{}", Pattern(&self.path)))
+            .field("dropped", &self.dropped())
+            .finish()
     }
 }
 
@@ -164,5 +184,24 @@ impl<T, P> Deref for Msg<T, P> {
 
     fn deref(&self) -> &T {
         self.view().1
+    }
+}
+
+/// Shares the event: a cloned [`Request`](crate::Request) is still answered once.
+impl<T, P> Clone for Msg<T, P> {
+    fn clone(&self) -> Self {
+        Self {
+            event: self.event.clone(),
+            route: self.route.clone(),
+        }
+    }
+}
+
+impl<T: fmt::Debug, P> fmt::Debug for Msg<T, P> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Msg")
+            .field("subject", &format_args!("{}", Subject(&*self.event)))
+            .field("msg", &**self)
+            .finish()
     }
 }
