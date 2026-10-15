@@ -1,4 +1,4 @@
-//! Queue groups declared in [`events!`](crate::events) with `queue Name { … }`.
+//! Queue groups declared in [`events!`](crate::events) with `[ … ]`.
 
 use std::any::{Any, TypeId};
 use std::hash::{Hash, Hasher};
@@ -8,7 +8,7 @@ use std::sync::Arc;
 /// one group: `Indexer(0)` and `Indexer(1)` are two groups.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` isn't a queue group",
-    note = "declare queue groups in `events!` with `queue Name {{ … }}` on a topic"
+    note = "declare queue groups in `events!` with `[ … ]` on a topic"
 )]
 pub trait QueueGroup: Eq + Hash + Send + Sync + 'static {}
 

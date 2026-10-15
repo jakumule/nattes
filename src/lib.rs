@@ -76,8 +76,8 @@
 //! # fn main() {}
 //! ```
 //!
-//! Queue groups are declared on a topic, with `queue Name { … }` in a subtree
-//! or `where queue Name { … }` after a leaf. Each value is a group, so
+//! Queue groups are declared on a topic, with `[ … ]` in a subtree
+//! or after a leaf's message type. Each value is a group, so
 //! `Indexer(0)` and `Indexer(1)` are two groups:
 //!
 //! ```
@@ -86,21 +86,21 @@
 //! events! {
 //!     pub mod events {
 //!         git {
-//!             push: PushMsg where queue Pushers { Indexer(u32), Audit },
-//!             queue Workers { Mailer },
+//!             push: PushMsg [Indexer(u32), Audit],
+//!             [Mailer],
 //!         },
 //!     }
 //! }
-//! use events::git::{Pushers, Workers};
+//! use events::git::{PushQueue, Queue};
 //!
 //! # fn main() {
 //! # futures::executor::block_on(async {
 //! let bus = channel!(events);
 //! let pushes = topic!(bus, git.push);
-//! let _a = pushes.subscribe().queue(Pushers::Indexer(0)).await;
-//! let _b = pushes.subscribe().queue(Pushers::Indexer(0)).await;
-//! let _c = pushes.subscribe().queue(Pushers::Indexer(1)).await;
-//! let _m = topic!(bus, git).subscribe().queue(Workers::Mailer).await; // git.>
+//! let _a = pushes.subscribe().queue(PushQueue::Indexer(0)).await;
+//! let _b = pushes.subscribe().queue(PushQueue::Indexer(0)).await;
+//! let _c = pushes.subscribe().queue(PushQueue::Indexer(1)).await;
+//! let _m = topic!(bus, git).subscribe().queue(Queue::Mailer).await; // git.>
 //!
 //! // one of _a and _b, _c, and _m
 //! assert_eq!(pushes.publish(PushMsg).await, 3);
@@ -114,10 +114,10 @@
 //! ```compile_fail,E0277
 //! # use nattes::{channel, events, topic};
 //! # pub struct PushMsg;
-//! # events! { pub mod events { git { push: PushMsg, queue Workers { Mailer } } } }
+//! # events! { pub mod events { git { push: PushMsg, [Mailer] } } }
 //! # async fn f() {
 //! let bus = channel!(events);
-//! topic!(bus, git.push).subscribe().queue(events::git::Workers::Mailer).await;
+//! topic!(bus, git.push).subscribe().queue(events::git::Queue::Mailer).await;
 //! # }
 //! # fn main() {}
 //! ```
@@ -140,10 +140,10 @@
 //! ```compile_fail,E0308
 //! # use nattes::{channel, events, topic};
 //! # pub struct PushMsg;
-//! # events! { pub mod events { git { push: PushMsg where queue Pushers { Indexer(u32) } } } }
+//! # events! { pub mod events { git { push: PushMsg [Indexer(u32)] } } }
 //! # async fn f() {
 //! let bus = channel!(events);
-//! topic!(bus, git.push).subscribe().queue(events::git::Pushers::Indexer("0")).await;
+//! topic!(bus, git.push).subscribe().queue(events::git::PushQueue::Indexer("0")).await;
 //! # }
 //! # fn main() {}
 //! ```

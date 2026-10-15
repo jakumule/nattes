@@ -15,7 +15,7 @@ pub struct DeleteMsg;
 
 events! {
     pub mod events {
-        git { push: PushMsg where queue Pushers { Workers } },
+        git { push: PushMsg [Workers] },
         user { id(u32) { delete: DeleteMsg } },
     }
 }
@@ -61,7 +61,7 @@ fn logs_subscriptions_publishes_and_drops() {
             let sub = topic!(bus, user.id().delete).subscribe().buffer(1).await;
             let group = topic!(bus, git.push)
                 .subscribe()
-                .queue(events::git::Pushers::Workers)
+                .queue(events::git::PushQueue::Workers)
                 .await;
             let deletes = topic!(bus, user.id(7).delete);
             deletes.publish(DeleteMsg).await;
@@ -74,7 +74,7 @@ fn logs_subscriptions_publishes_and_drops() {
         *recorder.0.lock().unwrap(),
         [
             "subscribe subscription=0 subject=user.id.*.delete.> group=None filtered=false",
-            "subscribe subscription=1 subject=git.push.> group=Some(tracing::events::git::Pushers) filtered=false",
+            "subscribe subscription=1 subject=git.push.> group=Some(tracing::events::git::PushQueue) filtered=false",
             "publish subject=user.id.7.delete delivered=1 waiting=0",
             "buffer full, dropped the message subscription=0 subject=user.id.7.delete",
             "publish subject=user.id.7.delete delivered=0 waiting=0",

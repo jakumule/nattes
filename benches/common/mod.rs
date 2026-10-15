@@ -9,7 +9,7 @@ pub struct Payload(pub u64);
 
 events! {
     pub mod events {
-        load: Payload where queue Group { Workers },
+        load: Payload [Workers],
         user { id(u64) { delete: Payload } },
     }
 }

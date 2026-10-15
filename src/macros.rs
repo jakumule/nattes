@@ -67,11 +67,11 @@ macro_rules! topic {
 ///                 delete: UserDeleteMsg,
 ///             },
 ///         },
-///         random => arrow => more: DeepMsg, // `a => x` is `a { x }`
+///         random.arrow.more: DeepMsg, // `a.x` is `a { x }`
 ///         other = other,              // mount the tree of another events! module
 ///         jobs {
-///             run: JobMsg where queue Runners { Shard(u32) }, // queue groups of `jobs.run`
-///             queue Workers { Mailer },                      // queue groups of `jobs`
+///             run: JobMsg [Shard(u32)], // queue groups of `jobs.run`
+///             [Mailer],                      // queue groups of `jobs`
 ///         },
 ///     }
 /// }
@@ -84,12 +84,15 @@ macro_rules! topic {
 ///   `Topic::PullRequest`.
 /// - a type `Steps` with one method per child, used by
 ///   [`topic!`](crate::topic).
-/// - one enum per queue group declaration, `events::jobs::Workers`, which
-///   derives `Clone + PartialEq + Eq + Hash` (attributes written before
-///   `queue` are added to it). Its values can only be joined on the topic
-///   that declares it, with [`queue`](crate::SubscriptionBuilder::queue). A
-///   leaf declares at most one, which is also the third type parameter of
-///   its channel: `Channel<JobMsg, (), events::jobs::Runners>`.
+/// - for queue groups `[ … ]` in the level, an enum `Queue`,
+///   `events::jobs::Queue`, and for a leaf `run: Msg [ … ]`, an enum named
+///   after it, `events::jobs::RunQueue`. Both derive
+///   `Clone + PartialEq + Eq + Hash`; inner attributes such as
+///   `[#![derive(Debug)] A, B]` are added. Their values can only be joined
+///   on the topic
+///   that declares them, with [`queue`](crate::SubscriptionBuilder::queue).
+///   A leaf's enum is also the third type parameter of its channel:
+///   `Channel<JobMsg, (), events::jobs::RunQueue>`.
 ///
 /// Names only need to be unique among siblings. Each module does
 /// `use super::*`, so messages and parameter types are found as in the
@@ -143,17 +146,17 @@ macro_rules! events {
         $($e)*
     };
 
-    // ---------- queue groups of this level:  queue Workers { Mailer, Indexer(u32) } ----------
+    // ---------- queue groups of this level:  [Mailer, Indexer(u32)] ----------
     (@munch $attrs:tt $v:tt [$($e:tt)*] $a:tt $s:tt
-        $(#[$gm:meta])* queue $g:ident { $($gv:tt)* } $(, $($rest:tt)*)?) => {
+        [$($gv:tt)*] $(, $($rest:tt)*)?) => {
         $crate::events!(@munch $attrs
             $v
-            [$($e)* $crate::events!(@group Topic [$(#[$gm])*] $g { $($gv)* });]
+            [$($e)* $crate::events!(@group Topic Queue { $($gv)* });]
             $a
             $s
             $($($rest)*)?);
     };
-    (@group $scope:ty [$(#[$gm:meta])*] $g:ident { $($gv:ident $(($gp:ty))?),* $(,)? }) => {
+    (@group $scope:ident $g:ident { $(#![$gm:meta])* $($gv:ident $(($gp:ty))?),* $(,)? }) => {
         $(#[$gm])*
         #[derive(Clone, PartialEq, Eq, Hash)]
         pub enum $g { $($gv $(($gp))?),* }
@@ -162,11 +165,11 @@ macro_rules! events {
         impl $crate::InScope<$scope> for $g {}
     };
 
-    // ---------- `a => rest` is sugar for `a { rest }` ----------
-    (@munch $attrs:tt $v:tt $e:tt $a:tt $s:tt $var:ident => $($rest:tt)*) => {
+    // ---------- `a.rest` is sugar for `a { rest }` ----------
+    (@munch $attrs:tt $v:tt $e:tt $a:tt $s:tt $var:ident . $($rest:tt)*) => {
         $crate::events!(@chain $attrs $v $e $a $s [$var] [] $($rest)*);
     };
-    (@munch $attrs:tt $v:tt $e:tt $a:tt $s:tt $var:ident $p:tt => $($rest:tt)*) => {
+    (@munch $attrs:tt $v:tt $e:tt $a:tt $s:tt $var:ident $p:tt . $($rest:tt)*) => {
         $crate::events!(@chain $attrs $v $e $a $s [$var $p] [] $($rest)*);
     };
     (@chain $attrs:tt $v:tt $e:tt $a:tt $s:tt [$($head:tt)*] [$($acc:tt)*] , $($rest:tt)*) => {
@@ -264,16 +267,18 @@ macro_rules! events {
             $($($rest)*)?);
     };
 
-    // ---------- leaf with queue groups:  push: GitPushMsg where queue Pushers { … } ----------
+    // ---------- leaf with queue groups:  push: GitPushMsg [Indexer(u32)] ----------
     // The group enum is also the leaf's topic type: the message type may be
     // used by other leaves.
     (@munch $attrs:tt [$($v:tt)*] [$($e:tt)*] [$($a:tt)*] [$($s:tt)*]
-        $var:ident : $t:ty where $(#[$gm:meta])* queue $g:ident { $($gv:tt)* }
+        $var:ident : $t:ty [$($gv:tt)*]
         $(, $($rest:tt)*)?) => {
         $crate::events!(@munch $attrs
             [$($v)* [<$var:camel>]($t),]
             [$($e)*
-                $crate::events!(@group $g [$(#[$gm])*] $g { $($gv)* });
+                $crate::__pastey::paste! {
+                    $crate::events!(@group [<$var:camel Queue>] [<$var:camel Queue>] { $($gv)* });
+                }
             ]
             [$($a)*
                 Topic::[<$var:camel>](_) => $crate::Step {
@@ -281,21 +286,23 @@ macro_rules! events {
                 },
             ]
             [$($s)*
-                pub fn $var(self) -> $crate::Channel<$t, P, $g> {
+                pub fn $var(self) -> $crate::Channel<$t, P, [<$var:camel Queue>]> {
                     self.0.at_prism($crate::events!(@plain $var)).on_topic()
                 }
             ]
             $($($rest)*)?);
     };
 
-    // ---------- param leaf with queue groups:  new(Uuid): GitNewMsg where queue … ----------
+    // ---------- param leaf with queue groups:  new(Uuid): GitNewMsg [Shard(u32)] ----------
     (@munch $attrs:tt [$($v:tt)*] [$($e:tt)*] [$($a:tt)*] [$($s:tt)*]
-        $var:ident ($p:ty) : $t:ty where $(#[$gm:meta])* queue $g:ident { $($gv:tt)* }
+        $var:ident ($p:ty) : $t:ty [$($gv:tt)*]
         $(, $($rest:tt)*)?) => {
         $crate::events!(@munch $attrs
             [$($v)* [<$var:camel>]($p, $t),]
             [$($e)*
-                $crate::events!(@group $g [$(#[$gm])*] $g { $($gv)* });
+                $crate::__pastey::paste! {
+                    $crate::events!(@group [<$var:camel Queue>] [<$var:camel Queue>] { $($gv)* });
+                }
             ]
             [$($a)*
                 Topic::[<$var:camel>](p, _) => $crate::Step {
@@ -303,7 +310,7 @@ macro_rules! events {
                 },
             ]
             [$($s)*
-                pub fn $var<S: $crate::Param<$p>>(self, select: S) -> $crate::Channel<$t, $crate::Append<P, S::Q>, $g>
+                pub fn $var<S: $crate::Param<$p>>(self, select: S) -> $crate::Channel<$t, $crate::Append<P, S::Q>, [<$var:camel Queue>]>
                 where
                     P: $crate::AppendParams<S::Q>,
                 {

@@ -192,7 +192,7 @@ fn queue_group(c: &mut Criterion) {
                             for _ in 0..workers {
                                 let sub = start(
                                     load.subscribe()
-                                        .queue(events::Group::Workers)
+                                        .queue(events::LoadQueue::Workers)
                                         .on_full(Overflow::Wait),
                                 );
                                 // idle workers go first: shares aren't even
@@ -257,7 +257,11 @@ fn routing(c: &mut Criterion) {
 }
 
 /// `total` messages split across `pubs` concurrent tasks.
-async fn publish_from(pubs: u64, load: &nattes::Channel<Payload, (), events::Group>, total: u64) {
+async fn publish_from(
+    pubs: u64,
+    load: &nattes::Channel<Payload, (), events::LoadQueue>,
+    total: u64,
+) {
     let mut tasks = JoinSet::new();
     for _ in 0..pubs {
         let load = load.clone();

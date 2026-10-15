@@ -118,13 +118,13 @@ events! {
             id(Uuid) {                  // parameter, then subtree
                 update: UserUpdateMsg,
                 delete: UserDeleteMsg,
-                queue Admins { Oncall }, // queue groups of user.<id>
+                [Oncall],               // queue groups of user.<id>
             },
         },
-        random => arrow => more: DeepMsg, // `a => x` is `a { x }`
+        random.arrow.more: DeepMsg,     // `a.x` is `a { x }`
         jobs {
-            run: JobMsg where queue Runners { Shard(u32) }, // queue groups of jobs.run
-            queue Workers { Mailer },   // queue groups of jobs
+            run: JobMsg [Shard(u32)],   // queue groups of jobs.run
+            [Mailer],                   // queue groups of jobs
         },
         other = other,                  // mount the tree of another events! module
     }
@@ -138,10 +138,10 @@ events::Topic                 { Git(git::Topic), User(user::Topic), Random(…),
 events::git::Topic            { Push(GitPushMsg), New(Uuid, GitNewMsg) }
 events::user::Topic           { New(UserNewMsg), Id(Uuid, id::Topic) }
 events::user::id::Topic       { Update(UserUpdateMsg), Delete(UserDeleteMsg) }
-events::user::id::Admins      { Oncall }
+events::user::id::Queue       { Oncall }
 events::jobs::Topic           { Run(JobMsg) }
-events::jobs::Workers         { Mailer }
-events::jobs::Runners         { Shard(u32) }
+events::jobs::Queue           { Mailer }
+events::jobs::RunQueue        { Shard(u32) }
 ```
 
 So names only need to be unique among siblings: `git::new` and `user::new` don't
@@ -158,10 +158,10 @@ the `Topic` variants: `pull_request` is `Topic::PullRequest`. Rust keywords such
 | `name: Msg` | leaf message | `Name(Msg)` |
 | `name(Type): Msg` | parameter, then message | `Name(Type, Msg)` |
 | `name(Type) { … }` | parameter, then subtree, in module `name` | `Name(Type, name::Topic)` |
-| `name => …` | subtree with a single child, no braces | same as `name { … }` |
+| `name.…` | subtree with a single child, no braces | same as `name { … }` |
 | `name = path::to::module` | mount the tree of another `events!` | `Name(path::to::module::Topic)` |
-| `queue Name { A, B(Type) }` | queue groups of this level, enum `Name` | none |
-| `name: Msg where queue Name { … }` | leaf with queue groups, enum `Name` | `Name(Msg)` |
+| `[A, B(Type)]` | queue groups of this level, enum `Queue` | none |
+| `name: Msg [ … ]` | leaf with queue groups, enum `NameQueue` | `Name(Msg)` |
 
 Each module also gets a `Steps` type with one method per child, which is what
 `topic!` uses to navigate (see below).
@@ -208,7 +208,7 @@ let any_delete    = topic!(any_user, delete);               // user.*.delete, fr
 | `git.push` | `topic!(bus, git.push).subscribe()` |
 | `user.<alice>.>` | `topic!(bus, user.id(alice)).subscribe()` |
 | `user.*.delete` | `topic!(bus, user.id().delete).subscribe()` |
-| queue group | `.subscribe().queue(jobs::Workers::Mailer)` |
+| queue group | `.subscribe().queue(jobs::Queue::Mailer)` |
 | request/reply | `channel.request(msg)` / `msg.respond(reply)` |
 | scatter-gather | `channel.scatter(msg)` / `channel.gather(msg, timeout)` |
 
@@ -240,7 +240,7 @@ a `Stream` of messages that deref to the channel's type:
 let mut sub = any_user
     .subscribe()
     .filter(move |(id,), _msg| *id != admin_id) // optional: filter on params and message
-    .queue(Admins::Oncall)                      // optional: share messages with other members
+    .queue(id::Queue::Oncall)                   // optional: share messages with other members
     .buffer(256)                                // optional: buffer size (default 1024)
     .on_full(Overflow::DropOldest)              // optional: what to do when it's full
     .await;
@@ -281,34 +281,35 @@ while let Some(msg) = sub.next().await {
 ## Queue groups
 
 Queue groups are declared in `events!` on the topic they belong to: with
-`queue Name { … }` inside a subtree, or with `where queue Name { … }` after a
-leaf. Each declaration becomes an enum in the level's module, and each of its
-values is one group:
+`[ … ]` inside a subtree, or with `[ … ]` after a leaf's message type. Like
+`Topic`, the generated enum has a fixed name in the level's module: `Queue` for
+the level, and the leaf's name followed by `Queue` for a leaf (`push` gives
+`PushQueue`). Each of its values is one group:
 
 ```rust
 events! {
     pub mod events {
         git {
-            push: GitPushMsg where queue Pushers { Indexer(u32), Audit },
-            queue Workers { Mailer },
+            push: GitPushMsg [Indexer(u32), Audit],
+            [Mailer],
         },
     }
 }
 
-use events::git::{Pushers, Workers};
+use events::git::{PushQueue, Queue};
 
 let pushes = topic!(bus, git.push);
-let a = pushes.subscribe().queue(Pushers::Indexer(0)).await; // shard 0
-let b = pushes.subscribe().queue(Pushers::Indexer(0)).await; // shard 0
-let c = pushes.subscribe().queue(Pushers::Indexer(1)).await; // shard 1
-let m = topic!(bus, git).subscribe().queue(Workers::Mailer).await; // git.>
+let a = pushes.subscribe().queue(PushQueue::Indexer(0)).await; // shard 0
+let b = pushes.subscribe().queue(PushQueue::Indexer(0)).await; // shard 0
+let c = pushes.subscribe().queue(PushQueue::Indexer(1)).await; // shard 1
+let m = topic!(bus, git).subscribe().queue(Queue::Mailer).await; // git.>
 
 pushes.publish(GitPushMsg { branch: "main".into() }).await;
 // one of a and b, then c, then m
 ```
 
-- **A group is joined only on the topic that declares it.** `Workers` can be
-  joined on `git` and `Pushers` on `git.push`, not the other way around, and not
+- **A group is joined only on the topic that declares it.** `Queue` can be
+  joined on `git` and `PushQueue` on `git.push`, not the other way around, and not
   on any other topic. A member still receives everything its subscription
   matches: `m`, on `git.>`, gets the pushes.
 - **Each value is a group.** `Indexer(0)` and `Indexer(1)` are two groups, and
@@ -318,12 +319,13 @@ pushes.publish(GitPushMsg { branch: "main".into() }).await;
   joined on `user.id(alice)` and on `user.id()`; members on both form one group.
 - **Mounted trees keep their groups.** Groups declared inside `other` are joined
   on `other`'s topics, wherever it's mounted.
-- **Attributes** written before `queue` are added to the group enum, which
-  already derives `Clone`, `PartialEq`, `Eq` and `Hash`.
+- **Attributes** go inside the brackets, as inner attributes:
+  `[#![derive(Debug)] Indexer(u32), Audit]`. The enum already
+  derives `Clone`, `PartialEq`, `Eq` and `Hash`.
 
-A leaf declares at most one group enum (put several families of groups in its
-variants), and its channel has that enum as a third type parameter:
-`topic!(bus, git.push)` is a `Channel<GitPushMsg, (), events::git::Pushers>`.
+A level or leaf declares at most one `[ … ]`: put several families of groups
+in its variants. A leaf's enum is also the third type parameter of its channel:
+`topic!(bus, git.push)` is a `Channel<GitPushMsg, (), events::git::PushQueue>`.
 Other channels keep the default (`Channel<T, P>` is `Channel<T, P, T>`).
 
 ## Request/reply
@@ -355,7 +357,7 @@ let ack = pushes
 ```
 
 Responders can check `msg.is_pending()` to skip work nobody is waiting for. Leaves
-under `a => b => c` chains can't use a type with a top-level comma; use a type
+under `a.b.c` chains can't use a type with a top-level comma; use a type
 alias there.
 
 The first reply wins. Possible errors:
@@ -479,12 +481,12 @@ events! { pub mod sensors { reading(f64): Reading } }
 pushes.subscribe().queue("workers");
 // error: `&str` isn't a queue group
 
-// a queue group declared on another topic (Workers is on git)
-pushes.subscribe().queue(Workers::Mailer);
-// error: queue group `Workers` isn't declared on this topic
+// a queue group declared on another topic (git::Queue is on git)
+pushes.subscribe().queue(Queue::Mailer);
+// error: queue group `Queue` isn't declared on this topic
 
 // wrong value for a queue group
-pushes.subscribe().queue(Pushers::Indexer("0"));
+pushes.subscribe().queue(PushQueue::Indexer("0"));
 // error: expected `u32`, found `&str`
 ```
 

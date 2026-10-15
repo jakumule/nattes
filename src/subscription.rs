@@ -39,7 +39,7 @@ impl<T: 'static, P: 'static, S> SubscriptionBuilder<T, P, S> {
     /// Join a queue group: each message goes to one member of the group.
     ///
     /// Groups are declared on a topic in [`events!`](crate::events), with
-    /// `queue Name { … }`, and can only be joined on that topic.
+    /// `[ … ]`, and can only be joined on that topic.
     pub fn queue<G: QueueGroup + InScope<S>>(mut self, group: G) -> Self {
         self.group = Some(GroupKey::new(group));
         self
