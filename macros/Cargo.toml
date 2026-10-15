@@ -1,10 +1,13 @@
 [package]
 name = "nattes-macros"
-version = "0.1.0"
-edition = "2024"
-license = "MIT"
-repository = "https://github.com/jakumule/nattes"
-description = "Proc macros of nattes. Use them through the nattes crate."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+description.workspace = true
+categories.workspace = true
+keywords.workspace = true
 
 [lib]
 proc-macro = true

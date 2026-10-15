@@ -1,6 +1,22 @@
 [package]
 name = "nattes"
-version = "0.2.0"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+description.workspace = true
+categories.workspace = true
+keywords.workspace = true
+
+
+[workspace]
+members = ["macros"]
+resolver = "3"
+
+
+[workspace.package]
+version = "0.2.1"
 edition = "2024"
 license = "MIT"
 readme = "README.md"
@@ -8,9 +24,6 @@ repository = "https://github.com/jakumule/nattes"
 description = "A simple message queue inspired by NATS"
 categories = ["asynchronous"]
 keywords = ["message-queue", "nats"]
-
-[workspace]
-members = ["macros"]
 
 [dependencies]
 
@@ -20,7 +33,7 @@ arc-swap = "1"
 smallvec = "1"
 thiserror = "2"
 imbl = "7.0.2"
-nattes-macros = { path = "macros", version = "0.1.0" }
+nattes-macros = { path = "macros" }
 tracing = { version = "0.1", default-features = false, features = ["std"], optional = true }
 
 [features]
