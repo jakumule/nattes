@@ -1,4 +1,5 @@
 # Nattes
 
-- [x] Make queue group declared
-- [x] Build Scatter-gather
+- [ ] Document topics
+- [ ] Coalesce wrapper
+- [ ] optimize macros for autocompletion
