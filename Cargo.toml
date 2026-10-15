@@ -17,6 +17,7 @@ arc-swap = "1"
 smallvec = "1"
 thiserror = "2"
 imbl = "7.0.2"
+pastey = "0.2.3"
 
 [dev-dependencies]
 tokio = { version = "1.42.0", features = ["rt-multi-thread", "macros"] }

@@ -21,7 +21,8 @@ while let Some(msg) = deletes.next().await {
   string parsing and no serialization; subscribers get the published value through
   an `Arc`.
 - **NATS-style subscriptions.** Subscribe to everything below a topic (`>`), use
-  wildcard parameters (`*`) or fixed ones, join queue groups, and do request/reply.
+  wildcard parameters (`*`) or fixed ones, join queue groups, and do request/reply
+  or scatter-gather.
 - **Sub-channels are roots.** A `Channel<events::git::Topic>` behaves like a bus whose
   root is `git`. Hand it to a component, and that component works the same whether
   it's standalone or mounted inside a bigger tree.
@@ -87,7 +88,7 @@ async fn main() {
 
 ```rust
 events! {
-    #[derive(Debug)]                    // applied to every generated enum
+    #[derive(Debug)]                    // applied to every `Topic` enum
     pub mod events {
         git {                           // subtree
             push: GitPushMsg,           // leaf message
@@ -98,9 +99,14 @@ events! {
             id(Uuid) {                  // parameter, then subtree
                 update: UserUpdateMsg,
                 delete: UserDeleteMsg,
+                queue Admins { Oncall }, // queue groups of user.<id>
             },
         },
         random => arrow => more: DeepMsg, // `a => x` is `a { x }`
+        jobs {
+            run: JobMsg where queue Runners { Shard(u32) }, // queue groups of jobs.run
+            queue Workers { Mailer },   // queue groups of jobs
+        },
         other = other,                  // mount the tree of another events! module
     }
 }
@@ -109,28 +115,34 @@ events! {
 Every level is a module containing an enum named `Topic`. This example generates:
 
 ```text
-events::Topic                 { git(git::Topic), user(user::Topic), random(…), other(other::Topic) }
-events::git::Topic            { push(GitPushMsg), new(Uuid, GitNewMsg) }
-events::user::Topic           { new(UserNewMsg), id(Uuid, id::Topic) }
-events::user::id::Topic       { update(UserUpdateMsg), delete(UserDeleteMsg) }
+events::Topic                 { Git(git::Topic), User(user::Topic), Random(…), Jobs(jobs::Topic), Other(other::Topic) }
+events::git::Topic            { Push(GitPushMsg), New(Uuid, GitNewMsg) }
+events::user::Topic           { New(UserNewMsg), Id(Uuid, id::Topic) }
+events::user::id::Topic       { Update(UserUpdateMsg), Delete(UserDeleteMsg) }
+events::user::id::Admins      { Oncall }
+events::jobs::Topic           { Run(JobMsg) }
+events::jobs::Workers         { Mailer }
+events::jobs::Runners         { Shard(u32) }
 ```
 
 So names only need to be unique among siblings: `git::new` and `user::new` don't
 clash.
 
-Names are written in lowercase, like NATS subjects. They become both module names
-and enum variants, so lowercase keeps the modules idiomatic, and the macro silences
-the lint about lowercase variants. Rust keywords such as `type` or `match` can't be
-used as names.
+Names are written in snake case, like NATS subjects (`push`, `pull_request`).
+They become the subject segments, the module and method names, and, in camel case,
+the `Topic` variants: `pull_request` is `Topic::PullRequest`. Rust keywords such as
+`type` or `match` can't be used as names.
 
 | Syntax | Meaning | Variant in the parent's `Topic` |
 |---|---|---|
-| `name { … }` | subtree, in module `name` | `name(name::Topic)` |
-| `name: Msg` | leaf message | `name(Msg)` |
-| `name(Type): Msg` | parameter, then message | `name(Type, Msg)` |
-| `name(Type) { … }` | parameter, then subtree, in module `name` | `name(Type, name::Topic)` |
+| `name { … }` | subtree, in module `name` | `Name(name::Topic)` |
+| `name: Msg` | leaf message | `Name(Msg)` |
+| `name(Type): Msg` | parameter, then message | `Name(Type, Msg)` |
+| `name(Type) { … }` | parameter, then subtree, in module `name` | `Name(Type, name::Topic)` |
 | `name => …` | subtree with a single child, no braces | same as `name { … }` |
-| `name = path::to::module` | mount the tree of another `events!` | `name(path::to::module::Topic)` |
+| `name = path::to::module` | mount the tree of another `events!` | `Name(path::to::module::Topic)` |
+| `queue Name { A, B(Type) }` | queue groups of this level, enum `Name` | none |
+| `name: Msg where queue Name { … }` | leaf with queue groups, enum `Name` | `Name(Msg)` |
 
 Each module also gets a `Steps` type with one method per child, which is what
 `topic!` uses to navigate (see below).
@@ -177,8 +189,9 @@ let any_delete    = topic!(any_user, delete);               // user.*.delete, fr
 | `git.push` | `topic!(bus, git.push).subscribe()` |
 | `user.<alice>.>` | `topic!(bus, user.id(alice)).subscribe()` |
 | `user.*.delete` | `topic!(bus, user.id().delete).subscribe()` |
-| queue group | `.subscribe().queue("workers")` |
+| queue group | `.subscribe().queue(jobs::Workers::Mailer)` |
 | request/reply | `channel.request(msg)` / `msg.respond(reply)` |
+| scatter-gather | `channel.scatter(msg)` / `channel.gather(msg, timeout)` |
 
 ## Publishing
 
@@ -188,7 +201,7 @@ subtree value.
 ```rust
 pushes.publish(GitPushMsg { branch: "main".into() }).await;
 alice_deletes.publish(UserDeleteMsg).await;
-git.publish(events::git::Topic::push(GitPushMsg { branch: "dev".into() })).await;
+git.publish(events::git::Topic::Push(GitPushMsg { branch: "dev".into() })).await;
 ```
 
 `publish` returns the number of subscribers that queued the message. A channel
@@ -208,7 +221,7 @@ a `Stream` of messages that deref to the channel's type:
 let mut sub = any_user
     .subscribe()
     .filter(move |(id,), _msg| *id != admin_id) // optional: filter on params and message
-    .queue("workers")                           // optional: share messages with other members
+    .queue(Admins::Oncall)                      // optional: share messages with other members
     .buffer(256)                                // optional: buffer size (default 1024)
     .on_full(Overflow::DropOldest)              // optional: what to do when it's full
     .await;
@@ -216,15 +229,16 @@ let mut sub = any_user
 while let Some(msg) = sub.next().await {
     let (id,) = msg.params();
     match &*msg {
-        events::user::id::Topic::update(update) => { /* … */ }
-        events::user::id::Topic::delete(delete) => { /* … */ }
+        events::user::id::Topic::Update(update) => { /* … */ }
+        events::user::id::Topic::Delete(delete) => { /* … */ }
     }
 }
 ```
 
-- **Queue groups.** Subscribers with the same `.queue(name)` on the same bus share
+- **Queue groups.** Subscribers with the same `.queue(group)` on the same bus share
   the messages: each one goes to a single member. A member waiting in `next()` is
-  picked first. If none is waiting, members take turns (round robin).
+  picked first. If none is waiting, members take turns (round robin). See
+  [Queue groups](#queue-groups).
 - **Slow subscribers.** Each subscription has its own buffer. When it's full, the
   `.on_full(...)` policy applies:
 
@@ -244,6 +258,54 @@ while let Some(msg) = sub.next().await {
 - **Subjects.** `msg.subject()` gives a NATS-style subject for logging, built from
   names and parameter values, e.g. `user.id.42.delete`. `msg.root()` gives the whole
   event.
+
+## Queue groups
+
+Queue groups are declared in `events!` on the topic they belong to: with
+`queue Name { … }` inside a subtree, or with `where queue Name { … }` after a
+leaf. Each declaration becomes an enum in the level's module, and each of its
+values is one group:
+
+```rust
+events! {
+    pub mod events {
+        git {
+            push: GitPushMsg where queue Pushers { Indexer(u32), Audit },
+            queue Workers { Mailer },
+        },
+    }
+}
+
+use events::git::{Pushers, Workers};
+
+let pushes = topic!(bus, git.push);
+let a = pushes.subscribe().queue(Pushers::Indexer(0)).await; // shard 0
+let b = pushes.subscribe().queue(Pushers::Indexer(0)).await; // shard 0
+let c = pushes.subscribe().queue(Pushers::Indexer(1)).await; // shard 1
+let m = topic!(bus, git).subscribe().queue(Workers::Mailer).await; // git.>
+
+pushes.publish(GitPushMsg { branch: "main".into() }).await;
+// one of a and b, then c, then m
+```
+
+- **A group is joined only on the topic that declares it.** `Workers` can be
+  joined on `git` and `Pushers` on `git.push`, not the other way around, and not
+  on any other topic. A member still receives everything its subscription
+  matches: `m`, on `git.>`, gets the pushes.
+- **Each value is a group.** `Indexer(0)` and `Indexer(1)` are two groups, and
+  two enums never share a group, even with the same variant names. Variant
+  values must be `Eq + Hash`, like parameters.
+- **Parameters don't change the topic.** A group declared on `user.id` can be
+  joined on `user.id(alice)` and on `user.id()`; members on both form one group.
+- **Mounted trees keep their groups.** Groups declared inside `other` are joined
+  on `other`'s topics, wherever it's mounted.
+- **Attributes** written before `queue` are added to the group enum, which
+  already derives `Clone`, `PartialEq`, `Eq` and `Hash`.
+
+A leaf declares at most one group enum (put several families of groups in its
+variants), and its channel has that enum as a third type parameter:
+`topic!(bus, git.push)` is a `Channel<GitPushMsg, (), events::git::Pushers>`.
+Other channels keep the default (`Channel<T, P>` is `Channel<T, P, T>`).
 
 ## Request/reply
 
@@ -286,6 +348,30 @@ The first reply wins. Possible errors:
 `request` on its own waits for as long as some receiver still holds the request, so
 prefer `request_timeout` unless you know a responder will answer.
 
+### Scatter-gather
+
+`scatter` sends the request to every subscriber and streams their replies, one per
+responder (a queue group counts as one responder). The stream ends once each of
+them answered or dropped the request; `replies.remaining()` tells how many are
+still expected. `gather` collects the replies until they are all in or the timeout
+runs out, and returns whatever came back:
+
+```rust
+let mut replies = pushes.scatter(GitPushMsg { branch: "main".into() }).await?;
+while let Some(ack) = replies.next().await {
+    // one `PushAck` per responder
+}
+
+let acks: Vec<PushAck> = pushes
+    .gather(GitPushMsg { branch: "main".into() }, Duration::from_secs(1))
+    .await?;
+```
+
+Responders use the same `msg.respond(reply)`, and should answer once: an extra
+reply takes the place of another responder's. Both fail with
+`BusError::NoResponders` when nobody is subscribed; dropping the stream makes
+`respond` return `false` and `is_pending` turn `false`.
+
 ## Sub-channels as roots
 
 A channel's type only mentions the part of the tree it points to. A component that
@@ -314,11 +400,11 @@ other_service(topic!(bus, other)).await;
 
 ## Passing channels around
 
-To write a function that subscribes anywhere in the tree, take a `&Channel<T, P>`.
+To write a function that subscribes anywhere in the tree, take a `&Channel<T, P, S>`.
 The root channel and any `topic!` work the same:
 
 ```rust
-async fn log_all<T: 'static, P: 'static>(ch: &Channel<T, P>) {
+async fn log_all<T: 'static, P: 'static, S>(ch: &Channel<T, P, S>) {
     let mut sub = ch.subscribe().await;
     while let Some(msg) = sub.next().await {
         println!("{}", msg.subject());
@@ -332,7 +418,9 @@ log_all(&topic!(bus, user.id())).await;   // user.*.>
 
 Fix `T` to accept only one part of the tree, for example
 `&Channel<events::git::Topic>`. Leave `P` generic to also accept wildcard channels,
-or leave it out (`P = ()`) to require a channel that can publish.
+or leave it out (`P = ()`) to require a channel that can publish. `S` only matters
+for leaves that declare queue groups (see [Queue groups](#queue-groups)); leave it
+out unless you want to accept those.
 
 Take the channel by value instead when the function keeps it, for example to move it
 into `tokio::spawn`. Clones are cheap.
@@ -367,6 +455,18 @@ topic!(bus, user.id("alice").delete);
 events! { pub mod sensors { reading(f64): Reading } }
 // error: `f64` can't be a parameter
 //        the trait `Eq` is not implemented for `f64`
+
+// a queue group named with a string
+pushes.subscribe().queue("workers");
+// error: `&str` isn't a queue group
+
+// a queue group declared on another topic (Workers is on git)
+pushes.subscribe().queue(Workers::Mailer);
+// error: queue group `Workers` isn't declared on this topic
+
+// wrong value for a queue group
+pushes.subscribe().queue(Pushers::Indexer("0"));
+// error: expected `u32`, found `&str`
 ```
 
 ## Requirements
@@ -375,9 +475,11 @@ events! { pub mod sensors { reading(f64): Reading } }
 - Parameter types must implement `Clone + Eq + Hash + Display`. Messages are routed
   by comparing parameter values with `Eq`, and `Display` is only used for
   `subject()`. Floats aren't `Eq`, so they can't be parameters.
+- Values in queue group variants must implement `Clone + Eq + Hash + Send + Sync +
+  'static`.
 - `events!` must be used at module level, because its modules find your types
   through `use super::*`.
-- `request_timeout` needs a tokio runtime with the timer enabled. Everything else
+- `request_timeout` and `gather` need a tokio runtime with the timer enabled. Everything else
   runs on any executor.
 - Containing panicking filters relies on unwinding, so it doesn't work with
   `panic = "abort"`.

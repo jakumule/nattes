@@ -26,7 +26,7 @@ use std::hint::black_box;
 const BATCH: u64 = 100;
 
 type Bus = Channel<events::Topic>;
-type Load = Channel<Payload>;
+type Load = Channel<Payload, (), events::Group>;
 type Sub<P = ()> = Subscription<Payload, P>;
 
 /// Poll `fut` once: everything measured here completes without waiting.
@@ -35,8 +35,8 @@ fn now<F: Future>(fut: F) -> F::Output {
 }
 
 /// Subscriptions that hold a whole batch.
-fn buffered<T: 'static, P: 'static>(
-    builder: nattes::SubscriptionBuilder<T, P>,
+fn buffered<T: 'static, P: 'static, S>(
+    builder: nattes::SubscriptionBuilder<T, P, S>,
 ) -> Subscription<T, P> {
     start(builder.buffer(BATCH as usize).on_full(Overflow::DropNewest))
 }
@@ -110,7 +110,7 @@ fn queue_setup(n: u64) -> (Load, Vec<Sub>) {
     let bus = channel!(events);
     let load = topic!(bus, load);
     let subs = (0..n)
-        .map(|_| buffered(load.subscribe().queue("workers")))
+        .map(|_| buffered(load.subscribe().queue(events::Group::Workers)))
         .collect();
     (load, subs)
 }

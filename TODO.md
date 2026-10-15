@@ -1,4 +1,4 @@
 # Nattes
 
-- [ ] Make queue group declared
-- [ ] Build Scatter-gather
+- [x] Make queue group declared
+- [x] Build Scatter-gather

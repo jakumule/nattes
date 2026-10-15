@@ -69,61 +69,97 @@ macro_rules! topic {
 ///         },
 ///         random => arrow => more: DeepMsg, // `a => x` is `a { x }`
 ///         other = other,              // mount the tree of another events! module
+///         jobs {
+///             run: JobMsg where queue Runners { Shard(u32) }, // queue groups of `jobs.run`
+///             queue Workers { Mailer },                      // queue groups of `jobs`
+///         },
 ///     }
 /// }
 /// ```
 ///
 /// Every level becomes a module with:
 /// - an enum `Topic` holding the events of that level: `events::Topic`,
-///   `events::git::Topic`, `events::user::id::Topic`, …
+///   `events::git::Topic`, `events::user::id::Topic`, … Each name is a
+///   variant in camel case: `push` is `Topic::Push`, `pull_request` is
+///   `Topic::PullRequest`.
 /// - a type `Steps` with one method per child, used by
 ///   [`topic!`](crate::topic).
+/// - one enum per queue group declaration, `events::jobs::Workers`, which
+///   derives `Clone + PartialEq + Eq + Hash` (attributes written before
+///   `queue` are added to it). Its values can only be joined on the topic
+///   that declares it, with [`queue`](crate::SubscriptionBuilder::queue). A
+///   leaf declares at most one, which is also the third type parameter of
+///   its channel: `Channel<JobMsg, (), events::jobs::Runners>`.
 ///
 /// Names only need to be unique among siblings. Each module does
 /// `use super::*`, so messages and parameter types are found as in the
 /// surrounding code; for that reason `events!` must be used at module level.
 ///
-/// Attributes are applied to every generated enum. Parameter types must
+/// Attributes are applied to every `Topic` enum. Parameter types must
 /// implement `Clone + Eq + Hash + Display` (see [`ParamValue`](crate::ParamValue));
 /// messages must be `Send + Sync + 'static`.
 #[macro_export]
 macro_rules! events {
     // ---------- end of a level: `Topic`, `Steps` and the child modules ----------
     (@munch [$(#[$m:meta])*] [$($v:tt)*] [$($e:tt)*] [$($a:tt)*] [$($s:tt)*]) => {
-        $(#[$m])*
-        pub enum Topic { $($v)* }
+        // variants are the names in camel case: `push` is `Topic::Push`
+        $crate::__pastey::paste! {
+            $(#[$m])*
+            #[allow(clippy::enum_variant_names)]
+            pub enum Topic { $($v)* }
 
-        impl $crate::Node for Topic {
-            fn step(&self) -> $crate::Step<'_> {
-                match self { $($a)* }
+            impl $crate::Node for Topic {
+                fn step(&self) -> $crate::Step<'_> {
+                    match self { $($a)* }
+                }
             }
-        }
 
-        /// Navigation from this level: one method per child.
-        pub struct Steps<P>($crate::Channel<Topic, P>);
+            /// Navigation from this level: one method per child.
+            pub struct Steps<P>($crate::Channel<Topic, P>);
 
-        // method names are topic names, so naming conventions don't apply
-        #[allow(clippy::new_ret_no_self, clippy::wrong_self_convention, clippy::should_implement_trait)]
-        impl<P: 'static> Steps<P> {
-            $($s)*
-        }
-
-        impl $crate::Navigable for Topic {
-            type Steps<P: 'static> = Steps<P>;
-            fn steps<P: 'static>(channel: $crate::Channel<Topic, P>) -> Steps<P> {
-                Steps(channel)
+            // method names are topic names, so naming conventions don't apply
+            #[allow(clippy::new_ret_no_self, clippy::wrong_self_convention, clippy::should_implement_trait)]
+            impl<P: 'static> Steps<P> {
+                $($s)*
             }
-        }
 
-        impl<P: 'static> $crate::IntoChannel for Steps<P> {
-            type T = Topic;
-            type P = P;
-            fn into_channel(self) -> $crate::Channel<Topic, P> {
-                self.0
+            impl $crate::Navigable for Topic {
+                type Steps<P: 'static> = Steps<P>;
+                fn steps<P: 'static>(channel: $crate::Channel<Topic, P>) -> Steps<P> {
+                    Steps(channel)
+                }
+            }
+
+            impl<P: 'static> $crate::IntoChannel for Steps<P> {
+                type T = Topic;
+                type P = P;
+                type S = Topic;
+                fn into_channel(self) -> $crate::Channel<Topic, P> {
+                    self.0
+                }
             }
         }
 
         $($e)*
+    };
+
+    // ---------- queue groups of this level:  queue Workers { Mailer, Indexer(u32) } ----------
+    (@munch $attrs:tt $v:tt [$($e:tt)*] $a:tt $s:tt
+        $(#[$gm:meta])* queue $g:ident { $($gv:tt)* } $(, $($rest:tt)*)?) => {
+        $crate::events!(@munch $attrs
+            $v
+            [$($e)* $crate::events!(@group Topic [$(#[$gm])*] $g { $($gv)* });]
+            $a
+            $s
+            $($($rest)*)?);
+    };
+    (@group $scope:ty [$(#[$gm:meta])*] $g:ident { $($gv:ident $(($gp:ty))?),* $(,)? }) => {
+        $(#[$gm])*
+        #[derive(Clone, PartialEq, Eq, Hash)]
+        pub enum $g { $($gv $(($gp))?),* }
+
+        impl $crate::QueueGroup for $g {}
+        impl $crate::InScope<$scope> for $g {}
     };
 
     // ---------- `a => rest` is sugar for `a { rest }` ----------
@@ -145,21 +181,25 @@ macro_rules! events {
 
     // ---------- prisms for one variant ----------
     (@plain $var:ident) => {
-        $crate::Plain::new(
-            stringify!($var),
-            |a: &Topic| match a {
-                Topic::$var(x) => Some(x),
-                #[allow(unreachable_patterns)]
-                _ => None,
-            },
-            Topic::$var,
-        )
+        $crate::__pastey::paste! {
+            $crate::Plain::new(
+                stringify!($var),
+                |a: &Topic| match a {
+                    Topic::[<$var:camel>](x) => Some(x),
+                    #[allow(unreachable_patterns)]
+                    _ => None,
+                },
+                Topic::[<$var:camel>],
+            )
+        }
     };
     (@project $var:ident) => {
-        |a: &Topic| match a {
-            Topic::$var(v, x) => Some((v, x)),
-            #[allow(unreachable_patterns)]
-            _ => None,
+        $crate::__pastey::paste! {
+            |a: &Topic| match a {
+                Topic::[<$var:camel>](v, x) => Some((v, x)),
+                #[allow(unreachable_patterns)]
+                _ => None,
+            }
         }
     };
 
@@ -167,10 +207,10 @@ macro_rules! events {
     (@munch $attrs:tt [$($v:tt)*] [$($e:tt)*] [$($a:tt)*] [$($s:tt)*]
         $var:ident { $($inner:tt)* } $(, $($rest:tt)*)?) => {
         $crate::events!(@munch $attrs
-            [$($v)* $var($var::Topic),]
+            [$($v)* [<$var:camel>]($var::Topic),]
             [$($e)* $crate::events!(@module $attrs pub $var { $($inner)* });]
             [$($a)*
-                Topic::$var(x) => $crate::Step {
+                Topic::[<$var:camel>](x) => $crate::Step {
                     name: stringify!($var), param: None, next: Some(x),
                 },
             ]
@@ -186,10 +226,10 @@ macro_rules! events {
     (@munch $attrs:tt [$($v:tt)*] [$($e:tt)*] [$($a:tt)*] [$($s:tt)*]
         $var:ident ($p:ty) { $($inner:tt)* } $(, $($rest:tt)*)?) => {
         $crate::events!(@munch $attrs
-            [$($v)* $var($p, $var::Topic),]
+            [$($v)* [<$var:camel>]($p, $var::Topic),]
             [$($e)* $crate::events!(@module $attrs pub $var { $($inner)* });]
             [$($a)*
-                Topic::$var(p, x) => $crate::Step {
+                Topic::[<$var:camel>](p, x) => $crate::Step {
                     name: stringify!($var), param: Some(p as &dyn $crate::ParamValue), next: Some(x),
                 },
             ]
@@ -198,7 +238,7 @@ macro_rules! events {
                 where
                     P: $crate::AppendParams<S::Q>,
                 {
-                    let prism = $crate::ParamStep::new(stringify!($var), select, $crate::events!(@project $var), Topic::$var);
+                    let prism = $crate::ParamStep::new(stringify!($var), select, $crate::events!(@project $var), Topic::[<$var:camel>]);
                     <$var::Topic as $crate::Navigable>::steps(self.0.at_prism(prism))
                 }
             ]
@@ -209,10 +249,10 @@ macro_rules! events {
     (@munch $attrs:tt [$($v:tt)*] $e:tt [$($a:tt)*] [$($s:tt)*]
         $var:ident = $($m:ident)::+ $(, $($rest:tt)*)?) => {
         $crate::events!(@munch $attrs
-            [$($v)* $var($($m::)+ Topic),]
+            [$($v)* [<$var:camel>]($($m::)+ Topic),]
             $e
             [$($a)*
-                Topic::$var(x) => $crate::Step {
+                Topic::[<$var:camel>](x) => $crate::Step {
                     name: stringify!($var), param: None, next: Some(x),
                 },
             ]
@@ -224,14 +264,66 @@ macro_rules! events {
             $($($rest)*)?);
     };
 
+    // ---------- leaf with queue groups:  push: GitPushMsg where queue Pushers { … } ----------
+    // The group enum is also the leaf's topic type: the message type may be
+    // used by other leaves.
+    (@munch $attrs:tt [$($v:tt)*] [$($e:tt)*] [$($a:tt)*] [$($s:tt)*]
+        $var:ident : $t:ty where $(#[$gm:meta])* queue $g:ident { $($gv:tt)* }
+        $(, $($rest:tt)*)?) => {
+        $crate::events!(@munch $attrs
+            [$($v)* [<$var:camel>]($t),]
+            [$($e)*
+                $crate::events!(@group $g [$(#[$gm])*] $g { $($gv)* });
+            ]
+            [$($a)*
+                Topic::[<$var:camel>](_) => $crate::Step {
+                    name: stringify!($var), param: None, next: None,
+                },
+            ]
+            [$($s)*
+                pub fn $var(self) -> $crate::Channel<$t, P, $g> {
+                    self.0.at_prism($crate::events!(@plain $var)).on_topic()
+                }
+            ]
+            $($($rest)*)?);
+    };
+
+    // ---------- param leaf with queue groups:  new(Uuid): GitNewMsg where queue … ----------
+    (@munch $attrs:tt [$($v:tt)*] [$($e:tt)*] [$($a:tt)*] [$($s:tt)*]
+        $var:ident ($p:ty) : $t:ty where $(#[$gm:meta])* queue $g:ident { $($gv:tt)* }
+        $(, $($rest:tt)*)?) => {
+        $crate::events!(@munch $attrs
+            [$($v)* [<$var:camel>]($p, $t),]
+            [$($e)*
+                $crate::events!(@group $g [$(#[$gm])*] $g { $($gv)* });
+            ]
+            [$($a)*
+                Topic::[<$var:camel>](p, _) => $crate::Step {
+                    name: stringify!($var), param: Some(p as &dyn $crate::ParamValue), next: None,
+                },
+            ]
+            [$($s)*
+                pub fn $var<S: $crate::Param<$p>>(self, select: S) -> $crate::Channel<$t, $crate::Append<P, S::Q>, $g>
+                where
+                    P: $crate::AppendParams<S::Q>,
+                {
+                    self.0
+                        .at_prism($crate::ParamStep::new(stringify!($var), select, $crate::events!(@project $var), Topic::[<$var:camel>]))
+                        .on_topic()
+                }
+            ]
+            $($($rest)*)?);
+    };
+
+
     // ---------- leaf:  push: GitPushMsg ----------
     (@munch $attrs:tt [$($v:tt)*] $e:tt [$($a:tt)*] [$($s:tt)*]
         $var:ident : $t:ty $(, $($rest:tt)*)?) => {
         $crate::events!(@munch $attrs
-            [$($v)* $var($t),]
+            [$($v)* [<$var:camel>]($t),]
             $e
             [$($a)*
-                Topic::$var(_) => $crate::Step {
+                Topic::[<$var:camel>](_) => $crate::Step {
                     name: stringify!($var), param: None, next: None,
                 },
             ]
@@ -247,10 +339,10 @@ macro_rules! events {
     (@munch $attrs:tt [$($v:tt)*] $e:tt [$($a:tt)*] [$($s:tt)*]
         $var:ident ($p:ty) : $t:ty $(, $($rest:tt)*)?) => {
         $crate::events!(@munch $attrs
-            [$($v)* $var($p, $t),]
+            [$($v)* [<$var:camel>]($p, $t),]
             $e
             [$($a)*
-                Topic::$var(p, _) => $crate::Step {
+                Topic::[<$var:camel>](p, _) => $crate::Step {
                     name: stringify!($var), param: Some(p as &dyn $crate::ParamValue), next: None,
                 },
             ]
@@ -259,7 +351,7 @@ macro_rules! events {
                 where
                     P: $crate::AppendParams<S::Q>,
                 {
-                    self.0.at_prism($crate::ParamStep::new(stringify!($var), select, $crate::events!(@project $var), Topic::$var))
+                    self.0.at_prism($crate::ParamStep::new(stringify!($var), select, $crate::events!(@project $var), Topic::[<$var:camel>]))
                 }
             ]
             $($($rest)*)?);
@@ -267,8 +359,6 @@ macro_rules! events {
 
     // ---------- one level = one module ----------
     (@module $attrs:tt $vis:vis $name:ident { $($body:tt)* }) => {
-        // names are the subject segments, lowercase like NATS subjects
-        #[allow(non_snake_case, non_camel_case_types, clippy::enum_variant_names)]
         $vis mod $name {
             #[allow(unused_imports)]
             use super::*;

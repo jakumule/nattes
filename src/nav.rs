@@ -226,12 +226,14 @@ pub trait Navigable: Sized + 'static {
 pub trait IntoChannel {
     type T;
     type P;
-    fn into_channel(self) -> Channel<Self::T, Self::P>;
+    type S;
+    fn into_channel(self) -> Channel<Self::T, Self::P, Self::S>;
 }
 
-impl<T, P> IntoChannel for Channel<T, P> {
+impl<T, P, S> IntoChannel for Channel<T, P, S> {
     type T = T;
     type P = P;
+    type S = S;
     fn into_channel(self) -> Self {
         self
     }

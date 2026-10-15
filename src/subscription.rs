@@ -2,6 +2,7 @@
 
 use crate::bus::{Core, Event, Matcher, Queue};
 use crate::channel::Route;
+use crate::group::{GroupKey, InScope, QueueGroup};
 use crate::nav::Key;
 use crate::{subject, Channel, Overflow};
 use futures::Stream;
@@ -16,15 +17,18 @@ use std::task::{Context, Poll};
 type Filter<P, T> = Box<dyn Fn(&P, &T) -> bool + Send + Sync>;
 
 /// Configure a subscription, then `.await` it to start receiving.
-pub struct SubscriptionBuilder<T, P> {
-    pub(crate) channel: Channel<T, P>,
+///
+/// `S` is the topic the channel is on, which decides the queue groups it can
+/// join.
+pub struct SubscriptionBuilder<T, P, S = T> {
+    pub(crate) channel: Channel<T, P, S>,
     pub(crate) filters: Vec<Filter<P, T>>,
-    pub(crate) group: Option<String>,
+    pub(crate) group: Option<GroupKey>,
     pub(crate) buffer: usize,
     pub(crate) overflow: Overflow,
 }
 
-impl<T: 'static, P: 'static> SubscriptionBuilder<T, P> {
+impl<T: 'static, P: 'static, S> SubscriptionBuilder<T, P, S> {
     /// Only messages for which `f(params, msg)` is true. A panicking filter
     /// counts as "no match".
     pub fn filter(mut self, f: impl Fn(&P, &T) -> bool + Send + Sync + 'static) -> Self {
@@ -33,8 +37,11 @@ impl<T: 'static, P: 'static> SubscriptionBuilder<T, P> {
     }
 
     /// Join a queue group: each message goes to one member of the group.
-    pub fn queue(mut self, group: impl Into<String>) -> Self {
-        self.group = Some(group.into());
+    ///
+    /// Groups are declared on a topic in [`events!`](crate::events), with
+    /// `queue Name { … }`, and can only be joined on that topic.
+    pub fn queue<G: QueueGroup + InScope<S>>(mut self, group: G) -> Self {
+        self.group = Some(GroupKey::new(group));
         self
     }
 
@@ -67,7 +74,7 @@ impl<T: 'static, P: 'static> SubscriptionBuilder<T, P> {
         });
 
         let core = self.channel.core;
-        let id = core.subscribe(&path, matches, self.group.as_deref(), queue.clone());
+        let id = core.subscribe(&path, matches, self.group.as_ref(), queue.clone());
         Subscription {
             id,
             core,
@@ -79,7 +86,7 @@ impl<T: 'static, P: 'static> SubscriptionBuilder<T, P> {
     }
 }
 
-impl<T: 'static, P: 'static> IntoFuture for SubscriptionBuilder<T, P> {
+impl<T: 'static, P: 'static, S> IntoFuture for SubscriptionBuilder<T, P, S> {
     type Output = Subscription<T, P>;
     type IntoFuture = Ready<Subscription<T, P>>;
 
@@ -95,7 +102,7 @@ pub struct Subscription<T, P> {
     queue: Arc<Queue>,
     route: Arc<dyn Route<T, P>>,
     path: Box<[Key]>,
-    group: Option<String>,
+    group: Option<GroupKey>,
 }
 
 impl<T, P> Subscription<T, P> {
@@ -123,7 +130,7 @@ impl<T, P> Stream for Subscription<T, P> {
 impl<T, P> Drop for Subscription<T, P> {
     fn drop(&mut self) {
         self.core
-            .unsubscribe(&self.path, self.id, self.group.as_deref());
+            .unsubscribe(&self.path, self.id, self.group.as_ref());
         self.queue.close();
     }
 }

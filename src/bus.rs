@@ -1,6 +1,7 @@
 //! Untyped bus core: works only with `Arc<dyn Node>` events and `&dyn Any`
 //! matchers. [`Channel`](crate::Channel) adds the types on top.
 
+use crate::group::GroupKey;
 use crate::nav::{Key, KeyParam, ParamKey};
 use crate::Node;
 use arc_swap::ArcSwap;
@@ -395,9 +396,9 @@ fn pick<'e>(
 
 #[derive(Default)]
 struct State {
-    /// Queue groups by name, with their member count: a group is forgotten
+    /// Queue groups by value, with their member count: a group is forgotten
     /// with its last member.
-    groups: HashMap<String, (Arc<Group>, usize)>,
+    groups: HashMap<GroupKey, (Arc<Group>, usize)>,
     next_id: u64,
 }
 
@@ -484,14 +485,14 @@ impl Core {
         &self,
         path: &[Key],
         matches: Option<Matcher>,
-        group: Option<&str>,
+        group: Option<&GroupKey>,
         queue: Arc<Queue>,
     ) -> u64 {
         let mut state = lock(&self.state);
         let id = state.next_id;
         state.next_id += 1;
-        let group = group.map(|name| {
-            let (group, members) = state.groups.entry(name.to_owned()).or_default();
+        let group = group.map(|key| {
+            let (group, members) = state.groups.entry(key.clone()).or_default();
             *members += 1;
             group.clone()
         });
@@ -502,14 +503,14 @@ impl Core {
         id
     }
 
-    pub(crate) fn unsubscribe(&self, path: &[Key], id: u64, group: Option<&str>) {
+    pub(crate) fn unsubscribe(&self, path: &[Key], id: u64, group: Option<&GroupKey>) {
         // Writers are serialized by `state`, so no update is lost
         let mut state = lock(&self.state);
-        if let Some(name) = group {
-            if let Some((_, members)) = state.groups.get_mut(name) {
+        if let Some(key) = group {
+            if let Some((_, members)) = state.groups.get_mut(key) {
                 *members -= 1;
                 if *members == 0 {
-                    state.groups.remove(name);
+                    state.groups.remove(key);
                 }
             }
         }

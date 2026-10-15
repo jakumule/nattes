@@ -1,5 +1,7 @@
 use super::*;
 use crate::{channel, topic};
+use events::git::{GitWorkers, Pushers};
+use events::user::id::Admins;
 use futures::{FutureExt, StreamExt};
 use std::pin::pin;
 use uuid::Uuid;
@@ -44,17 +46,19 @@ crate::events! {
     #[allow(dead_code)]
     pub mod events {
         git {
-            push: GitPushMsg,
+            push: GitPushMsg where #[derive(Debug)] queue Pushers { Workers, Shard(u32) },
             pull: GitPullMsg,
             new(Uuid): GitNewMsg,
             count(u32): U32Event,
             fetch: Request<GitFetchMsg, FetchAck>,
+            queue GitWorkers { Workers },
         },
         user {
             new: UserNewMsg,
             id(Uuid) {
                 update: UserUpdateMsg,
                 delete: UserDeleteMsg,
+                queue Admins { Workers },
             },
         },
         repo {
@@ -92,7 +96,7 @@ async fn navigate_the_tree() {
     topic!(git, pull).publish(GitPullMsg).await;
     deep.publish(VeryNestedMsg).await;
     // publishing a whole subtree value works too
-    git.publish(events::git::Topic::push(GitPushMsg("dev".into())))
+    git.publish(events::git::Topic::Push(GitPushMsg("dev".into())))
         .await;
 
     assert_eq!(drain(&mut all_sub).len(), 4);
@@ -191,8 +195,8 @@ async fn same_type_in_several_places() {
 #[tokio::test]
 async fn queue_groups_share_messages() {
     let pushes = push_channel();
-    let mut w1 = pushes.subscribe().queue("workers").await;
-    let mut w2 = pushes.subscribe().queue("workers").await;
+    let mut w1 = pushes.subscribe().queue(Pushers::Workers).await;
+    let mut w2 = pushes.subscribe().queue(Pushers::Workers).await;
     let mut watcher = pushes.subscribe().await;
 
     for i in 0..4 {
@@ -268,6 +272,85 @@ async fn request_dropped_without_reply() {
 }
 
 #[tokio::test]
+async fn scatter_gathers_one_reply_per_responder() -> anyhow::Result<()> {
+    let fetches = fetch_channel();
+    assert!(matches!(
+        fetches.scatter(GitFetchMsg("main".into())).await,
+        Err(BusError::NoResponders)
+    ));
+
+    for n in 1..=3 {
+        let mut responder = fetches.subscribe().await;
+        tokio::spawn(async move {
+            while let Some(msg) = responder.next().await {
+                msg.respond(FetchAck(n));
+            }
+        });
+    }
+
+    let replies = fetches.scatter(GitFetchMsg("main".into())).await?;
+    assert_eq!(replies.remaining(), 3);
+    let mut acks: Vec<_> = replies.collect().await;
+    acks.sort_by_key(|ack| ack.0);
+    assert_eq!(acks, [FetchAck(1), FetchAck(2), FetchAck(3)]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn scatter_ends_when_responders_drop_the_request() -> anyhow::Result<()> {
+    let fetches = fetch_channel();
+    let mut a = fetches.subscribe().await;
+    let mut silent = fetches.subscribe().await;
+    let mut replies = fetches.scatter(GitFetchMsg("main".into())).await?;
+
+    let a = a.next().await.unwrap();
+    assert!(a.respond(FetchAck(1)));
+    drop(silent.next().await.unwrap());
+    drop(a);
+
+    assert_eq!(replies.next().await, Some(FetchAck(1)));
+    assert_eq!(replies.next().await, None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn scatter_stops_listening_once_everyone_replied() -> anyhow::Result<()> {
+    let fetches = fetch_channel();
+    let mut sub = fetches.subscribe().await;
+    let mut replies = fetches.scatter(GitFetchMsg("main".into())).await?;
+
+    let msg = sub.next().await.unwrap();
+    assert!(msg.respond(FetchAck(1)));
+    // Still held by the responder, but the one expected reply is in
+    assert_eq!(replies.next().await, Some(FetchAck(1)));
+    assert_eq!(replies.next().await, None);
+    assert!(!msg.is_pending());
+    assert!(!msg.respond(FetchAck(2)));
+    Ok(())
+}
+
+#[tokio::test]
+async fn gather_returns_replies_received_before_timeout() -> anyhow::Result<()> {
+    let fetches = fetch_channel();
+    let mut fast = fetches.subscribe().await;
+    tokio::spawn(async move {
+        while let Some(msg) = fast.next().await {
+            msg.respond(FetchAck(1));
+        }
+    });
+    let _silent = fetches.subscribe().await;
+
+    let acks = fetches
+        .gather(
+            GitFetchMsg("main".into()),
+            std::time::Duration::from_millis(20),
+        )
+        .await?;
+    assert_eq!(acks, [FetchAck(1)]);
+    Ok(())
+}
+
+#[tokio::test]
 async fn drop_unsubscribes() {
     let pushes = push_channel();
     let sub = pushes.subscribe().await;
@@ -276,7 +359,7 @@ async fn drop_unsubscribes() {
     assert_eq!(pushes.publish(GitPushMsg("b".into())).await, 0);
 }
 
-fn push_channel() -> Channel<GitPushMsg> {
+fn push_channel() -> Channel<GitPushMsg, (), events::git::Pushers> {
     topic!(channel!(events), git.push)
 }
 
@@ -403,6 +486,9 @@ fn handles_are_send_and_sync() {
     let pushes = push_channel();
     assert_send(pushes.publish(GitPushMsg("a".into())));
     assert_send(fetch_channel().request(GitFetchMsg("a".into())));
+    assert_send(fetch_channel().scatter(GitFetchMsg("a".into())));
+    assert_send(fetch_channel().gather(GitFetchMsg("a".into()), Default::default()));
+    assert_send_sync::<Replies<FetchAck>>();
     assert_send_sync::<Msg<Request<GitFetchMsg, FetchAck>, ()>>();
 }
 
@@ -433,25 +519,69 @@ async fn full_path_equals_step_by_step() {
 }
 
 #[tokio::test]
-async fn queue_group_spans_levels_in_subscription_order() {
+async fn queue_group_spans_parameter_nodes_in_subscription_order() {
     let bus = channel!(events);
-    let pushes = topic!(bus, git.push);
-    // members sit on different nodes of the interest graph
-    let mut w1 = topic!(bus, git).subscribe().queue("workers").await;
-    let mut w2 = pushes.subscribe().queue("workers").await;
+    let alice = Uuid::now_v7();
+    // same topic, but members sit on different nodes of the interest graph
+    let mut w1 = topic!(bus, user.id())
+        .subscribe()
+        .queue(Admins::Workers)
+        .await;
+    let mut w2 = topic!(bus, user.id(alice))
+        .subscribe()
+        .queue(Admins::Workers)
+        .await;
 
     // nobody waits yet, so members take turns
-    pushes.publish(GitPushMsg("a".into())).await;
-    pushes.publish(GitPushMsg("b".into())).await;
-    assert_eq!(drain(&mut w1).len(), 1);
-    assert_eq!(*drain(&mut w2)[0], GitPushMsg("b".into()));
+    topic!(bus, user.id(alice).update)
+        .publish(UserUpdateMsg)
+        .await;
+    topic!(bus, user.id(alice).delete)
+        .publish(UserDeleteMsg)
+        .await;
+    let w1 = drain(&mut w1);
+    let w2 = drain(&mut w2);
+    assert!(matches!(*w1[0], events::user::id::Topic::Update(_)));
+    assert!(matches!(*w2[0], events::user::id::Topic::Delete(_)));
+}
+
+#[tokio::test]
+async fn queue_groups_are_told_apart_by_value() {
+    let pushes = push_channel();
+    let mut a = pushes.subscribe().queue(Pushers::Shard(0)).await;
+    let mut b = pushes.subscribe().queue(Pushers::Shard(0)).await;
+    let mut c = pushes.subscribe().queue(Pushers::Shard(1)).await;
+
+    for i in 0..4 {
+        // one of a and b, and c
+        assert_eq!(pushes.publish(GitPushMsg(i.to_string())).await, 2);
+    }
+    assert_eq!(drain(&mut a).len() + drain(&mut b).len(), 4);
+    assert_eq!(drain(&mut c).len(), 4);
+    assert_eq!(pushes.core.group_count(), 2);
+}
+
+#[tokio::test]
+async fn queue_groups_are_told_apart_by_type() {
+    let bus = channel!(events);
+    let pushes = topic!(bus, git.push);
+    // both variants are named `workers`; the group on git also gets git.push
+    let mut on_git = topic!(bus, git)
+        .subscribe()
+        .queue(GitWorkers::Workers)
+        .await;
+    let mut on_push = pushes.subscribe().queue(Pushers::Workers).await;
+
+    assert_eq!(pushes.publish(GitPushMsg("a".into())).await, 2);
+    assert_eq!(drain(&mut on_git).len(), 1);
+    assert_eq!(drain(&mut on_push).len(), 1);
 }
 
 #[tokio::test]
 async fn queue_group_prefers_idle_members() {
     let pushes = push_channel();
-    let mut w1 = pushes.subscribe().queue("workers").await;
-    let mut w2 = pushes.subscribe().queue("workers").await;
+    let mut w1 = pushes.subscribe().queue(Pushers::Workers).await;
+    let mut w2 = pushes.subscribe().queue(Pushers::Workers).await;
 
     // w2 waits for a message; w1 hasn't asked yet
     assert!(w2.next().now_or_never().is_none());
@@ -495,7 +625,10 @@ async fn unsubscribing_prunes_the_interest_graph() {
         topic!(bus, user.id(alice).delete).subscribe().await,
         topic!(bus, user.id().update).subscribe().await,
         topic!(bus, other.text()).subscribe().await,
-        topic!(bus, git).subscribe().queue("workers").await,
+        topic!(bus, git)
+            .subscribe()
+            .queue(GitWorkers::Workers)
+            .await,
     );
     assert!(!bus.core.interest.load().children.is_empty());
 
@@ -625,17 +758,21 @@ async fn long_param_values_route_like_short_ones() {
 #[tokio::test]
 async fn queue_group_skips_members_whose_filter_rejects() {
     let bus = channel!(events);
-    let pushes = topic!(bus, git.push);
+    let alice = Uuid::now_v7();
     // on different nodes, so the group is merged across the subject
-    let mut picky = topic!(bus, git)
+    let mut picky = topic!(bus, user.id())
         .subscribe()
         .filter(|_, _| false)
-        .queue("workers")
+        .queue(Admins::Workers)
         .await;
-    let mut w = pushes.subscribe().queue("workers").await;
+    let mut w = topic!(bus, user.id(alice))
+        .subscribe()
+        .queue(Admins::Workers)
+        .await;
 
-    for i in 0..3 {
-        assert_eq!(pushes.publish(GitPushMsg(i.to_string())).await, 1);
+    let deletes = topic!(bus, user.id(alice).delete);
+    for _ in 0..3 {
+        assert_eq!(deletes.publish(UserDeleteMsg).await, 1);
     }
     assert!(drain(&mut picky).is_empty());
     assert_eq!(drain(&mut w).len(), 3);
@@ -644,8 +781,8 @@ async fn queue_group_skips_members_whose_filter_rejects() {
 #[tokio::test]
 async fn queue_groups_are_forgotten_with_their_last_member() {
     let pushes = push_channel();
-    let w1 = pushes.subscribe().queue("workers").await;
-    let w2 = pushes.subscribe().queue("workers").await;
+    let w1 = pushes.subscribe().queue(Pushers::Workers).await;
+    let w2 = pushes.subscribe().queue(Pushers::Workers).await;
     assert_eq!(pushes.core.group_count(), 1);
     drop(w1);
     assert_eq!(pushes.core.group_count(), 1);
