@@ -2,7 +2,7 @@
 //! walks one level down with [`Node::step`].
 
 use std::any::Any;
-use std::fmt::Display;
+use std::fmt::{self, Display};
 use std::hash::{Hash, Hasher};
 
 /// Implemented by every enum generated with [`events!`](crate::events).
@@ -66,13 +66,28 @@ impl Hash for dyn ParamValue {
 
 /// NATS-style subject of an event, e.g. `user.<uuid>.delete`.
 pub fn subject(node: &dyn Node) -> String {
-    let mut parts = Vec::new();
-    let mut next = Some(node);
-    while let Some(node) = next {
-        let step = node.step();
-        parts.push(step.name.to_string());
-        parts.extend(step.param.map(ToString::to_string));
-        next = step.next;
+    Subject(node).to_string()
+}
+
+/// Displays the [`subject`] of an event without building a `String`.
+pub(crate) struct Subject<'a>(pub(crate) &'a dyn Node);
+
+impl Display for Subject<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut next = Some(self.0);
+        let mut first = true;
+        while let Some(node) = next {
+            let step = node.step();
+            if !first {
+                f.write_str(".")?;
+            }
+            first = false;
+            f.write_str(step.name)?;
+            if let Some(param) = step.param {
+                write!(f, ".{param}")?;
+            }
+            next = step.next;
+        }
+        Ok(())
     }
-    parts.join(".")
 }

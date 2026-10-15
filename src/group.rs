@@ -27,6 +27,8 @@ trait GroupValue: Send + Sync + 'static {
     fn as_any(&self) -> &dyn Any;
     fn eq_value(&self, other: &dyn GroupValue) -> bool;
     fn hash_value(&self, state: &mut dyn Hasher);
+    #[cfg(feature = "tracing")]
+    fn type_name(&self) -> &'static str;
 }
 
 impl<G: QueueGroup> GroupValue for G {
@@ -39,6 +41,10 @@ impl<G: QueueGroup> GroupValue for G {
     fn hash_value(&self, mut state: &mut dyn Hasher) {
         TypeId::of::<G>().hash(&mut state);
         self.hash(&mut state);
+    }
+    #[cfg(feature = "tracing")]
+    fn type_name(&self) -> &'static str {
+        std::any::type_name::<G>()
     }
 }
 
@@ -63,5 +69,13 @@ impl Eq for GroupKey {}
 impl Hash for GroupKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.0.hash_value(state);
+    }
+}
+
+/// The group enum's type: group values need not implement `Debug`.
+#[cfg(feature = "tracing")]
+impl std::fmt::Debug for GroupKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0.type_name())
     }
 }

@@ -2,7 +2,12 @@
 //! matchers. [`Channel`](crate::Channel) adds the types on top.
 
 use crate::group::GroupKey;
+use crate::log::{debug, trace, warning};
+#[cfg(feature = "tracing")]
+use crate::nav::Pattern;
 use crate::nav::{Key, KeyParam, ParamKey};
+#[cfg(feature = "tracing")]
+use crate::tree::Subject;
 use crate::Node;
 use arc_swap::ArcSwap;
 use futures::task::AtomicWaker;
@@ -66,6 +71,8 @@ struct QueueState {
 
 enum Push {
     Queued,
+    /// Queued in place of the oldest message.
+    Evicted,
     Dropped,
     Full(Event),
     Closed,
@@ -94,6 +101,7 @@ impl Queue {
         if state.closed {
             return Push::Closed;
         }
+        let mut evicted = false;
         if state.items.len() >= self.capacity {
             match self.overflow {
                 Overflow::DropNewest => {
@@ -103,6 +111,7 @@ impl Queue {
                 Overflow::DropOldest => {
                     state.items.pop_front();
                     self.dropped.fetch_add(1, Ordering::Relaxed);
+                    evicted = true;
                 }
                 Overflow::Wait => {
                     // Set under the lock, so the pop that frees room sees it
@@ -118,7 +127,11 @@ impl Queue {
         if self.parked.load(Ordering::Relaxed) && self.parked.swap(false, Ordering::AcqRel) {
             self.waker.wake();
         }
-        Push::Queued
+        if evicted {
+            Push::Evicted
+        } else {
+            Push::Queued
+        }
     }
 
     /// Wait for room; `false` if the subscriber went away first.
@@ -127,7 +140,7 @@ impl Queue {
             let mut notified = pin!(self.space.notified());
             notified.as_mut().enable();
             match self.try_push(event) {
-                Push::Queued => return true,
+                Push::Queued | Push::Evicted => return true,
                 Push::Dropped | Push::Closed => return false,
                 Push::Full(back) => event = back,
             }
@@ -189,7 +202,13 @@ impl Entry {
     /// code: a panic counts as no match.
     fn accepts(&self, event: &dyn Any) -> bool {
         self.matches.as_ref().is_none_or(|matches| {
-            catch_unwind(AssertUnwindSafe(|| matches(event))).unwrap_or(false)
+            catch_unwind(AssertUnwindSafe(|| matches(event))).unwrap_or_else(|_| {
+                warning!(
+                    subscription = self.id,
+                    "filter panicked, counted as no match"
+                );
+                false
+            })
         })
     }
 }
@@ -437,10 +456,23 @@ impl Core {
         let interest = self.interest.load();
         let mut delivered = 0;
         let mut waiting = Vec::new();
-        let mut push = |queue: &Arc<Queue>| match queue.try_push(event.clone()) {
+        let mut push = |entry: &Entry| match entry.queue.try_push(event.clone()) {
             Push::Queued => delivered += 1,
-            Push::Full(event) => waiting.push((queue.clone(), event)),
-            Push::Dropped | Push::Closed => {}
+            Push::Evicted => {
+                debug!(
+                    subscription = entry.id,
+                    subject = %Subject(&**event),
+                    "buffer full, dropped the oldest message"
+                );
+                delivered += 1;
+            }
+            Push::Full(event) => waiting.push((entry.queue.clone(), event)),
+            Push::Dropped => debug!(
+                subscription = entry.id,
+                subject = %Subject(&**event),
+                "buffer full, dropped the message"
+            ),
+            Push::Closed => {}
         };
 
         // The graph matches the subject exactly; matchers only run filters
@@ -449,7 +481,7 @@ impl Core {
         interest.visit(Some(&**event), &mut |node| {
             for entry in &node.entries {
                 if entry.accepts(any) {
-                    push(&entry.queue);
+                    push(entry);
                 }
             }
             if !node.groups.is_empty() {
@@ -475,9 +507,15 @@ impl Core {
                 pick(&members.group, entries.len(), |i| &entries[i], any)
             };
             if let Some(member) = member {
-                push(&member.queue);
+                push(member);
             }
         }
+        trace!(
+            subject = %Subject(&**event),
+            delivered,
+            waiting = waiting.len(),
+            "publish"
+        );
         (delivered, waiting)
     }
 
@@ -485,21 +523,32 @@ impl Core {
         &self,
         path: &[Key],
         matches: Option<Matcher>,
-        group: Option<&GroupKey>,
+        group_key: Option<&GroupKey>,
         queue: Arc<Queue>,
     ) -> u64 {
         let mut state = lock(&self.state);
         let id = state.next_id;
         state.next_id += 1;
-        let group = group.map(|key| {
+        let group = group_key.map(|key| {
             let (group, members) = state.groups.entry(key.clone()).or_default();
             *members += 1;
             group.clone()
         });
+        #[cfg(feature = "tracing")]
+        let filtered = matches.is_some();
         let entry = Arc::new(Entry { id, matches, queue });
         let mut interest = self.interest.load_full();
         interest.insert(path, entry, group);
         self.interest.store(interest);
+        // No user code under our lock, and a tracing subscriber is user code
+        drop(state);
+        debug!(
+            subscription = id,
+            subject = %Pattern(path),
+            group = ?group_key,
+            filtered,
+            "subscribe"
+        );
         id
     }
 
@@ -517,6 +566,8 @@ impl Core {
         let mut interest = self.interest.load_full();
         interest.remove(path, id);
         self.interest.store(interest);
+        drop(state);
+        debug!(subscription = id, subject = %Pattern(path), "unsubscribe");
     }
 
     #[cfg(test)]

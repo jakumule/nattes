@@ -275,3 +275,23 @@ impl_append!(A B);
 impl_append!(A B C);
 impl_append!(A B C D);
 impl_append!(A B C D E);
+
+/// Displays where a subscription sits as a NATS subject, e.g. `user.*.>`.
+#[cfg(feature = "tracing")]
+pub(crate) struct Pattern<'a>(pub(crate) &'a [Key]);
+
+#[cfg(feature = "tracing")]
+impl std::fmt::Display for Pattern<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for key in self.0 {
+            f.write_str(key.name)?;
+            match &key.param {
+                KeyParam::None => {}
+                KeyParam::Any => f.write_str(".*")?,
+                KeyParam::Is(value) => write!(f, ".{}", value.0)?,
+            }
+            f.write_str(".")?;
+        }
+        f.write_str(">")
+    }
+}

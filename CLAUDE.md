@@ -15,6 +15,7 @@ cargo build
 cargo test                       # unit tests (src/tests.rs) + doctests in lib.rs
 cargo test <name>                # single test by name substring
 cargo test --doc                 # doctests only (includes compile_fail checks)
+cargo test --features tracing     # also the tracing test (tests/tracing.rs)
 cargo clippy --all-features      # lint, as run in CI
 cargo bench --bench throughput   # criterion multi-threaded throughput (noisy, wall-clock)
 cargo bench --bench throughput -- fan_out   # one bench group
@@ -48,4 +49,5 @@ The repo is also a jujutsu repo (`.jj/`), so git may show a detached `HEAD`.
 - Compile-time guarantees are part of the API. When changing navigation or publishing, update the `compile_fail` doctests in `lib.rs` and the "Compile-time checks" section of the README.
 - Every handle and future must stay `Send + Sync`, and messages are `Send + Sync + 'static`.
 - Generated code follows Rust naming conventions: names are snake case (modules, methods, subject segments) and become camel case `Topic` variants. Only clippy lints about method names (`clippy::new_ret_no_self`, …) are silenced, since `Steps` methods are topic names.
+- Logging goes through the `trace!`/`debug!`/`warning!` macros in `src/log.rs`, which compile to nothing without the `tracing` feature. Never log while holding a lock: a tracing subscriber is user code. Format subjects lazily (`%Subject(..)`, `%Pattern(..)`), never with `subject()`. The test is its own binary (`tests/tracing.rs`) because tracing caches callsite interest globally, so it races with tests on other threads.
 - `TODO.md` tracks planned features.

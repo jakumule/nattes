@@ -38,6 +38,25 @@ while let Some(msg) = deletes.next().await {
 nattes = { git = "https://github.com/JacquesHumule/nattes" }
 ```
 
+### Tracing
+
+Enable the `tracing` feature to log what the bus does with
+[`tracing`](https://docs.rs/tracing), under the `nattes` target:
+
+```toml
+nattes = { git = "https://github.com/JacquesHumule/nattes", features = ["tracing"] }
+```
+
+| Level   | Event                                                                 |
+|---------|-----------------------------------------------------------------------|
+| `debug` | `subscribe` / `unsubscribe`, with the id, subject (`user.id.*.>`) and queue group |
+| `trace` | `publish`, with the subject and how many subscribers got the message  |
+| `debug` | a message dropped because a subscriber's buffer is full               |
+| `warn`  | a filter that panicked                                                |
+
+Subjects are only formatted when the event is enabled. Without the feature, nothing
+is compiled in.
+
 ## Quick start
 
 ```rust

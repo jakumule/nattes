@@ -18,6 +18,11 @@ smallvec = "1"
 thiserror = "2"
 imbl = "7.0.2"
 pastey = "0.2.3"
+tracing = { version = "0.1", default-features = false, features = ["std"], optional = true }
+
+[features]
+# Log subscriptions, publishes and lost messages with `tracing`
+tracing = ["dep:tracing"]
 
 [dev-dependencies]
 tokio = { version = "1.42.0", features = ["rt-multi-thread", "macros"] }

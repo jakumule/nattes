@@ -151,6 +151,7 @@
 mod bus;
 mod channel;
 mod group;
+mod log;
 mod macros;
 mod nav;
 mod request;
