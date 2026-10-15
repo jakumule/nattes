@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Commands
 
-The dev shell comes from devenv (`devenv.nix`, Rust enabled) and loads through direnv (`.envrc`).
+The dev shell is the default `devShell` of `flake.nix` (Rust toolchain, Valgrind, gnuplot). Enter it with `nix develop`, or let direnv load it (`.envrc`, `use flake`).
 
 ```sh
 cargo build
@@ -22,7 +22,7 @@ cargo bench --bench throughput -- fan_out   # one bench group
 cargo bench --bench instructions # exact instruction counts under Valgrind (gungraun), diffed against the last run
 ```
 
-Use `instructions` to iterate on performance: counts are reproducible, so a small change shows up. It needs `gungraun-runner` at the same version as the `gungraun` dev-dependency (`cargo install gungraun-runner --version 0.20.0`). Valgrind comes from the dev shell. To compare against a fixed point, run `cargo bench --bench instructions -- --save-baseline=<name>` before a change and `-- --baseline=<name>` after it. Exception: `subscribe`/`unsubscribe` with 1000+ existing subscriptions move by up to ~8% between identical builds (likely the random hash seed of the parameter map), so treat changes there as noise unless they persist.
+Use `instructions` to iterate on performance: counts are reproducible, so a small change shows up. It needs Valgrind and `gungraun-runner` at the same version as the `gungraun` dev-dependency. The dev shell provides both: `flake.nix` builds the runner from crates.io, so bump its `version` and hashes there along with the dev-dependency. To compare against a fixed point, run `cargo bench --bench instructions -- --save-baseline=<name>` before a change and `-- --baseline=<name>` after it. Exception: `subscribe`/`unsubscribe` with 1000+ existing subscriptions move by up to ~8% between identical builds (likely the random hash seed of the parameter map), so treat changes there as noise unless they persist.
 
 Both benches share the event tree, `Payload`, and `start()` from `benches/common/mod.rs` (a plain module, not a bench target). Put shared setup there rather than copying it.
 

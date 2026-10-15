@@ -37,13 +37,12 @@ Cargo.lock
 .nfs*
 
 
-# Devenv
-.devenv*
-devenv.local.nix
-devenv.local.yaml
-
 # direnv
 .direnv
+
+# nix build output
+result
+result-*
 
 # pre-commit
 .pre-commit-config.yaml
