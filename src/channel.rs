@@ -74,7 +74,7 @@ where
 /// ```
 /// # use nattes::{channel, events, topic, Channel};
 /// # pub struct DeleteMsg;
-/// # events! { pub mod events { user { id(u32) { delete: DeleteMsg } } } }
+/// # events! { events { user { id(u32) { delete: DeleteMsg } } } }
 /// async fn watch<T: 'static, P: 'static, S>(ch: &Channel<T, P, S>) {
 ///     let _sub = ch.subscribe().await;
 ///     // …

@@ -30,6 +30,9 @@ while let Some(msg) = deletes.next().await {
   subscriber never blocks publishers unless you ask for backpressure. Subscriptions
   are `futures::Stream`s that unsubscribe when dropped. It runs on any executor;
   only `request_timeout` needs tokio's timer.
+- **Editor-friendly.** rust-analyzer completes `topic!` paths, hovering a segment
+  shows the topic's docs and subject, and going to the definition of a `Topic`
+  variant or queue group lands on its line in `events!`.
 
 ## Installation
 
@@ -73,7 +76,7 @@ pub struct DeleteMsg;
 
 events! {
     #[derive(Debug)]
-    pub mod events {
+    events {
         git [Mailer] {
             push: PushMsg,
         },
@@ -103,13 +106,15 @@ async fn main() {
 
 ## Declaring events
 
-`events!` turns a tree into nested modules. Each entry is one subject segment:
+`events!` turns a tree into nested `pub` modules. The root is written like any
+subtree, `events { … }`, and each entry is one subject segment:
 
 ```rust
 events! {
     #[derive(Debug)]                    // applied to every `Topic` enum
-    pub mod events {
+    events {
         git {                           // subtree
+            /// Commits pushed.         // docs of this topic
             push: GitPushMsg,           // leaf message
             new(Uuid): GitNewMsg,       // parameter, then message
         },
@@ -148,7 +153,8 @@ clash.
 Names are written in snake case, like NATS subjects (`push`, `pull_request`).
 They become the subject segments, the module and method names, and, in camel case,
 the `Topic` variants: `pull_request` is `Topic::PullRequest`. Rust keywords such as
-`type` or `match` can't be used as names.
+`type` or `match` are written as raw identifiers: `r#type` is the segment `type`
+and `Topic::Type`.
 
 | Syntax | Meaning | Variant in the parent's `Topic` |
 |---|---|---|
@@ -162,6 +168,14 @@ the `Topic` variants: `pull_request` is `Topic::PullRequest`. Rust keywords such
 
 Each module also gets a `Steps` type with one method per child, which is what
 `topic!` uses to navigate (see below).
+
+Doc comments (`/// …`) on an entry document its `Topic` variant, its `Steps`
+method and, for a subtree, its module, so your editor shows them when you hover
+`push` in `topic!(bus, git.push)`. On a chain `a.b.c: Msg` they document `c`.
+Both also state the subject, such as `git.push` or `user.id.*.delete`. Doc comments before
+the root's name document its module, while other attributes there are applied to
+every `Topic` enum. A wrong entry is reported on its own and left out, so the rest
+of the tree keeps working while you type.
 
 Each generated module does `use super::*`, so message and parameter types are
 resolved as in the code around `events!`. For that reason, `events!` must be used
@@ -281,12 +295,12 @@ Queue groups are declared in `events!` on the topic they belong to, with `[ … 
 right after its name (after the parameter, if it has one), in chains too:
 `user.id(Uuid) [Oncall].delete: Msg`. Like `Topic`, the generated enum has a
 fixed name: `Queue` in the module of a subtree (and of the root, with
-`pub mod events [ … ] { … }`), and for a leaf its name followed by `Queue`, in its
+`events [ … ] { … }`), and for a leaf its name followed by `Queue`, in its
 parent's module (`push` gives `PushQueue`). Each of its values is one group:
 
 ```rust
 events! {
-    pub mod events {
+    events {
         git [Mailer] {
             push [Indexer(u32), Audit]: GitPushMsg,
         },
@@ -318,7 +332,8 @@ pushes.publish(GitPushMsg { branch: "main".into() }).await;
   on `other`'s topics, wherever it's mounted.
 - **Attributes** go inside the brackets, as inner attributes:
   `[#![derive(Debug)] Indexer(u32), Audit]`. The enum already
-  derives `Clone`, `PartialEq`, `Eq` and `Hash`.
+  derives `Clone`, `PartialEq`, `Eq` and `Hash`. Variants can have attributes
+  of their own, such as doc comments.
 
 A level or leaf declares at most one `[ … ]`: put several families of groups
 in its variants. A leaf's enum is also the third type parameter of its channel:
@@ -331,7 +346,7 @@ Make a leaf request-reply by giving it the type `nattes::Request<Payload, Reply>
 
 ```rust
 events! {
-    pub mod events {
+    events {
         git { push: Request<GitPushMsg, PushAck> },
     }
 }
@@ -399,7 +414,7 @@ connected to its own bus or mounted inside a bigger one:
 ```rust
 events! {
     #[derive(Debug)]
-    pub mod other {
+    other {
         text(String): StringEvent,
     }
 }
@@ -469,8 +484,12 @@ topic!(bus, user.id("alice").delete);
 // error: `Is<&str>` can't select a `Uuid` parameter
 //        expected `_` or a `Uuid` value
 
+// two siblings with the same name
+events! { events { git { push: GitPushMsg, push: GitPushMsg } } }
+// error: `push` is already a topic of this level
+
 // a parameter type that can't be compared exactly
-events! { pub mod sensors { reading(f64): Reading } }
+events! { sensors { reading(f64): Reading } }
 // error: `f64` can't be a parameter
 //        the trait `Eq` is not implemented for `f64`
 

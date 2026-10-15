@@ -8,7 +8,7 @@ use std::future::IntoFuture;
 pub struct Payload(pub u64);
 
 events! {
-    pub mod events {
+    events {
         load [Workers]: Payload,
         user { id(u64) { delete: Payload } },
     }

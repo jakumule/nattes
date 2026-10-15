@@ -1,0 +1,15 @@
+[package]
+name = "nattes-macros"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/jakumule/nattes"
+description = "Proc macros of nattes. Use them through the nattes crate."
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "3", features = ["full"] }

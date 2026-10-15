@@ -14,7 +14,7 @@
 //! pub struct DeleteMsg;
 //!
 //! events! {
-//!     pub mod events {
+//!     events {
 //!         git { push: PushMsg },
 //!         user { id(u32) { delete: DeleteMsg } },
 //!     }
@@ -45,7 +45,7 @@
 //! # use nattes::channel;
 //! # use nattes::{events, topic};
 //! # pub struct DeleteMsg;
-//! # events! { pub mod events { user { id(u32) { delete: DeleteMsg } } } }
+//! # events! { events { user { id(u32) { delete: DeleteMsg } } } }
 //! # async fn f() {
 //! let bus = channel!(events);
 //! topic!(bus, user.id().delete).publish(DeleteMsg).await;
@@ -59,7 +59,7 @@
 //! # use nattes::channel;
 //! # use nattes::{events, topic};
 //! # pub struct PushMsg;
-//! # events! { pub mod events { git { push: PushMsg }, user { new: PushMsg } } }
+//! # events! { events { git { push: PushMsg }, user { new: PushMsg } } }
 //! # fn main() {
 //! let users = topic!(channel!(events), user);
 //! topic!(users, git.push);
@@ -72,7 +72,16 @@
 //! ```compile_fail,E0277
 //! # use nattes::events;
 //! # pub struct Reading;
-//! events! { pub mod sensors { reading(f64): Reading } }
+//! events! { sensors { reading(f64): Reading } }
+//! # fn main() {}
+//! ```
+//!
+//! Names are unique among siblings:
+//!
+//! ```compile_fail
+//! # use nattes::events;
+//! # pub struct PushMsg;
+//! events! { events { git { push: PushMsg, push: PushMsg } } }
 //! # fn main() {}
 //! ```
 //!
@@ -84,7 +93,7 @@
 //! # use nattes::{channel, events, topic};
 //! # pub struct PushMsg;
 //! events! {
-//!     pub mod events {
+//!     events {
 //!         git [Mailer] {
 //!             push [Indexer(u32), Audit]: PushMsg,
 //!         },
@@ -113,7 +122,7 @@
 //! ```compile_fail,E0277
 //! # use nattes::{channel, events, topic};
 //! # pub struct PushMsg;
-//! # events! { pub mod events { git [Mailer] { push: PushMsg } } }
+//! # events! { events { git [Mailer] { push: PushMsg } } }
 //! # async fn f() {
 //! let bus = channel!(events);
 //! topic!(bus, git.push).subscribe().queue(events::git::Queue::Mailer).await;
@@ -126,7 +135,7 @@
 //! ```compile_fail,E0277
 //! # use nattes::{channel, events, topic};
 //! # pub struct PushMsg;
-//! # events! { pub mod events { git { push: PushMsg } } }
+//! # events! { events { git { push: PushMsg } } }
 //! # async fn f() {
 //! let bus = channel!(events);
 //! topic!(bus, git.push).subscribe().queue("workers").await;
@@ -139,7 +148,7 @@
 //! ```compile_fail,E0308
 //! # use nattes::{channel, events, topic};
 //! # pub struct PushMsg;
-//! # events! { pub mod events { git { push [Indexer(u32)]: PushMsg } } }
+//! # events! { events { git { push [Indexer(u32)]: PushMsg } } }
 //! # async fn f() {
 //! let bus = channel!(events);
 //! topic!(bus, git.push).subscribe().queue(events::git::PushQueue::Indexer("0")).await;
@@ -172,4 +181,4 @@ pub use tree::Step;
 pub use tree::{subject, Node, ParamValue};
 
 #[doc(hidden)]
-pub use pastey as __pastey;
+pub use nattes_macros::events as __events;

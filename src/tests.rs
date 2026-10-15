@@ -35,7 +35,7 @@ pub struct FetchAck(pub usize);
 crate::events! {
     #[derive(Debug)]
     #[allow(dead_code)]
-    pub mod other {
+    other {
         num(u32): U32Event,
         text(String): StringEvent,
     }
@@ -44,7 +44,7 @@ crate::events! {
 crate::events! {
     #[derive(Debug)]
     #[allow(dead_code)]
-    pub mod events [Workers] {
+    events [Workers] {
         git [Workers] {
             push [#![derive(Debug)] Workers, Shard(u32)]: GitPushMsg,
             pull: GitPullMsg,
@@ -638,7 +638,7 @@ impl std::fmt::Display for Opaque {
 crate::events! {
     #[derive(Debug)]
     #[allow(dead_code)]
-    pub mod opaque {
+    opaque {
         item(Opaque): U32Event,
     }
 }
@@ -655,6 +655,37 @@ async fn fixed_params_match_by_equality_not_display() {
     assert_eq!(drain(&mut one).len(), 1);
     let ids: Vec<_> = drain(&mut any).iter().map(|m| m.params()).collect();
     assert_eq!(ids, [(Opaque(1),), (Opaque(2),)]);
+}
+
+crate::events! {
+    /// Docs before `mod` document the module, other attributes go on `Topic`.
+    #[allow(dead_code)]
+    keywords [
+        #![derive(Debug)]
+        /// A documented group.
+        Docs
+    ] {
+        /// A documented subtree.
+        r#type {
+            /// A documented leaf.
+            r#match: U32Event,
+        },
+        /// Docs of a chain go to its last topic.
+        a.b(u32).r#loop: U32Event,
+    }
+}
+
+#[tokio::test]
+async fn raw_identifiers_are_keyword_segments() {
+    let bus = channel!(keywords);
+    let mut sub = bus.subscribe().await;
+
+    topic!(bus, r#type.r#match).publish(U32Event).await;
+    topic!(bus, a.b(1).r#loop).publish(U32Event).await;
+
+    let subjects: Vec<_> = drain(&mut sub).iter().map(|m| m.subject()).collect();
+    assert_eq!(subjects, ["type.match", "a.b.1.loop"]);
+    assert_eq!(format!("{:?}", keywords::Queue::Docs), "Docs");
 }
 
 /// Many publishers on a tiny buffer, across threads: every handoff between

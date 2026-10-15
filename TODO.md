@@ -1,5 +1,5 @@
 # Nattes
 
-- [ ] Document topics
+- [x] Document topics
 - [ ] Coalesce wrapper
-- [ ] optimize macros for autocompletion
+- [x] optimize macros for autocompletion
