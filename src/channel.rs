@@ -1,15 +1,15 @@
-//! [`Channel`]: a typed view on part of the event tree.
+//! [`Channel`]: a typed view on part of the tree.
 
-use crate::bus::{Core, Event};
+use crate::bus::{Bus, Event};
 use crate::nav::{Append, AppendParams, Key, Navigable, Pattern, Prism};
 use crate::subscription::SubscriptionBuilder;
-use crate::{Node, Overflow, DEFAULT_BUFFER};
+use crate::{DEFAULT_BUFFER, Level, Overflow};
 use std::any::Any;
 use std::fmt;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-/// Path from the root event down to `T`, with the wildcard values `P` met on
+/// Route from the root event down to `T`, with the wildcard values `P` met on
 /// the way. One link per step: walking down allocates one per [`Prism`].
 pub(crate) trait Route<T, P>: Send + Sync {
     /// The `T` inside a root event, with the wildcard values: matches
@@ -17,14 +17,14 @@ pub(crate) trait Route<T, P>: Send + Sync {
     fn project<'a>(&self, root: &'a dyn Any) -> Option<(P, &'a T)>;
     /// The root event holding `t`, for `publish`. `None` below a wildcard.
     fn inject(&self, t: T) -> Option<Event>;
-    /// Where subscriptions sit in the interest graph. Built on subscribe only.
+    /// Where subscriptions sit in the interest trie. Built on subscribe only.
     fn path(&self, keys: &mut Vec<Key>);
 }
 
 /// Start of every route: the root event itself.
 struct Root<R>(PhantomData<fn() -> R>);
 
-impl<R: Node> Route<R, ()> for Root<R> {
+impl<R: Level> Route<R, ()> for Root<R> {
     fn project<'a>(&self, root: &'a dyn Any) -> Option<((), &'a R)> {
         root.downcast_ref::<R>().map(|r| ((), r))
     }
@@ -60,22 +60,22 @@ where
     }
 }
 
-/// Typed view on the part `T` of an event tree; behaves like a bus rooted at `T`.
+/// Typed view on the part `T` of a tree; behaves like a bus rooted at `T`.
 ///
 /// `P` holds the parameters left as wildcards on the way down. Only fully fixed
 /// channels (`P = ()`) can publish.
 ///
-/// `S` is the topic the channel is on, for the queue groups it can join: the
-/// level's `Topic` enum (so `S = T`), or the queue group enum of a leaf that
+/// `S` is the scope of the channel, which tells the queue groups it can join: the
+/// level's `Topic` enum (so `S = T`), or the group enum of a leaf that
 /// declares one.
 ///
 /// A function taking `&Channel<T, P, S>` accepts any channel, root or not, with
 /// or without wildcards:
 ///
 /// ```
-/// # use nattes::{channel, events, topic, Channel};
+/// # use nattes::{at, topics, Channel};
 /// # pub struct DeleteMsg;
-/// # events! { events { user { id(u32) { delete: DeleteMsg } } } }
+/// # topics! { topics { user { id(u32) { delete: DeleteMsg } } } }
 /// async fn watch<T: 'static, P: 'static, S>(ch: &Channel<T, P, S>) {
 ///     let _sub = ch.subscribe().await;
 ///     // …
@@ -83,17 +83,17 @@ where
 ///
 /// # fn main() {
 /// # futures::executor::block_on(async {
-/// let bus = channel!(events);
-/// watch(&bus).await;                              // >
-/// watch(&topic!(bus, user)).await;                // user.>
-/// watch(&topic!(bus, user.id().delete)).await;    // user.*.delete
+/// let bus = Channel::<topics::Topic>::new();
+/// watch(&bus).await;                           // >
+/// watch(&at!(bus, user)).await;                // user.>
+/// watch(&at!(bus, user.id().delete)).await;    // user.*.delete
 /// # });
 /// # }
 /// ```
 pub struct Channel<T, P = (), S = T> {
-    pub(crate) core: Arc<Core>,
+    pub(crate) bus: Arc<Bus>,
     // The path from the root is a chain of trait objects, not a type:
-    // `topic!(bus, user.id(alice))` and `topic!(bus, user.id(bob))` are both
+    // `at!(bus, user.id(alice))` and `at!(bus, user.id(bob))` are both
     // `Channel<user::id::Topic>`, and a mounted tree has the same channel type
     // as a standalone one.
     pub(crate) route: Arc<dyn Route<T, P>>,
@@ -103,7 +103,7 @@ pub struct Channel<T, P = (), S = T> {
 impl<T, P, S> Clone for Channel<T, P, S> {
     fn clone(&self) -> Self {
         Self {
-            core: self.core.clone(),
+            bus: self.bus.clone(),
             route: self.route.clone(),
             scope: PhantomData,
         }
@@ -120,25 +120,25 @@ impl<T, P, S> fmt::Debug for Channel<T, P, S> {
     }
 }
 
-impl<R: Node> Channel<R> {
+impl<R: Level> Channel<R> {
     /// New bus with `R` as its root.
     pub fn new() -> Self {
         Self {
-            core: Arc::default(),
+            bus: Arc::default(),
             route: Arc::new(Root(PhantomData)),
             scope: PhantomData,
         }
     }
 }
 
-impl<R: Node> Default for Channel<R> {
+impl<R: Level> Default for Channel<R> {
     fn default() -> Self {
         Self::new()
     }
 }
 
 impl<T: Navigable, P: 'static> Channel<T, P> {
-    /// Navigation from this channel; used by [`topic!`](crate::topic).
+    /// Navigation from this channel; used by [`at!`](crate::at).
     #[doc(hidden)]
     pub fn steps(&self) -> T::Steps<P> {
         T::steps(self.clone())
@@ -146,14 +146,14 @@ impl<T: Navigable, P: 'static> Channel<T, P> {
 }
 
 impl<T: 'static, P: 'static, S> Channel<T, P, S> {
-    /// One step down; used by the code generated by [`events!`](crate::events).
+    /// One step down; used by the code generated by [`topics!`](crate::topics).
     #[doc(hidden)]
-    pub fn at_prism<X: Prism<T>>(&self, step: X) -> Channel<X::B, Append<P, X::Q>>
+    pub fn step<X: Prism<T>>(&self, step: X) -> Channel<X::B, Append<P, X::Q>>
     where
         P: AppendParams<X::Q>,
     {
         Channel {
-            core: self.core.clone(),
+            bus: self.bus.clone(),
             route: Arc::new(Hop {
                 parent: self.route.clone(),
                 step,
@@ -162,18 +162,18 @@ impl<T: 'static, P: 'static, S> Channel<T, P, S> {
         }
     }
 
-    /// The same channel on the topic `X`; used by [`events!`](crate::events)
+    /// The same channel in the scope `X`; used by [`topics!`](crate::topics)
     /// for leaves that declare queue groups.
     #[doc(hidden)]
-    pub fn on_topic<X>(self) -> Channel<T, P, X> {
+    pub fn with_scope<X>(self) -> Channel<T, P, X> {
         Channel {
-            core: self.core,
+            bus: self.bus,
             route: self.route,
             scope: PhantomData,
         }
     }
 
-    /// Where subscriptions on this channel sit in the interest graph.
+    /// Where subscriptions on this channel sit in the interest trie.
     pub(crate) fn path(&self) -> Vec<Key> {
         let mut keys = Vec::new();
         self.route.path(&mut keys);
@@ -193,16 +193,16 @@ impl<T: 'static, P: 'static, S> Channel<T, P, S> {
 }
 
 impl<T: 'static, S> Channel<T, (), S> {
-    /// Publish `msg` here. Returns how many subscriptions queued it.
+    /// Publish `msg` here. Returns how many subscriptions it was delivered to.
     ///
-    /// The message is first queued for every subscriber with room in its
+    /// The message is first delivered to every subscription with room in its
     /// buffer. Only then does `publish` wait for room in the full buffers of
     /// [`Overflow::Wait`] subscribers. If this future is dropped during that
     /// wait, those subscribers miss the message. Delivery is at most once:
     /// see [delivery guarantees](crate#delivery-guarantees).
     pub async fn publish(&self, msg: T) -> usize {
         let event = self.to_event(msg);
-        self.core.deliver(event).await
+        self.bus.deliver(event).await
     }
 
     /// Wrap `msg` into the root event to deliver.

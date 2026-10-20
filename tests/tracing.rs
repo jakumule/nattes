@@ -3,7 +3,7 @@
 //! the scoped subscriber.
 #![cfg(feature = "tracing")]
 
-use nattes::{channel, events, topic};
+use nattes::{Channel, at, topics};
 use std::fmt::Debug;
 use std::sync::{Arc, Mutex};
 use tracing::field::{Field, Visit};
@@ -13,14 +13,14 @@ use tracing::{Event, Metadata, Subscriber};
 pub struct PushMsg;
 pub struct DeleteMsg;
 
-events! {
-    events {
+topics! {
+    topics {
         git { push [Workers]: PushMsg },
         user { id(u32) { delete: DeleteMsg } },
     }
 }
 
-/// Records every event as `message field=value …`.
+/// Records every log record as `message field=value …`.
 #[derive(Clone, Default)]
 struct Recorder(Arc<Mutex<Vec<String>>>);
 
@@ -57,13 +57,13 @@ fn logs_subscriptions_publishes_and_drops() {
     let recorder = Recorder::default();
     tracing::subscriber::with_default(recorder.clone(), || {
         futures::executor::block_on(async {
-            let bus = channel!(events);
-            let sub = topic!(bus, user.id().delete).subscribe().buffer(1).await;
-            let group = topic!(bus, git.push)
+            let bus = Channel::<topics::Topic>::new();
+            let sub = at!(bus, user.id().delete).subscribe().buffer(1).await;
+            let group = at!(bus, git.push)
                 .subscribe()
-                .queue(events::git::PushQueue::Workers)
+                .queue(topics::git::PushQueue::Workers)
                 .await;
-            let deletes = topic!(bus, user.id(7).delete);
+            let deletes = at!(bus, user.id(7).delete);
             deletes.publish(DeleteMsg).await;
             deletes.publish(DeleteMsg).await;
             drop(sub);
@@ -73,13 +73,13 @@ fn logs_subscriptions_publishes_and_drops() {
     assert_eq!(
         *recorder.0.lock().unwrap(),
         [
-            "subscribe subscription=0 subject=user.id.*.delete.> group=None filtered=false",
-            "subscribe subscription=1 subject=git.push.> group=Some(tracing::events::git::PushQueue) filtered=false",
+            "subscribe subscription=0 pattern=user.id.*.delete.> group=None filtered=false",
+            "subscribe subscription=1 pattern=git.push.> group=Some(tracing::topics::git::PushQueue) filtered=false",
             "publish subject=user.id.7.delete delivered=1 waiting=0",
             "buffer full, dropped the message subscription=0 subject=user.id.7.delete",
             "publish subject=user.id.7.delete delivered=0 waiting=0",
-            "unsubscribe subscription=0 subject=user.id.*.delete.>",
-            "unsubscribe subscription=1 subject=git.push.>",
+            "unsubscribe subscription=0 pattern=user.id.*.delete.>",
+            "unsubscribe subscription=1 pattern=git.push.>",
         ]
     );
 }

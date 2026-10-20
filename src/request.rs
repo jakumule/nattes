@@ -1,19 +1,19 @@
-//! Request/reply plumbing, kept apart from the queue.
+//! Request/reply plumbing, kept apart from the bus.
 //!
 //! A [`Request<RQ, RP>`] wraps the request payload `RQ` together with the means
-//! to answer it with an `RP`. The requester keeps the matching receiver and
-//! awaits it. A scattered request goes to every subscriber and each of them can
-//! answer, so the requester gathers several replies.
+//! to answer it with an `RP`. The requester keeps the other end of the reply
+//! handle and awaits it. A scattered request goes to every subscription and each
+//! responder can answer, so the requester gathers several replies.
 
-use crate::bus::lock;
 use crate::Channel;
-use futures::stream::FusedStream;
+use crate::bus::lock;
 use futures::Stream;
+use futures::stream::FusedStream;
 use std::fmt;
 use std::ops::Deref;
 use std::pin::Pin;
 use std::sync::Mutex;
-use std::task::{ready, Context, Poll};
+use std::task::{Context, Poll, ready};
 use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
@@ -28,11 +28,11 @@ pub enum BusError {
     Timeout,
 }
 
-/// A request payload `RQ` that can be answered with a reply payload `RP`:
+/// A request payload `RQ` that can be answered with a reply `RP`:
 /// once if it was sent with [`request`](Channel::request), once per responder
 /// if it was sent with [`scatter`](Channel::scatter).
 ///
-/// Derefs to `RQ`. Queues only need to carry this value around; they never
+/// Derefs to `RQ`. Buffers only need to carry this value around; they never
 /// touch the reply logic.
 pub struct Request<RQ, RP> {
     payload: RQ,
@@ -47,7 +47,7 @@ enum Reply<RP> {
 }
 
 impl<RQ, RP> Request<RQ, RP> {
-    /// Wrap `payload`; returns the request to deliver and the receiver to await.
+    /// Wrap `payload`; returns the request to deliver and the end to await.
     fn new(payload: RQ) -> (Self, oneshot::Receiver<RP>) {
         let (tx, rx) = oneshot::channel();
         let request = Self {
@@ -157,22 +157,22 @@ impl<RP> fmt::Debug for Replies<RP> {
 }
 
 /// A channel whose leaf type is `Request<RQ, RP>` is explicitly request-reply:
-/// publishers send an `RQ` and get an `RP` back; subscribers receive the
+/// requesters send an `RQ` and get an `RP` back; responders receive the
 /// `Request` (derefs to `RQ`) and call [`Request::respond`].
 impl<RQ: 'static, RP: Send + 'static, S> Channel<Request<RQ, RP>, (), S> {
-    /// Send `payload` and wait for the first reply from a subscriber.
+    /// Send `payload` and wait for the first reply from a responder.
     ///
     /// It is delivered like [`publish`](Channel::publish) does it: to every
-    /// matching subscriber and one member per queue group. Later replies are
-    /// discarded. Fails with [`BusError::NoResponders`] if no subscription
-    /// queued it, and with [`BusError::NoReply`] once every receiver dropped it
-    /// without answering, including when it was lost from a full buffer or a
-    /// dropped subscription. Waits as long as a receiver holds the request:
+    /// matching subscription and one member per queue group. Later replies are
+    /// discarded. Fails with [`BusError::NoResponders`] if it was delivered to
+    /// no subscription, and with [`BusError::NoReply`] once every responder
+    /// dropped it without answering, including when it was lost from a full buffer or a
+    /// dropped subscription. Waits as long as a responder holds the request:
     /// prefer [`request_timeout`](Self::request_timeout).
     pub async fn request(&self, payload: RQ) -> Result<RP, BusError> {
         let (request, rx) = Request::new(payload);
         let event = self.to_event(request);
-        if self.core.deliver(event).await == 0 {
+        if self.bus.deliver(event).await == 0 {
             return Err(BusError::NoResponders);
         }
         // The sender goes away only once every responder dropped the request
@@ -189,18 +189,18 @@ impl<RQ: 'static, RP: Send + 'static, S> Channel<Request<RQ, RP>, (), S> {
             .map_err(|_| BusError::Timeout)?
     }
 
-    /// Send `payload` to every subscriber and stream their replies, one per
+    /// Send `payload` to every subscription and stream their replies, one per
     /// responder (a queue group counts as one responder).
     ///
     /// It is delivered like [`publish`](Channel::publish) does it, and expects
-    /// one reply from each subscription that queued it. The stream ends once
-    /// every responder answered or dropped the request, including when it was
+    /// one reply from each subscription it was delivered to. The stream ends
+    /// once every responder answered or dropped the request, including when it was
     /// lost from a full buffer or a dropped subscription. Fails with
-    /// [`BusError::NoResponders`] if no subscription queued it.
+    /// [`BusError::NoResponders`] if it was delivered to no subscription.
     pub async fn scatter(&self, payload: RQ) -> Result<Replies<RP>, BusError> {
         let (request, rx) = Request::scattered(payload);
         let event = self.to_event(request);
-        let remaining = self.core.deliver(event).await;
+        let remaining = self.bus.deliver(event).await;
         if remaining == 0 {
             return Err(BusError::NoResponders);
         }

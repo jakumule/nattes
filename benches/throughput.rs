@@ -9,12 +9,12 @@
 
 mod common;
 
-use common::{events, start, Payload};
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use common::{Message, start, topics};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use futures::StreamExt;
-use nattes::{channel, topic, Overflow, Subscription};
-use std::sync::atomic::{AtomicU64, Ordering};
+use nattes::{Channel, Overflow, Subscription, at};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::runtime::Runtime;
 use tokio::sync::Notify;
@@ -31,12 +31,12 @@ fn runtime() -> Runtime {
 }
 
 /// Subscriber tasks; each returns its subscription.
-type Receivers = JoinSet<Box<dyn Send>>;
+type Subscribers = JoinSet<Box<dyn Send>>;
 
 /// Receive `n` messages on a separate task. The subscription is handed back, not
 /// dropped: leaving early would reshuffle queue groups while others still publish.
 fn drain<T: Send + 'static, P: Send + 'static>(
-    tasks: &mut Receivers,
+    tasks: &mut Subscribers,
     mut sub: Subscription<T, P>,
     n: u64,
 ) {
@@ -48,10 +48,10 @@ fn drain<T: Send + 'static, P: Send + 'static>(
     });
 }
 
-/// Messages a set of receivers expects in total.
+/// Messages a set of subscribers expect in total.
 struct Shared {
     left: AtomicU64,
-    /// Wakes the other receivers once the last message is in.
+    /// Wakes the other subscribers once the last message is in.
     done: Notify,
 }
 
@@ -64,9 +64,9 @@ impl Shared {
     }
 }
 
-/// Receive until `shared` has all its messages, among several receivers.
+/// Receive until `shared` has all its messages, among several subscribers.
 fn drain_shared<T: Send + 'static, P: Send + 'static>(
-    tasks: &mut Receivers,
+    tasks: &mut Subscribers,
     mut sub: Subscription<T, P>,
     shared: &Arc<Shared>,
 ) {
@@ -95,17 +95,17 @@ fn drain_shared<T: Send + 'static, P: Send + 'static>(
 /// Time `run` only, `iters` times, with a fresh setup each time.
 async fn timed<S, F, Fut>(iters: u64, setup: S, run: F) -> Duration
 where
-    S: Fn() -> Receivers,
+    S: Fn() -> Subscribers,
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
     let mut total = Duration::ZERO;
     for _ in 0..iters {
-        let receivers = setup();
+        let subscribers = setup();
         let start = Instant::now();
         run().await;
         // subscriptions are dropped after the clock stops
-        let _subs = receivers.join_all().await;
+        let _subs = subscribers.join_all().await;
         total += start.elapsed();
     }
     total
@@ -119,12 +119,12 @@ fn fan_out(c: &mut Criterion) {
         group.throughput(Throughput::Elements(MSGS * subs));
         group.bench_with_input(BenchmarkId::from_parameter(subs), &subs, |b, &subs| {
             b.to_async(&rt).iter_custom(|iters| async move {
-                let bus = channel!(events);
-                let load = topic!(bus, load);
+                let bus = Channel::<topics::Topic>::new();
+                let load = at!(bus, load);
                 timed(
                     iters,
                     || {
-                        let mut tasks = Receivers::new();
+                        let mut tasks = Subscribers::new();
                         for _ in 0..subs {
                             let sub = start(load.subscribe().on_full(Overflow::Wait));
                             drain(&mut tasks, sub, MSGS);
@@ -133,7 +133,7 @@ fn fan_out(c: &mut Criterion) {
                     },
                     || async {
                         for i in 0..MSGS {
-                            load.publish(Payload(i)).await;
+                            load.publish(Message(i)).await;
                         }
                     },
                 )
@@ -152,12 +152,12 @@ fn fan_in(c: &mut Criterion) {
     for pubs in [1, 4, 16] {
         group.bench_with_input(BenchmarkId::from_parameter(pubs), &pubs, |b, &pubs| {
             b.to_async(&rt).iter_custom(|iters| async move {
-                let bus = channel!(events);
-                let load = topic!(bus, load);
+                let bus = Channel::<topics::Topic>::new();
+                let load = at!(bus, load);
                 timed(
                     iters,
                     || {
-                        let mut tasks = Receivers::new();
+                        let mut tasks = Subscribers::new();
                         let sub = start(load.subscribe().on_full(Overflow::Wait));
                         drain(&mut tasks, sub, MSGS);
                         tasks
@@ -182,17 +182,17 @@ fn queue_group(c: &mut Criterion) {
             &workers,
             |b, &workers| {
                 b.to_async(&rt).iter_custom(|iters| async move {
-                    let bus = channel!(events);
-                    let load = topic!(bus, load);
+                    let bus = Channel::<topics::Topic>::new();
+                    let load = at!(bus, load);
                     timed(
                         iters,
                         || {
-                            let mut tasks = Receivers::new();
+                            let mut tasks = Subscribers::new();
                             let shared = Shared::new(MSGS);
                             for _ in 0..workers {
                                 let sub = start(
                                     load.subscribe()
-                                        .queue(events::LoadQueue::Workers)
+                                        .queue(topics::LoadQueue::Workers)
                                         .on_full(Overflow::Wait),
                                 );
                                 // idle workers go first: shares aren't even
@@ -219,14 +219,14 @@ fn routing(c: &mut Criterion) {
     for subs in [10u64, 100, 1000] {
         group.bench_with_input(BenchmarkId::from_parameter(subs), &subs, |b, &subs| {
             b.to_async(&rt).iter_custom(|iters| async move {
-                let bus = channel!(events);
+                let bus = Channel::<topics::Topic>::new();
                 timed(
                     iters,
                     || {
-                        let mut tasks = Receivers::new();
+                        let mut tasks = Subscribers::new();
                         for id in 0..subs {
                             let sub = start(
-                                topic!(bus, user.id(id).delete)
+                                at!(bus, user.id(id).delete)
                                     .subscribe()
                                     .on_full(Overflow::Wait),
                             );
@@ -242,7 +242,7 @@ fn routing(c: &mut Criterion) {
                                 // publisher p sends to ids p, p+4, …: each id gets MSGS / subs
                                 for i in (p..MSGS).step_by(4) {
                                     let id = i % subs;
-                                    topic!(bus, user.id(id).delete).publish(Payload(i)).await;
+                                    at!(bus, user.id(id).delete).publish(Message(i)).await;
                                 }
                             });
                         }
@@ -259,7 +259,7 @@ fn routing(c: &mut Criterion) {
 /// `total` messages split across `pubs` concurrent tasks.
 async fn publish_from(
     pubs: u64,
-    load: &nattes::Channel<Payload, (), events::LoadQueue>,
+    load: &nattes::Channel<Message, (), topics::LoadQueue>,
     total: u64,
 ) {
     let mut tasks = JoinSet::new();
@@ -267,7 +267,7 @@ async fn publish_from(
         let load = load.clone();
         tasks.spawn(async move {
             for i in 0..total / pubs {
-                load.publish(Payload(i)).await;
+                load.publish(Message(i)).await;
             }
         });
     }

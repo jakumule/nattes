@@ -1,0 +1,6 @@
+[book]
+title = "nattes"
+src = "src"
+
+[build]
+build-dir = "book"

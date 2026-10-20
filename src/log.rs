@@ -1,7 +1,7 @@
 //! Logging through `tracing` with the `tracing` feature, compiled out without it.
 //!
-//! Events go under the `nattes` target: subscriptions at `debug`, every publish
-//! at `trace`, lost messages at `debug` and panicking filters at `warn`.
+//! Log records go under the `nattes` target: subscriptions at `debug`, every
+//! publish at `trace`, lost messages at `debug` and panicking filters at `warn`.
 
 #[cfg(feature = "tracing")]
 macro_rules! trace {
@@ -39,4 +39,6 @@ macro_rules! warning {
     };
 }
 
+// `warning`, not `warn`: re-exported with `use`, `warn` would clash with the
+// built-in `#[warn]` attribute
 pub(crate) use {debug, trace, warning};

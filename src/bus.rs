@@ -1,6 +1,7 @@
-//! Untyped bus core: works only with `Arc<dyn Node>` events and `&dyn Any`
+//! The untyped bus: works only with `Arc<dyn Level>` events and `&dyn Any`
 //! matchers. [`Channel`](crate::Channel) adds the types on top.
 
+use crate::Level;
 use crate::group::GroupKey;
 use crate::log::{debug, trace, warning};
 #[cfg(feature = "tracing")]
@@ -8,13 +9,12 @@ use crate::nav::Pattern;
 use crate::nav::{Key, KeyParam, ParamKey};
 #[cfg(feature = "tracing")]
 use crate::tree::Subject;
-use crate::Node;
 use arc_swap::ArcSwap;
 use futures::task::AtomicWaker;
 use smallvec::SmallVec;
 use std::any::Any;
 use std::collections::{HashMap, VecDeque};
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -36,7 +36,7 @@ pub enum Overflow {
 /// Default number of messages a subscription buffers.
 pub const DEFAULT_BUFFER: usize = 1024;
 
-pub(crate) type Event = Arc<dyn Node>;
+pub(crate) type Event = Arc<dyn Level>;
 pub(crate) type Matcher = Box<dyn Fn(&dyn Any) -> bool + Send + Sync>;
 
 /// Locks without propagating poison: no user code runs while our locks are held,
@@ -45,15 +45,15 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Buffer of one subscription.
-pub(crate) struct Queue {
-    state: Mutex<QueueState>,
+/// Bounded buffer of one subscription.
+pub(crate) struct Buffer {
+    state: Mutex<BufferState>,
     capacity: usize,
     overflow: Overflow,
     pub(crate) dropped: AtomicU64,
     /// Wakes the subscriber when a message arrives, if it is `parked`.
     waker: AtomicWaker,
-    /// Set while the subscriber waits for a message on an empty queue: pushes
+    /// Set while the subscriber waits for a message on an empty buffer: pushes
     /// skip the wake otherwise, and queue groups prefer idle members.
     parked: AtomicBool,
     /// Wakes `Overflow::Wait` publishers when room frees up or the subscriber leaves.
@@ -61,24 +61,24 @@ pub(crate) struct Queue {
 }
 
 #[derive(Default)]
-struct QueueState {
-    items: VecDeque<Event>,
+struct BufferState {
+    events: VecDeque<Event>,
     closed: bool,
-    /// A publisher waits for room. It is woken once the queue drains to half,
+    /// A publisher waits for room. It is woken once the buffer drains to half,
     /// so waiters refill it in a burst instead of one slot at a time.
     wanted: bool,
 }
 
 enum Push {
-    Queued,
-    /// Queued in place of the oldest message.
+    Delivered,
+    /// Delivered in place of the oldest message.
     Evicted,
     Dropped,
     Full(Event),
     Closed,
 }
 
-impl Queue {
+impl Buffer {
     pub(crate) fn new(capacity: usize, overflow: Overflow) -> Self {
         Self {
             state: Mutex::default(),
@@ -96,7 +96,7 @@ impl Queue {
         self.parked.load(Ordering::Relaxed)
     }
 
-    /// Queue `event`. When the buffer is full, apply the overflow policy if
+    /// Deliver `event`. When the buffer is full, apply the overflow policy if
     /// `OVERFLOW`, else hand the event back as `Full`.
     fn try_push<const OVERFLOW: bool>(&self, event: Event) -> Push {
         let mut state = lock(&self.state);
@@ -104,7 +104,7 @@ impl Queue {
             return Push::Closed;
         }
         let mut evicted = false;
-        if state.items.len() >= self.capacity {
+        if state.events.len() >= self.capacity {
             if !OVERFLOW {
                 return Push::Full(event);
             }
@@ -114,7 +114,7 @@ impl Queue {
                     return Push::Dropped;
                 }
                 Overflow::DropOldest => {
-                    state.items.pop_front();
+                    state.events.pop_front();
                     self.dropped.fetch_add(1, Ordering::Relaxed);
                     evicted = true;
                 }
@@ -125,9 +125,9 @@ impl Queue {
                 }
             }
         }
-        state.items.push_back(event);
+        state.events.push_back(event);
         drop(state);
-        // The subscriber sets `parked` before its last check of the queue, under
+        // The subscriber sets `parked` before its last check of the buffer, under
         // the same lock: either it sees this event, or this sees `parked`
         if self.parked.load(Ordering::Relaxed) && self.parked.swap(false, Ordering::AcqRel) {
             self.waker.wake();
@@ -135,7 +135,7 @@ impl Queue {
         if evicted {
             Push::Evicted
         } else {
-            Push::Queued
+            Push::Delivered
         }
     }
 
@@ -145,7 +145,7 @@ impl Queue {
             let mut notified = pin!(self.space.notified());
             notified.as_mut().enable();
             match self.try_push::<true>(event) {
-                Push::Queued | Push::Evicted => return true,
+                Push::Delivered | Push::Evicted => return true,
                 Push::Dropped | Push::Closed => return false,
                 Push::Full(back) => event = back,
             }
@@ -155,8 +155,8 @@ impl Queue {
 
     fn pop(&self) -> Option<Event> {
         let mut state = lock(&self.state);
-        let item = state.items.pop_front();
-        let refill = state.wanted && state.items.len() <= self.capacity / 2;
+        let event = state.events.pop_front();
+        let refill = state.wanted && state.events.len() <= self.capacity / 2;
         if refill {
             state.wanted = false;
         }
@@ -164,7 +164,7 @@ impl Queue {
         if refill {
             self.space.notify_waiters();
         }
-        item
+        event
     }
 
     /// Next event, or register `cx` and park until a push.
@@ -188,26 +188,27 @@ impl Queue {
         let mut state = lock(&self.state);
         state.closed = true;
         // Drop pending requests now so requesters see `NoReply`
-        state.items.clear();
+        state.events.clear();
         drop(state);
         self.space.notify_waiters();
     }
 }
 
-pub(crate) struct Entry {
+/// A subscription as stored in the interest trie.
+pub(crate) struct Sub {
     id: u64,
-    /// `None` when being found in the graph is enough, i.e. without filters:
-    /// the graph matches names and parameter values exactly.
-    matches: Option<Matcher>,
-    queue: Arc<Queue>,
+    /// `None` when being found in the trie is enough, i.e. without filters:
+    /// the trie matches names and parameter values exactly.
+    matcher: Option<Matcher>,
+    buffer: Arc<Buffer>,
 }
 
-impl Entry {
+impl Sub {
     /// Whether the event really is for this subscription. Filters are user
     /// code: a panic counts as no match.
     fn accepts(&self, event: &dyn Any) -> bool {
-        self.matches.as_ref().is_none_or(|matches| {
-            catch_unwind(AssertUnwindSafe(|| matches(event))).unwrap_or_else(|_| {
+        self.matcher.as_ref().is_none_or(|matcher| {
+            catch_unwind(AssertUnwindSafe(|| matcher(event))).unwrap_or_else(|_| {
                 warning!(
                     subscription = self.id,
                     "filter panicked, counted as no match"
@@ -220,24 +221,24 @@ impl Entry {
 
 /// Round-robin position of a queue group.
 #[derive(Default)]
-struct Group {
+struct RoundRobin {
     next: AtomicUsize,
 }
 
-/// Members of a queue group on one node, in subscription order.
+/// Members of a queue group on one trie node, in subscription order.
 #[derive(Clone)]
 pub(crate) struct Members {
-    group: Arc<Group>,
-    entries: Vec<Arc<Entry>>,
+    turn: Arc<RoundRobin>,
+    subs: Vec<Arc<Sub>>,
 }
 
-/// Interest graph: a trie of subscriptions keyed by the path of their channel,
-/// like the NATS sublist. A subscription sits on the node of its channel and
+/// Interest trie: the subscriptions keyed by the path of their channel, like
+/// the NATS sublist. A subscription sits on the trie node of its channel and
 /// wants everything at or below it.
 #[derive(Clone, Default)]
 pub(crate) struct Interest {
     /// Subscriptions outside any queue group.
-    pub(crate) entries: Vec<Arc<Entry>>,
+    pub(crate) subs: Vec<Arc<Sub>>,
     /// Queue group members, kept here so publishing doesn't regroup them.
     pub(crate) groups: Vec<Members>,
     /// By segment name. A list: siblings are few, and comparing short names
@@ -250,37 +251,37 @@ pub(crate) struct Interest {
 #[derive(Clone, Default)]
 pub(crate) struct Edges {
     plain: Option<Arc<Interest>>,
-    any: Option<Arc<Interest>>,
-    is: imbl::HashMap<ParamKey, Arc<Interest>>,
+    wild: Option<Arc<Interest>>,
+    fixed: imbl::HashMap<ParamKey, Arc<Interest>>,
 }
 
 impl Edges {
     fn get_or_default(&mut self, param: &KeyParam) -> &mut Arc<Interest> {
         match param {
             KeyParam::None => self.plain.get_or_insert_with(Default::default),
-            KeyParam::Any => self.any.get_or_insert_with(Default::default),
-            KeyParam::Is(value) => self.is.entry(value.clone()).or_default(),
+            KeyParam::Wild => self.wild.get_or_insert_with(Default::default),
+            KeyParam::Is(value) => self.fixed.entry(value.clone()).or_default(),
         }
     }
 
     fn get_mut(&mut self, param: &KeyParam) -> Option<&mut Arc<Interest>> {
         match param {
             KeyParam::None => self.plain.as_mut(),
-            KeyParam::Any => self.any.as_mut(),
-            KeyParam::Is(value) => self.is.get_mut(value),
+            KeyParam::Wild => self.wild.as_mut(),
+            KeyParam::Is(value) => self.fixed.get_mut(value),
         }
     }
 
     fn remove(&mut self, param: &KeyParam) {
         match param {
             KeyParam::None => self.plain = None,
-            KeyParam::Any => self.any = None,
-            KeyParam::Is(value) => drop(self.is.remove(value)),
+            KeyParam::Wild => self.wild = None,
+            KeyParam::Is(value) => drop(self.fixed.remove(value)),
         }
     }
 
     fn is_empty(&self) -> bool {
-        self.plain.is_none() && self.any.is_none() && self.is.is_empty()
+        self.plain.is_none() && self.wild.is_none() && self.fixed.is_empty()
     }
 }
 
@@ -292,23 +293,19 @@ impl Interest {
             .map(|(_, e)| e)
     }
 
-    /// Copy on write: only the nodes on `path` that a publisher still holds get cloned.
-    fn insert(self: &mut Arc<Self>, path: &[Key], entry: Arc<Entry>, group: Option<Arc<Group>>) {
+    /// Copy on write: only the trie nodes on `path` that a publisher still holds get cloned.
+    fn insert(self: &mut Arc<Self>, path: &[Key], sub: Arc<Sub>, turn: Option<Arc<RoundRobin>>) {
         let node = Arc::make_mut(self);
         match path.split_first() {
-            None => match group {
-                None => node.entries.push(entry),
-                Some(group) => {
+            None => match turn {
+                None => node.subs.push(sub),
+                Some(turn) => {
                     // ids grow, so pushing keeps subscription order
-                    match node
-                        .groups
-                        .iter_mut()
-                        .find(|m| Arc::ptr_eq(&m.group, &group))
-                    {
-                        Some(members) => members.entries.push(entry),
+                    match node.groups.iter_mut().find(|m| Arc::ptr_eq(&m.turn, &turn)) {
+                        Some(members) => members.subs.push(sub),
                         None => node.groups.push(Members {
-                            group,
-                            entries: vec![entry],
+                            turn,
+                            subs: vec![sub],
                         }),
                     }
                 }
@@ -322,25 +319,25 @@ impl Interest {
                     }
                 };
                 let edges = &mut node.children[i].1;
-                edges.get_or_default(&key.param).insert(rest, entry, group);
+                edges.get_or_default(&key.param).insert(rest, sub, turn);
             }
         }
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.entries.is_empty() && self.groups.is_empty() && self.children.is_empty()
+        self.subs.is_empty() && self.groups.is_empty() && self.children.is_empty()
     }
 
-    /// Removes the entry and prunes the nodes left empty.
+    /// Removes the subscription and prunes the trie nodes left empty.
     fn remove(self: &mut Arc<Self>, path: &[Key], id: u64) {
         let node = Arc::make_mut(self);
         match path.split_first() {
             None => {
-                node.entries.retain(|e| e.id != id);
+                node.subs.retain(|e| e.id != id);
                 for members in &mut node.groups {
-                    members.entries.retain(|e| e.id != id);
+                    members.subs.retain(|e| e.id != id);
                 }
-                node.groups.retain(|m| !m.entries.is_empty());
+                node.groups.retain(|m| !m.subs.is_empty());
             }
             Some((key, rest)) => {
                 let Some(i) = node.children.iter().position(|(n, _)| *n == key.name) else {
@@ -361,10 +358,10 @@ impl Interest {
         }
     }
 
-    /// Calls `found` with every node along the subject of `event`. Walks only
+    /// Calls `found` with every trie node along the subject of `event`. Walks only
     /// the branches that match: the segment name and, on a parameter, both `*`
     /// and the value.
-    fn visit<'s>(&'s self, event: Option<&dyn Node>, found: &mut impl FnMut(&'s Interest)) {
+    fn visit<'s>(&'s self, event: Option<&dyn Level>, found: &mut impl FnMut(&'s Interest)) {
         found(self);
         let Some(event) = event else {
             return;
@@ -380,11 +377,11 @@ impl Interest {
                 }
             }
             Some(value) => {
-                if let Some(child) = &edges.any {
+                if let Some(child) = &edges.wild {
                     child.visit(step.next, found);
                 }
-                if !edges.is.is_empty() {
-                    if let Some(child) = edges.is.get(value) {
+                if !edges.fixed.is_empty() {
+                    if let Some(child) = edges.fixed.get(value) {
                         child.visit(step.next, found);
                     }
                 }
@@ -395,11 +392,11 @@ impl Interest {
 
 /// The member of a queue group that gets an event.
 enum Picked<'e> {
-    /// Already queued for a busy member with room.
-    Queued,
+    /// Already delivered to a busy member with room.
+    Delivered,
     /// Push to this one: it's idle, or every member that accepts is full and
     /// its overflow policy applies.
-    Member(&'e Entry),
+    Member(&'e Sub),
     /// No member accepts the event.
     None,
 }
@@ -409,30 +406,30 @@ enum Picked<'e> {
 /// first that accepts. `member(i)` for `i < len` lists the members found on
 /// the subject.
 fn pick<'e>(
-    group: &Group,
+    turn: &RoundRobin,
     len: usize,
-    member: impl Fn(usize) -> &'e Entry,
+    member: impl Fn(usize) -> &'e Sub,
     event: &Event,
 ) -> Picked<'e> {
     let any = &**event as &dyn Any;
-    let start = group.next.fetch_add(1, Ordering::Relaxed);
+    let start = turn.next.fetch_add(1, Ordering::Relaxed);
     let at = |i| member((start + i) % len);
     // An idle member waits in `next()`, so its buffer is empty
     for i in 0..len {
-        let entry = at(i);
-        if entry.queue.is_idle() && entry.accepts(any) {
-            return Picked::Member(entry);
+        let sub = at(i);
+        if sub.buffer.is_idle() && sub.accepts(any) {
+            return Picked::Member(sub);
         }
     }
-    // Checking for room and queuing take the same lock
+    // Checking for room and delivering take the same lock
     let mut full = None;
     for i in 0..len {
-        let entry = at(i);
-        if !entry.queue.is_idle() && entry.accepts(any) {
-            match entry.queue.try_push::<false>(event.clone()) {
-                Push::Queued => return Picked::Queued,
+        let sub = at(i);
+        if !sub.buffer.is_idle() && sub.accepts(any) {
+            match sub.buffer.try_push::<false>(event.clone()) {
+                Push::Delivered => return Picked::Delivered,
                 Push::Full(_) => {
-                    full.get_or_insert(entry);
+                    full.get_or_insert(sub);
                 }
                 Push::Evicted | Push::Dropped | Push::Closed => {}
             }
@@ -445,71 +442,71 @@ fn pick<'e>(
 struct State {
     /// Queue groups by value, with their member count: a group is forgotten
     /// with its last member.
-    groups: HashMap<GroupKey, (Arc<Group>, usize)>,
+    groups: HashMap<GroupKey, (Arc<RoundRobin>, usize)>,
     next_id: u64,
 }
 
 #[derive(Default)]
-pub(crate) struct Core {
+pub(crate) struct Bus {
     /// Read without locking on publish; replaced on (un)subscribe, under `state`.
     pub(crate) interest: ArcSwap<Interest>,
     state: Mutex<State>,
 }
 
-impl Core {
+impl Bus {
     pub(crate) async fn deliver(&self, event: Event) -> usize {
-        let (delivered, waiting) = self.route(&event);
+        let (delivered, waiting) = self.try_deliver(&event);
         if waiting.is_empty() {
             return delivered;
         }
-        delivered + Self::wait(waiting).await
+        delivered + Self::deliver_waiting(waiting).await
     }
 
-    /// Wait for room in each full `Overflow::Wait` queue. Kept out of
+    /// Wait for room in each full `Overflow::Wait` buffer. Kept out of
     /// `deliver`, so publishing that doesn't wait doesn't build this future.
-    async fn wait(waiting: Vec<(Arc<Queue>, Event)>) -> usize {
+    async fn deliver_waiting(waiting: Vec<(Arc<Buffer>, Event)>) -> usize {
         let mut delivered = 0;
-        for (queue, event) in waiting {
-            if queue.push_wait(event).await {
+        for (buffer, event) in waiting {
+            if buffer.push_wait(event).await {
                 delivered += 1;
             }
         }
         delivered
     }
 
-    /// Queues `event` everywhere there is room first, so a waiting subscriber
+    /// Delivers `event` everywhere there is room first, so a waiting subscriber
     /// doesn't delay the others. Returns how many got it, and the full
-    /// `Overflow::Wait` queues left to wait on.
-    fn route(&self, event: &Event) -> (usize, Vec<(Arc<Queue>, Event)>) {
+    /// `Overflow::Wait` buffers left to wait on.
+    fn try_deliver(&self, event: &Event) -> (usize, Vec<(Arc<Buffer>, Event)>) {
         let interest = self.interest.load();
         let mut delivered = 0;
         let mut waiting = Vec::new();
-        let mut push = |entry: &Entry| match entry.queue.try_push::<true>(event.clone()) {
-            Push::Queued => delivered += 1,
+        let mut push = |sub: &Sub| match sub.buffer.try_push::<true>(event.clone()) {
+            Push::Delivered => delivered += 1,
             Push::Evicted => {
                 debug!(
-                    subscription = entry.id,
+                    subscription = sub.id,
                     subject = %Subject(&**event),
                     "buffer full, dropped the oldest message"
                 );
                 delivered += 1;
             }
-            Push::Full(event) => waiting.push((entry.queue.clone(), event)),
+            Push::Full(event) => waiting.push((sub.buffer.clone(), event)),
             Push::Dropped => debug!(
-                subscription = entry.id,
+                subscription = sub.id,
                 subject = %Subject(&**event),
                 "buffer full, dropped the message"
             ),
             Push::Closed => {}
         };
 
-        // The graph matches the subject exactly; matchers only run filters
+        // The trie matches the subject exactly; matchers only run filters
         let any = &**event as &dyn Any;
         let mut groups: SmallVec<[&Members; 4]> = SmallVec::new();
         interest.visit(Some(&**event), &mut |node| {
-            for entry in &node.entries {
-                if entry.accepts(any) {
-                    push(entry);
+            for sub in &node.subs {
+                if sub.accepts(any) {
+                    push(sub);
                 }
             }
             if !node.groups.is_empty() {
@@ -517,31 +514,31 @@ impl Core {
             }
         });
 
-        // One member per queue group. A group usually sits on one node; members
-        // spread over several nodes of the subject are merged in subscription order
-        let mut queued = 0;
+        // One member per queue group. A group usually sits on one trie node; members
+        // spread over several trie nodes of the subject are merged in subscription order
+        let mut group_delivered = 0;
         for (i, members) in groups.iter().enumerate() {
-            let same = |m: &&Members| Arc::ptr_eq(&m.group, &members.group);
+            let same = |m: &&Members| Arc::ptr_eq(&m.turn, &members.turn);
             if groups[..i].iter().any(same) {
                 continue;
             }
             let member = if groups[i + 1..].iter().any(same) {
-                let mut all: Vec<&Entry> = (groups[i..].iter().filter(|m| same(m)))
-                    .flat_map(|m| m.entries.iter().map(|e| &**e))
+                let mut all: Vec<&Sub> = (groups[i..].iter().filter(|m| same(m)))
+                    .flat_map(|m| m.subs.iter().map(|e| &**e))
                     .collect();
-                all.sort_unstable_by_key(|entry| entry.id);
-                pick(&members.group, all.len(), |i| all[i], event)
+                all.sort_unstable_by_key(|sub| sub.id);
+                pick(&members.turn, all.len(), |i| all[i], event)
             } else {
-                let entries = &members.entries;
-                pick(&members.group, entries.len(), |i| &entries[i], event)
+                let subs = &members.subs;
+                pick(&members.turn, subs.len(), |i| &subs[i], event)
             };
             match member {
-                Picked::Queued => queued += 1,
+                Picked::Delivered => group_delivered += 1,
                 Picked::Member(member) => push(member),
                 Picked::None => {}
             }
         }
-        delivered += queued;
+        delivered += group_delivered;
         trace!(
             subject = %Subject(&**event),
             delivered,
@@ -554,29 +551,33 @@ impl Core {
     pub(crate) fn subscribe(
         &self,
         path: &[Key],
-        matches: Option<Matcher>,
+        matcher: Option<Matcher>,
         group_key: Option<&GroupKey>,
-        queue: Arc<Queue>,
+        buffer: Arc<Buffer>,
     ) -> u64 {
         let mut state = lock(&self.state);
         let id = state.next_id;
         state.next_id += 1;
-        let group = group_key.map(|key| {
-            let (group, members) = state.groups.entry(key.clone()).or_default();
+        let turn = group_key.map(|key| {
+            let (turn, members) = state.groups.entry(key.clone()).or_default();
             *members += 1;
-            group.clone()
+            turn.clone()
         });
         #[cfg(feature = "tracing")]
-        let filtered = matches.is_some();
-        let entry = Arc::new(Entry { id, matches, queue });
+        let filtered = matcher.is_some();
+        let sub = Arc::new(Sub {
+            id,
+            matcher,
+            buffer,
+        });
         let mut interest = self.interest.load_full();
-        interest.insert(path, entry, group);
+        interest.insert(path, sub, turn);
         self.interest.store(interest);
         // No user code under our lock, and a tracing subscriber is user code
         drop(state);
         debug!(
             subscription = id,
-            subject = %Pattern(path),
+            pattern = %Pattern(path),
             group = ?group_key,
             filtered,
             "subscribe"
@@ -599,7 +600,7 @@ impl Core {
         interest.remove(path, id);
         self.interest.store(interest);
         drop(state);
-        debug!(subscription = id, subject = %Pattern(path), "unsubscribe");
+        debug!(subscription = id, pattern = %Pattern(path), "unsubscribe");
     }
 
     #[cfg(test)]

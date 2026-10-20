@@ -12,9 +12,9 @@ use std::sync::Arc;
 /// wildcard step can't `inject`: there is no value to fill the `*` with.
 ///
 /// Steps are plain values (`fn` pointers and the selected parameter), not
-/// closures: walking down with [`topic!`](crate::topic) costs one allocation
-/// per step, in [`Channel::at_prism`], and the [`Key`] is only built when
-/// someone subscribes. That keeps `topic!(bus, user.id(x).delete).publish(..)`
+/// closures: walking down with [`at!`](crate::at) costs one allocation
+/// per step, in [`Channel::step`], and the [`Key`] is only built when
+/// someone subscribes. That keeps `at!(bus, user.id(x).delete).publish(..)`
 /// cheap.
 #[doc(hidden)]
 pub trait Prism<A>: Send + Sync + 'static {
@@ -26,7 +26,7 @@ pub trait Prism<A>: Send + Sync + 'static {
     fn project<'a>(&self, a: &'a A) -> Option<(Self::Q, &'a Self::B)>;
     /// Wrap a `B` into its `A` variant; `None` on a wildcard step.
     fn inject(&self, b: Self::B) -> Option<A>;
-    /// Edge of the interest graph for this step.
+    /// Key of this step in the interest trie.
     fn key(&self) -> Key;
 }
 
@@ -118,7 +118,7 @@ where
     }
 }
 
-/// One edge of the interest graph: the segment name and, on a parameter step,
+/// A step as stored in the interest trie: the segment name and, on a parameter step,
 /// the value or `*`.
 #[doc(hidden)]
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -131,11 +131,11 @@ pub struct Key {
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub enum KeyParam {
     None,
-    Any,
+    Wild,
     Is(ParamKey),
 }
 
-/// Fixed parameter value in the interest graph, compared with `Eq`. Publishing
+/// Fixed parameter value in the interest trie, compared with `Eq`. Publishing
 /// looks it up by the event's `&dyn ParamValue`, without copying it.
 #[doc(hidden)]
 #[derive(Clone)]
@@ -161,11 +161,11 @@ impl Borrow<dyn ParamValue> for ParamKey {
     }
 }
 
-/// Wildcard parameter (`*`): `id()` in [`topic!`](crate::topic).
+/// Wildcard parameter (`*`): `id()` in [`at!`](crate::at).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct Wild;
 
-/// Fixed parameter: `id(alice)` in [`topic!`](crate::topic).
+/// Fixed parameter: `id(alice)` in [`at!`](crate::at).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Is<V>(pub V);
 
@@ -199,7 +199,7 @@ impl<V: Clone + Send + Sync + 'static> Param<V> for Wild {
         None
     }
     fn key(&self) -> KeyParam {
-        KeyParam::Any
+        KeyParam::Wild
     }
 }
 
@@ -216,15 +216,15 @@ impl<V: ParamValue + Clone + Eq> Param<V> for Is<V> {
     }
 }
 
-/// Implemented by every `Topic` enum generated with [`events!`](crate::events):
+/// Implemented by every `Topic` enum generated with [`topics!`](crate::topics):
 /// links it to its navigation type, which has one method per child.
 pub trait Navigable: Sized + 'static {
     type Steps<P: 'static>;
     fn steps<P: 'static>(channel: Channel<Self, P>) -> Self::Steps<P>;
 }
 
-/// What a [`topic!`](crate::topic) path can end on: a channel, or the navigation
-/// type of a subtree.
+/// What a [`at!`](crate::at) path can end on: a channel, or the navigation
+/// type of a level.
 pub trait IntoChannel {
     type T;
     type P;
@@ -287,7 +287,7 @@ impl std::fmt::Display for Pattern<'_> {
             f.write_str(key.name)?;
             match &key.param {
                 KeyParam::None => {}
-                KeyParam::Any => f.write_str(".*")?,
+                KeyParam::Wild => f.write_str(".*")?,
                 KeyParam::Is(value) => write!(f, ".{}", value.0)?,
             }
             f.write_str(".")?;

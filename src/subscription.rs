@@ -1,27 +1,27 @@
 //! Subscriptions: the builder, the [`Stream`] of messages, and [`Msg`].
 
-use crate::bus::{Core, Event, Matcher, Queue};
+use crate::bus::{Buffer, Bus, Event, Matcher};
 use crate::channel::Route;
 use crate::group::{GroupKey, InScope, QueueGroup};
 use crate::nav::{Key, Pattern};
 use crate::tree::Subject;
-use crate::{subject, Channel, Overflow};
-use futures::stream::FusedStream;
+use crate::{Channel, Overflow, subject};
 use futures::Stream;
+use futures::stream::FusedStream;
 use std::any::Any;
 use std::fmt;
-use std::future::{ready, IntoFuture, Ready};
+use std::future::{IntoFuture, Ready, ready};
 use std::ops::Deref;
 use std::pin::Pin;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::task::{Context, Poll};
 
 type Filter<P, T> = Box<dyn Fn(&P, &T) -> bool + Send + Sync>;
 
 /// Configure a subscription, then `.await` it to start receiving.
 ///
-/// `S` is the topic the channel is on, which decides the queue groups it can
+/// `S` is the scope of the channel, which decides the queue groups it can
 /// join.
 pub struct SubscriptionBuilder<T, P, S = T> {
     pub(crate) channel: Channel<T, P, S>,
@@ -41,7 +41,7 @@ impl<T: 'static, P: 'static, S> SubscriptionBuilder<T, P, S> {
 
     /// Join a queue group: each message goes to one member of the group.
     ///
-    /// Groups are declared on a topic in [`events!`](crate::events), with
+    /// Groups are declared on a topic in [`topics!`](crate::topics), with
     /// `[ … ]`, and can only be joined on that topic.
     pub fn queue<G: QueueGroup + InScope<S>>(mut self, group: G) -> Self {
         self.group = Some(GroupKey::new(group));
@@ -63,10 +63,10 @@ impl<T: 'static, P: 'static, S> SubscriptionBuilder<T, P, S> {
     }
 
     fn start(self) -> Subscription<T, P> {
-        let queue = Arc::new(Queue::new(self.buffer, self.overflow));
+        let buffer = Arc::new(Buffer::new(self.buffer, self.overflow));
         let path: Box<[Key]> = self.channel.path().into();
-        // The graph matches the subject exactly: only filters need a matcher
-        let matches: Option<Matcher> = (!self.filters.is_empty()).then(|| {
+        // The trie matches the subject exactly: only filters need a matcher
+        let matcher: Option<Matcher> = (!self.filters.is_empty()).then(|| {
             let route = self.channel.route.clone();
             let filters = self.filters;
             Box::new(move |event: &dyn Any| {
@@ -76,12 +76,12 @@ impl<T: 'static, P: 'static, S> SubscriptionBuilder<T, P, S> {
             }) as Matcher
         });
 
-        let core = self.channel.core;
-        let id = core.subscribe(&path, matches, self.group.as_ref(), queue.clone());
+        let bus = self.channel.bus;
+        let id = bus.subscribe(&path, matcher, self.group.as_ref(), buffer.clone());
         Subscription {
             id,
-            core,
-            queue,
+            bus,
+            buffer,
             route: self.channel.route,
             path,
             group: self.group,
@@ -101,8 +101,8 @@ impl<T: 'static, P: 'static, S> IntoFuture for SubscriptionBuilder<T, P, S> {
 /// Active subscription, a [`Stream`] of [`Msg`]. Unsubscribes on drop.
 pub struct Subscription<T, P> {
     id: u64,
-    core: Arc<Core>,
-    queue: Arc<Queue>,
+    bus: Arc<Bus>,
+    buffer: Arc<Buffer>,
     route: Arc<dyn Route<T, P>>,
     path: Box<[Key]>,
     group: Option<GroupKey>,
@@ -111,7 +111,7 @@ pub struct Subscription<T, P> {
 impl<T, P> Subscription<T, P> {
     /// Messages lost because the buffer was full.
     pub fn dropped(&self) -> u64 {
-        self.queue.dropped.load(Ordering::Relaxed)
+        self.buffer.dropped.load(Ordering::Relaxed)
     }
 
     fn msg(&self, event: Event) -> Msg<T, P> {
@@ -126,7 +126,7 @@ impl<T, P> Stream for Subscription<T, P> {
     type Item = Msg<T, P>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.queue.poll_pop(cx).map(|event| Some(self.msg(event)))
+        self.buffer.poll_pop(cx).map(|event| Some(self.msg(event)))
     }
 }
 
@@ -139,9 +139,9 @@ impl<T, P> FusedStream for Subscription<T, P> {
 
 impl<T, P> Drop for Subscription<T, P> {
     fn drop(&mut self) {
-        self.core
+        self.bus
             .unsubscribe(&self.path, self.id, self.group.as_ref());
-        self.queue.close();
+        self.buffer.close();
     }
 }
 

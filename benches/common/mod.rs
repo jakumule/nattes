@@ -1,16 +1,16 @@
-//! Event tree and helpers shared by the benchmarks.
+//! Tree and helpers shared by the benchmarks.
 
-use nattes::{events, Subscription, SubscriptionBuilder};
+use nattes::{Subscription, SubscriptionBuilder, topics};
 use std::future::IntoFuture;
 
 // `throughput` never reads the value
 #[allow(dead_code)]
-pub struct Payload(pub u64);
+pub struct Message(pub u64);
 
-events! {
-    events {
-        load [Workers]: Payload,
-        user { id(u64) { delete: Payload } },
+topics! {
+    topics {
+        load [Workers]: Message,
+        user { id(u64) { delete: Message } },
     }
 }
 

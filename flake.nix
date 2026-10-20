@@ -42,6 +42,7 @@
                 rustfmt
                 rust-analyzer
                 gnuplot
+                mdbook
               ]
               # Valgrind (for the `instructions` bench) is Linux only.
               ++ lib.optionals (lib.meta.availableOn stdenv.hostPlatform valgrind) [

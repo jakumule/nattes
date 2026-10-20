@@ -1,4 +1,4 @@
-//! Parsing the `events!` tree. Errors are collected entry by entry: a wrong
+//! Parsing the `topics!` tree. Errors are collected entry by entry: a wrong
 //! entry is skipped up to the next `,` and its siblings are still parsed.
 
 use std::collections::HashSet;
@@ -18,29 +18,29 @@ pub struct Input {
     pub krate: TokenTree,
     /// Attributes other than docs, applied to every `Topic` enum.
     pub attrs: Vec<Attribute>,
-    /// Always a `Kind::Tree`.
+    /// Always a `Kind::Level`.
     pub root: Entry,
 }
 
-/// Queue groups `[#![derive(Debug)] A, B(T)]`.
-pub struct Groups {
+/// The group enum `[#![derive(Debug)] A, B(T)]`: one queue group per value.
+pub struct GroupEnum {
     /// Inner attributes, applied to the enum.
     pub attrs: Vec<Attribute>,
     pub variants: Punctuated<Variant, Token![,]>,
 }
 
-/// One topic: `name(Param) [Groups]` and what follows.
+/// One topic: `name(Param) [A, B]` and what follows.
 pub struct Entry {
     pub docs: Vec<Attribute>,
     pub name: Ident,
     pub param: Option<Type>,
-    pub groups: Option<Groups>,
+    pub groups: Option<GroupEnum>,
     pub kind: Kind,
 }
 
 pub enum Kind {
     /// `name { … }`, and `name.rest` for `name { rest }`
-    Tree(Vec<Entry>),
+    Level(Vec<Entry>),
     /// `name: Message`
     Leaf(Type),
     /// `name = module`
@@ -54,7 +54,7 @@ pub fn parse(tokens: TokenStream, errors: &mut Vec<Error>) -> Result<Input> {
             .into_iter()
             .partition(|attr| attr.path().is_ident("doc"));
         let name = input.parse()?;
-        let groups = groups(input)?;
+        let groups = group_enum(input)?;
         let content;
         braced!(content in input);
         let root = Entry {
@@ -62,20 +62,20 @@ pub fn parse(tokens: TokenStream, errors: &mut Vec<Error>) -> Result<Input> {
             name,
             param: None,
             groups,
-            kind: Kind::Tree(entries(&content, errors)),
+            kind: Kind::Level(entries(&content, errors)),
         };
         Ok(Input { krate, attrs, root })
     };
     parser.parse2(tokens)
 }
 
-fn groups(input: ParseStream) -> Result<Option<Groups>> {
+fn group_enum(input: ParseStream) -> Result<Option<GroupEnum>> {
     if !input.peek(token::Bracket) {
         return Ok(None);
     }
     let content;
     bracketed!(content in input);
-    Ok(Some(Groups {
+    Ok(Some(GroupEnum {
         attrs: Attribute::parse_inner(&content)?,
         variants: Punctuated::parse_terminated(&content)?,
     }))
@@ -140,14 +140,14 @@ fn topic(input: ParseStream, docs: Vec<Attribute>, errors: &mut Vec<Error>) -> R
     } else {
         None
     };
-    let groups = groups(input)?;
+    let groups = group_enum(input)?;
     let (docs, kind) = if input.peek(Token![.]) {
         input.parse::<Token![.]>()?;
-        (Vec::new(), Kind::Tree(vec![topic(input, docs, errors)?]))
+        (Vec::new(), Kind::Level(vec![topic(input, docs, errors)?]))
     } else if input.peek(token::Brace) {
         let content;
         braced!(content in input);
-        (docs, Kind::Tree(entries(&content, errors)))
+        (docs, Kind::Level(entries(&content, errors)))
     } else if input.peek(Token![:]) {
         input.parse::<Token![:]>()?;
         let msg = input
@@ -201,7 +201,7 @@ mod tests {
     fn parse_tree(body: TokenStream) -> (Vec<Entry>, Vec<String>) {
         let mut errors = Vec::new();
         let input = parse(quote!(krate ev { #body }), &mut errors).unwrap();
-        let Kind::Tree(entries) = input.root.kind else {
+        let Kind::Level(entries) = input.root.kind else {
             unreachable!()
         };
         (entries, errors.iter().map(ToString::to_string).collect())
@@ -212,8 +212,8 @@ mod tests {
     }
 
     fn children(entry: &Entry) -> &[Entry] {
-        let Kind::Tree(children) = &entry.kind else {
-            panic!("not a tree")
+        let Kind::Level(children) = &entry.kind else {
+            panic!("not a level")
         };
         children
     }
