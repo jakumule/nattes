@@ -11,7 +11,7 @@ topics! {
     topics {
         git [Mailer] {
             push [Indexer(u32)]: GitPushMsg,
-            fetch: Request<GitFetchMsg, FetchAck>,
+            fetch: GitFetchMsg => FetchAck,
         },
         user { id(Uuid) { delete: UserDeleteMsg } },
         random.arrow.more: DeepMsg,
@@ -28,6 +28,7 @@ topics! {
 | **topic** | One named place in the tree: a level or a leaf. `git`, `git.push` and `user.id` are topics. | node, entry (in user docs) |
 | **level** | A topic with children. It becomes a module with a `Topic` enum and a `Steps` type, plus a group enum `Queue` if it declares queue groups. `git` and `user.id` are levels. The top level, `topics`, is the **root**. | subtree, node |
 | **leaf** | A topic carrying a message type: `push: GitPushMsg`. | — |
+| **request leaf** | A leaf declared with a reply type, `fetch: GitFetchMsg => FetchAck`. It holds its message like any leaf, and its channel takes requests only: no `publish`. | — |
 | **chain** | `a.b.c`, a shorthand for `a { b { c } }`: `random.arrow.more: DeepMsg`. | — |
 | **mount** | `name = module`: the root of another tree, as a level of this one. `other = other`. | — |
 | **name** | A topic's identifier as written in `topics!`: `push`, `r#type`. It gives the segment, the module and method names, and, in camel case, the `Topic` variant. | — |
@@ -43,7 +44,7 @@ topics! {
 |---|---|---|
 | **event** | The root value that a publish delivers: a `topics::Topic`, held as an `Arc<dyn Level>`. Publishing on `git.push` builds `Topic::Git(git::Topic::Push(msg))`. | — |
 | **message** | The part of an event that a channel sees: its `T`. On `at!(bus, git)` the message is a `git::Topic`; on `at!(bus, git.push)` a `GitPushMsg`. | item, payload |
-| **payload** | Only the `RQ` inside a `Request<RQ, RP>`: the `GitFetchMsg` of `fetch`. | — |
+| **payload** | Only the message of a request leaf, as sent by a requester: the `GitFetchMsg` of `fetch`. | — |
 | **subject** | The string of a concrete event: `git.push`, `user.id.42.delete`. Built by `subject()` and `msg.subject()`. | — |
 | **pattern** | What a channel or subscription covers, with `*` for wildcards and `>` for everything below: `user.id.*.>`. | subject (for wildcards) |
 
@@ -62,7 +63,7 @@ topics! {
 
 | Term | Meaning | Don't say |
 |---|---|---|
-| **subscription** | The registration made by awaiting `subscribe()`, and its handle `Subscription`, a `Stream` of messages. Dropping it unsubscribes. | — |
+| **subscription** | The registration made by awaiting `subscribe()`, and its handle `Subscription`, a `Stream` of messages. Dropping it unsubscribes. A responder is a subscription too, made with `respond()`. | — |
 | **subscriber** | The code that reads a subscription. | consumer, receiver |
 | **buffer** | A subscription's bounded storage for messages it hasn't read yet: `.buffer(256)`. | queue (for buffers) |
 | **deliver** | Push an event into a buffer. `publish` returns how many deliveries were made. | queued (as the outcome) |
@@ -76,7 +77,7 @@ topics! {
 | **queue group** | One value of a group enum: `PushQueue::Indexer(0)`. Each message goes to one member per queue group. | — |
 | **group enum** | The enum generated for `[ … ]`: `Queue` in a level's module (`git::Queue`), `<Leaf>Queue` for a leaf (`git::PushQueue`). | — |
 | **member** | A subscription in a queue group, joined with `.queue(…)`. | — |
-| **scope** | The type `S` of a channel, which tells which group enums it can join: the level's `Topic` enum, or a leaf's group enum. `at!(bus, git.push)` has the scope `git::PushQueue`. | topic (for `S`) |
+| **scope** | The type `S` of a channel, which tells which group enums it can join: the level's `Topic` enum, or a leaf's group enum. A request leaf without groups gets an empty enum `<Leaf>Scope` (`git::FetchScope`). On a request leaf, the scope implements `Answer`, which gives the reply type; on any other topic, `Publish`. `at!(bus, git.push)` has the scope `git::PushQueue`. | topic (for `S`) |
 
 ## Request/reply
 
@@ -84,7 +85,8 @@ topics! {
 |---|---|---|
 | **publisher** | Who publishes: calls `publish` on a channel. | sender |
 | **requester** | Who sends a request: calls `request`, `request_timeout` or `scatter`. | sender |
-| **responder** | Who answers a request: a subscriber calling `respond`. | receiver |
+| **responder** | A subscription made with `respond()` on a request leaf, and its handle `Responder`, a `Stream` of incoming requests. Only responders count for and answer requests. | receiver |
+| **incoming request** | What a responder receives: `Incoming`, which derefs to the payload and carries the responder's own **reply token**, used once by `respond(reply)`. | — |
 
 ## Internals
 
@@ -108,5 +110,6 @@ The internal types, by term:
 | event | `Event` (`Arc<dyn Level>`) |
 | level | `Level` (the trait every `Topic` enum implements) |
 | route | `Route`, `Root`, `Hop` |
+| responder, in the bus | `Answering<R>` (the event of one responder: the request's event and its reply token), `Reply` (the token) |
 | step | `Prism` (`Plain`, `ParamStep`), `Step`, `Steps` |
-| scope | `S`, `InScope<S>` |
+| scope | `S`, `InScope<S>`, `Answer<M>`, `Publish<T>` |

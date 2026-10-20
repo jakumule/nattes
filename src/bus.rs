@@ -92,12 +92,14 @@ impl Buffer {
     }
 
     /// Whether the subscriber is waiting for a message.
+    #[inline]
     fn is_idle(&self) -> bool {
         self.parked.load(Ordering::Relaxed)
     }
 
     /// Deliver `event`. When the buffer is full, apply the overflow policy if
     /// `OVERFLOW`, else hand the event back as `Full`.
+    #[inline]
     fn try_push<const OVERFLOW: bool>(&self, event: Event) -> Push {
         let mut state = lock(&self.state);
         if state.closed {
@@ -206,6 +208,7 @@ pub(crate) struct Sub {
 impl Sub {
     /// Whether the event really is for this subscription. Filters are user
     /// code: a panic counts as no match.
+    #[inline]
     fn accepts(&self, event: &dyn Any) -> bool {
         self.matcher.as_ref().is_none_or(|matcher| {
             catch_unwind(AssertUnwindSafe(|| matcher(event))).unwrap_or_else(|_| {
@@ -230,6 +233,9 @@ struct RoundRobin {
 pub(crate) struct Members {
     turn: Arc<RoundRobin>,
     subs: Vec<Arc<Sub>>,
+    /// Made with `respond()`: responders and subscribers joining the same
+    /// group form two groups.
+    responder: bool,
 }
 
 /// Interest trie: the subscriptions keyed by the path of their channel, like
@@ -241,6 +247,12 @@ pub(crate) struct Interest {
     pub(crate) subs: Vec<Arc<Sub>>,
     /// Queue group members, kept here so publishing doesn't regroup them.
     pub(crate) groups: Vec<Members>,
+    /// Responders (made with `respond()`) outside any queue group, apart so
+    /// that publishing doesn't even look at them: they only get requests.
+    pub(crate) responders: Vec<Arc<Sub>>,
+    /// Queue groups of responders. Responders and subscribers joining the same
+    /// group form two groups.
+    pub(crate) responder_groups: Vec<Members>,
     /// By segment name. A list: siblings are few, and comparing short names
     /// beats hashing them.
     pub(crate) children: Vec<(&'static str, Edges)>,
@@ -286,6 +298,7 @@ impl Edges {
 }
 
 impl Interest {
+    #[inline]
     fn edges(&self, name: &str) -> Option<&Edges> {
         self.children
             .iter()
@@ -294,18 +307,31 @@ impl Interest {
     }
 
     /// Copy on write: only the trie nodes on `path` that a publisher still holds get cloned.
-    fn insert(self: &mut Arc<Self>, path: &[Key], sub: Arc<Sub>, turn: Option<Arc<RoundRobin>>) {
+    fn insert(
+        self: &mut Arc<Self>,
+        path: &[Key],
+        sub: Arc<Sub>,
+        responder: bool,
+        turn: Option<Arc<RoundRobin>>,
+    ) {
         let node = Arc::make_mut(self);
         match path.split_first() {
             None => match turn {
+                None if responder => node.responders.push(sub),
                 None => node.subs.push(sub),
                 Some(turn) => {
+                    let groups = if responder {
+                        &mut node.responder_groups
+                    } else {
+                        &mut node.groups
+                    };
                     // ids grow, so pushing keeps subscription order
-                    match node.groups.iter_mut().find(|m| Arc::ptr_eq(&m.turn, &turn)) {
+                    match groups.iter_mut().find(|m| Arc::ptr_eq(&m.turn, &turn)) {
                         Some(members) => members.subs.push(sub),
-                        None => node.groups.push(Members {
+                        None => groups.push(Members {
                             turn,
                             subs: vec![sub],
+                            responder,
                         }),
                     }
                 }
@@ -319,25 +345,36 @@ impl Interest {
                     }
                 };
                 let edges = &mut node.children[i].1;
-                edges.get_or_default(&key.param).insert(rest, sub, turn);
+                edges
+                    .get_or_default(&key.param)
+                    .insert(rest, sub, responder, turn);
             }
         }
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.subs.is_empty() && self.groups.is_empty() && self.children.is_empty()
+        self.subs.is_empty()
+            && self.groups.is_empty()
+            && self.responders.is_empty()
+            && self.responder_groups.is_empty()
+            && self.children.is_empty()
     }
 
     /// Removes the subscription and prunes the trie nodes left empty.
-    fn remove(self: &mut Arc<Self>, path: &[Key], id: u64) {
+    fn remove(self: &mut Arc<Self>, path: &[Key], id: u64, responder: bool) {
         let node = Arc::make_mut(self);
         match path.split_first() {
             None => {
-                node.subs.retain(|e| e.id != id);
-                for members in &mut node.groups {
+                let (subs, groups) = if responder {
+                    (&mut node.responders, &mut node.responder_groups)
+                } else {
+                    (&mut node.subs, &mut node.groups)
+                };
+                subs.retain(|e| e.id != id);
+                for members in &mut *groups {
                     members.subs.retain(|e| e.id != id);
                 }
-                node.groups.retain(|m| !m.subs.is_empty());
+                groups.retain(|m| !m.subs.is_empty());
             }
             Some((key, rest)) => {
                 let Some(i) = node.children.iter().position(|(n, _)| *n == key.name) else {
@@ -347,7 +384,7 @@ impl Interest {
                 let Some(child) = edges.get_mut(&key.param) else {
                     return;
                 };
-                child.remove(rest, id);
+                child.remove(rest, id, responder);
                 if child.is_empty() {
                     edges.remove(&key.param);
                     if edges.is_empty() {
@@ -390,6 +427,9 @@ impl Interest {
     }
 }
 
+/// Builds the event of one responder, with its own reply token.
+pub(crate) type ForResponder<'a> = &'a (dyn Fn() -> Event + Sync);
+
 /// The member of a queue group that gets an event.
 enum Picked<'e> {
     /// Already delivered to a busy member with room.
@@ -404,12 +444,13 @@ enum Picked<'e> {
 /// One member of a queue group, from the round robin position (subscription
 /// order): the first idle one that accepts, else the first with room, else the
 /// first that accepts. `member(i)` for `i < len` lists the members found on
-/// the subject.
+/// the subject. `pushed` builds what to push to a member.
 fn pick<'e>(
     turn: &RoundRobin,
     len: usize,
     member: impl Fn(usize) -> &'e Sub,
     event: &Event,
+    pushed: impl Fn() -> Event,
 ) -> Picked<'e> {
     let any = &**event as &dyn Any;
     let start = turn.next.fetch_add(1, Ordering::Relaxed);
@@ -426,7 +467,7 @@ fn pick<'e>(
     for i in 0..len {
         let sub = at(i);
         if !sub.buffer.is_idle() && sub.accepts(any) {
-            match sub.buffer.try_push::<false>(event.clone()) {
+            match sub.buffer.try_push::<false>(pushed()) {
                 Push::Delivered => return Picked::Delivered,
                 Push::Full(_) => {
                     full.get_or_insert(sub);
@@ -440,9 +481,9 @@ fn pick<'e>(
 
 #[derive(Default)]
 struct State {
-    /// Queue groups by value, with their member count: a group is forgotten
-    /// with its last member.
-    groups: HashMap<GroupKey, (Arc<RoundRobin>, usize)>,
+    /// Queue groups by value and whether they are responders, with their
+    /// member count: a group is forgotten with its last member.
+    groups: HashMap<(GroupKey, bool), (Arc<RoundRobin>, usize)>,
     next_id: u64,
 }
 
@@ -454,8 +495,21 @@ pub(crate) struct Bus {
 }
 
 impl Bus {
+    /// Deliver a published event, to subscribers only. Returns how many got it.
     pub(crate) async fn deliver(&self, event: Event) -> usize {
-        let (delivered, waiting) = self.try_deliver(&event);
+        let none = || unreachable!("publishing reaches no responder");
+        let (delivered, waiting) = self.try_deliver::<false>(&event, &none);
+        if waiting.is_empty() {
+            return delivered;
+        }
+        delivered + Self::deliver_waiting(waiting).await
+    }
+
+    /// Deliver a request: `shared` to subscribers, and an event built by
+    /// `respond` to each responder. Returns how many responders it reached,
+    /// including those whose full buffer dropped it.
+    pub(crate) async fn deliver_request(&self, shared: &Event, respond: ForResponder<'_>) -> usize {
+        let (delivered, waiting) = self.try_deliver::<true>(shared, respond);
         if waiting.is_empty() {
             return delivered;
         }
@@ -464,10 +518,10 @@ impl Bus {
 
     /// Wait for room in each full `Overflow::Wait` buffer. Kept out of
     /// `deliver`, so publishing that doesn't wait doesn't build this future.
-    async fn deliver_waiting(waiting: Vec<(Arc<Buffer>, Event)>) -> usize {
+    async fn deliver_waiting(waiting: Vec<(Arc<Buffer>, Event, bool)>) -> usize {
         let mut delivered = 0;
-        for (buffer, event) in waiting {
-            if buffer.push_wait(event).await {
+        for (buffer, event, counts) in waiting {
+            if buffer.push_wait(event).await && counts {
                 delivered += 1;
             }
         }
@@ -476,28 +530,54 @@ impl Bus {
 
     /// Delivers `event` everywhere there is room first, so a waiting subscriber
     /// doesn't delay the others. Returns how many got it, and the full
-    /// `Overflow::Wait` buffers left to wait on.
-    fn try_deliver(&self, event: &Event) -> (usize, Vec<(Arc<Buffer>, Event)>) {
+    /// `Overflow::Wait` buffers left to wait on, with whether they count.
+    ///
+    /// For a `REQUEST`, responders get an event built by `respond` and only
+    /// they count, even when their buffer drops it. Otherwise responders are
+    /// skipped: they sit in their own lists, and with the const generic
+    /// publishing compiles to the same loops as without responders.
+    /// `accepts`, `try_push`, `is_idle` and `edges` are `#[inline]` because
+    /// LLVM stopped inlining them here once requests were added, which cost
+    /// publishing up to 20% on fan-out.
+    fn try_deliver<const REQUEST: bool>(
+        &self,
+        event: &Event,
+        respond: ForResponder,
+    ) -> (usize, Vec<(Arc<Buffer>, Event, bool)>) {
         let interest = self.interest.load();
         let mut delivered = 0;
         let mut waiting = Vec::new();
-        let mut push = |sub: &Sub| match sub.buffer.try_push::<true>(event.clone()) {
-            Push::Delivered => delivered += 1,
-            Push::Evicted => {
-                debug!(
-                    subscription = sub.id,
-                    subject = %Subject(&**event),
-                    "buffer full, dropped the oldest message"
-                );
-                delivered += 1;
+        // A responder gets its own event, and counts only for a request; a
+        // subscriber gets `event`, and counts only when publishing
+        let mut push = |sub: &Sub, responder: bool| {
+            let (pushed, counts) = if REQUEST && responder {
+                (respond(), true)
+            } else {
+                (event.clone(), !REQUEST)
+            };
+            match sub.buffer.try_push::<true>(pushed) {
+                Push::Delivered => delivered += usize::from(counts),
+                Push::Evicted => {
+                    debug!(
+                        subscription = sub.id,
+                        subject = %Subject(&**event),
+                        "buffer full, dropped the oldest message"
+                    );
+                    delivered += usize::from(counts);
+                }
+                Push::Full(pushed) => waiting.push((sub.buffer.clone(), pushed, counts)),
+                Push::Dropped => {
+                    debug!(
+                        subscription = sub.id,
+                        subject = %Subject(&**event),
+                        "buffer full, dropped the message"
+                    );
+                    // A responder was there: the requester sees `NoReply`, not
+                    // `NoResponders`, once its token is gone
+                    delivered += usize::from(REQUEST && counts);
+                }
+                Push::Closed => {}
             }
-            Push::Full(event) => waiting.push((sub.buffer.clone(), event)),
-            Push::Dropped => debug!(
-                subscription = sub.id,
-                subject = %Subject(&**event),
-                "buffer full, dropped the message"
-            ),
-            Push::Closed => {}
         };
 
         // The trie matches the subject exactly; matchers only run filters
@@ -506,11 +586,19 @@ impl Bus {
         interest.visit(Some(&**event), &mut |node| {
             for sub in &node.subs {
                 if sub.accepts(any) {
-                    push(sub);
+                    push(sub, false);
                 }
             }
             if !node.groups.is_empty() {
                 groups.extend(&node.groups);
+            }
+            if REQUEST {
+                for sub in &node.responders {
+                    if sub.accepts(any) {
+                        push(sub, true);
+                    }
+                }
+                groups.extend(&node.responder_groups);
             }
         });
 
@@ -522,19 +610,23 @@ impl Bus {
             if groups[..i].iter().any(same) {
                 continue;
             }
+            // Only requests reach responder groups
+            let responders = REQUEST && members.responder;
+            let pushed = || if responders { respond() } else { event.clone() };
             let member = if groups[i + 1..].iter().any(same) {
                 let mut all: Vec<&Sub> = (groups[i..].iter().filter(|m| same(m)))
                     .flat_map(|m| m.subs.iter().map(|e| &**e))
                     .collect();
                 all.sort_unstable_by_key(|sub| sub.id);
-                pick(&members.turn, all.len(), |i| all[i], event)
+                pick(&members.turn, all.len(), |i| all[i], event, pushed)
             } else {
                 let subs = &members.subs;
-                pick(&members.turn, subs.len(), |i| &subs[i], event)
+                pick(&members.turn, subs.len(), |i| &subs[i], event, pushed)
             };
+            let counts = responders || !REQUEST;
             match member {
-                Picked::Delivered => group_delivered += 1,
-                Picked::Member(member) => push(member),
+                Picked::Delivered => group_delivered += usize::from(counts),
+                Picked::Member(member) => push(member, responders),
                 Picked::None => {}
             }
         }
@@ -553,13 +645,14 @@ impl Bus {
         path: &[Key],
         matcher: Option<Matcher>,
         group_key: Option<&GroupKey>,
+        responder: bool,
         buffer: Arc<Buffer>,
     ) -> u64 {
         let mut state = lock(&self.state);
         let id = state.next_id;
         state.next_id += 1;
         let turn = group_key.map(|key| {
-            let (turn, members) = state.groups.entry(key.clone()).or_default();
+            let (turn, members) = state.groups.entry((key.clone(), responder)).or_default();
             *members += 1;
             turn.clone()
         });
@@ -571,7 +664,7 @@ impl Bus {
             buffer,
         });
         let mut interest = self.interest.load_full();
-        interest.insert(path, sub, turn);
+        interest.insert(path, sub, responder, turn);
         self.interest.store(interest);
         // No user code under our lock, and a tracing subscriber is user code
         drop(state);
@@ -579,25 +672,33 @@ impl Bus {
             subscription = id,
             pattern = %Pattern(path),
             group = ?group_key,
+            responder,
             filtered,
             "subscribe"
         );
         id
     }
 
-    pub(crate) fn unsubscribe(&self, path: &[Key], id: u64, group: Option<&GroupKey>) {
+    pub(crate) fn unsubscribe(
+        &self,
+        path: &[Key],
+        id: u64,
+        group: Option<&GroupKey>,
+        responder: bool,
+    ) {
         // Writers are serialized by `state`, so no update is lost
         let mut state = lock(&self.state);
         if let Some(key) = group {
-            if let Some((_, members)) = state.groups.get_mut(key) {
+            let key = (key.clone(), responder);
+            if let Some((_, members)) = state.groups.get_mut(&key) {
                 *members -= 1;
                 if *members == 0 {
-                    state.groups.remove(key);
+                    state.groups.remove(&key);
                 }
             }
         }
         let mut interest = self.interest.load_full();
-        interest.remove(path, id);
+        interest.remove(path, id, responder);
         self.interest.store(interest);
         drop(state);
         debug!(subscription = id, pattern = %Pattern(path), "unsubscribe");

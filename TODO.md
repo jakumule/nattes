@@ -3,14 +3,6 @@
 
 Found in a design review, in priority order.
 
-- [ ] **Subscribers that never answer count as responders.** `request`/`scatter`
-  (`src/request.rs`) count every subscription `deliver` reached, and see
-  `NoReply` only once every holder dropped the shared event. A logger on `>`
-  (like `log_all` in the README) breaks both: `request` never fails with
-  `NoResponders` and waits for `NoReply` until the logger drops its `Msg`, and
-  `scatter` expects a reply from the logger, so `Replies` never ends if it
-  keeps the `Msg`. Fix: make answering explicit, e.g. a responder opt-in on
-  `SubscriptionBuilder`, or a reply token taken out of `Msg<Request>`.
 - [ ] **User `Drop` runs under our locks.** `lock()` (`src/bus.rs`) claims no
   user code runs under them, but `Buffer::close` clears events under the
   buffer lock, `DropOldest` pops the evicted event under it (often its last
@@ -22,12 +14,10 @@ Found in a design review, in priority order.
   `None` and holds an `Arc<Bus>`, so `while let Some(m) = sub.next().await`
   can't end once every publisher is gone. Fix: close the buffers when the
   last `Channel` of a bus drops, or add an explicit close.
-- [ ] **A subscriber can't own a message.** `Msg` only derefs to `&T`, and the
-  event is shared. `Request::into_payload(self)` can't be called (nothing
-  gets a `Request` by value), and non-`Clone` payloads can't be moved out even
-  with one receiver (queue group). Fix: `Msg::try_into_inner` through
-  `Arc::try_unwrap` and a by-value `Prism` projection, or remove
-  `into_payload`.
+- [ ] **A subscriber can't own a message.** `Msg` and `Incoming` only deref to
+  `&T`, and the event is shared, so non-`Clone` messages can't be moved out
+  even with one receiver (queue group). Fix: `try_into_inner` through
+  `Arc::try_unwrap` and a by-value `Prism` projection.
 - [ ] **(Un)subscribe is O(n) in subscriptions on one trie node.**
   `Bus::subscribe` calls `Arc::make_mut` on `load_full()` while the `ArcSwap`
   still holds the trie, so every trie node on the path is cloned, including
@@ -47,10 +37,6 @@ Found in a design review, in priority order.
 - [ ] **Filters run on the publisher's thread**, inside `publish`: a slow
   filter slows every publisher, and with `panic = "abort"` a panicking filter
   aborts instead of counting as no match. Document ("keep filters cheap").
-- [ ] **`respond(&self)` allows several replies per responder** on `scatter`
-  (also through cloned `Msg`s), each taking another responder's place. A
-  consuming `respond` or a per-delivery token would rule it out at compile
-  time.
 - [ ] **`scatter` has no timeout**, and `request_timeout` ties the crate to the
   tokio timer, against being executor-agnostic.
 - [ ] **Ambiguous subjects**: a parameter whose `Display` contains `.` gives

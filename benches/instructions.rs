@@ -18,8 +18,9 @@ mod common;
 use common::{Message, start, topics};
 use futures::{FutureExt, StreamExt};
 use gungraun::prelude::*;
-use nattes::{Channel, Msg, Overflow, Subscription, at};
+use nattes::{Channel, Msg, Overflow, Replies, Subscription, at};
 use std::future::Future;
+use std::future::IntoFuture;
 use std::hint::black_box;
 
 /// Messages per measured batch.
@@ -28,6 +29,8 @@ const BATCH: u64 = 100;
 type Bus = Channel<topics::Topic>;
 type Load = Channel<Message, (), topics::LoadQueue>;
 type Sub<P = ()> = Subscription<Message, P>;
+type Ask = Channel<Message, (), topics::AskScope>;
+type Responder = nattes::Responder<Message, u64, ()>;
 
 /// Poll `fut` once: everything measured here completes without waiting.
 fn now<F: Future>(fut: F) -> F::Output {
@@ -188,6 +191,54 @@ fn subject((sub, msg): (Sub<(u64,)>, Msg<Message, (u64,)>)) -> (Sub<(u64,)>, Str
     (sub, black_box(msg.subject()))
 }
 
+/// `n` responders on `ask`.
+fn responders_setup(n: u64) -> (Ask, Vec<Responder>) {
+    let bus = Channel::<topics::Topic>::new();
+    let ask = at!(bus, ask);
+    let responders = (0..n)
+        .map(|_| {
+            let builder = ask.respond().buffer(BATCH as usize);
+            builder.into_future().into_inner()
+        })
+        .collect();
+    (ask, responders)
+}
+
+// Scatter a batch of requests to `n` responders.
+#[library_benchmark]
+#[benches::responders(args = [1, 16], setup = responders_setup)]
+fn request_scatter(
+    (ask, responders): (Ask, Vec<Responder>),
+) -> (Ask, Vec<Responder>, Vec<Replies<u64>>) {
+    let replies = (0..BATCH)
+        .map(|i| now(ask.scatter(Message(i))).expect("has responders"))
+        .collect();
+    (ask, responders, replies)
+}
+
+/// A responder with a batch of requests waiting in its buffer.
+fn answer_setup() -> (Ask, Responder, Vec<Replies<u64>>) {
+    let (ask, mut responders) = responders_setup(1);
+    let replies = (0..BATCH)
+        .map(|i| now(ask.scatter(Message(i))).unwrap())
+        .collect();
+    (ask, responders.pop().unwrap(), replies)
+}
+
+// Receive a batch of requests and answer each one.
+#[library_benchmark]
+#[bench::batch(setup = answer_setup)]
+fn answer(
+    (ask, mut responder, replies): (Ask, Responder, Vec<Replies<u64>>),
+) -> (Ask, Responder, Vec<Replies<u64>>) {
+    for _ in 0..BATCH {
+        let request = now(responder.next()).expect("responder closed");
+        let n = request.0;
+        black_box(request.respond(n));
+    }
+    (ask, responder, replies)
+}
+
 library_benchmark_group!(
     name = publishing,
     benchmarks = [
@@ -202,8 +253,11 @@ library_benchmark_group!(name = receiving, benchmarks = [receive, subject]);
 
 library_benchmark_group!(name = subscriptions, benchmarks = [subscribe, unsubscribe]);
 
+library_benchmark_group!(name = requests, benchmarks = [request_scatter, answer]);
+
 main!(
     library_benchmark_groups = publishing,
     receiving,
-    subscriptions
+    subscriptions,
+    requests
 );

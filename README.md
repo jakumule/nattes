@@ -119,6 +119,7 @@ topics! {
             /// Commits pushed.         // docs of this topic
             push: GitPushMsg,           // leaf message
             new(Uuid): GitNewMsg,       // parameter, then message
+            fetch: GitFetchMsg => FetchAck, // request leaf: message, then reply
         },
         user {
             new: UserNewMsg,            // same name as in git: fine
@@ -140,7 +141,8 @@ Every level is a module containing an enum named `Topic`. This example generates
 
 ```text
 topics::Topic                 { Git(git::Topic), User(user::Topic), Random(…), Jobs(jobs::Topic), Other(other::Topic) }
-topics::git::Topic            { Push(GitPushMsg), New(Uuid, GitNewMsg) }
+topics::git::Topic            { Push(GitPushMsg), New(Uuid, GitNewMsg), Fetch(GitFetchMsg) }
+topics::git::FetchScope       {}
 topics::user::Topic           { New(UserNewMsg), Id(Uuid, id::Topic) }
 topics::user::id::Topic       { Update(UserUpdateMsg), Delete(UserDeleteMsg) }
 topics::user::id::Queue       { Oncall }
@@ -163,6 +165,7 @@ and `Topic::Type`.
 | `name { … }` | level, in module `name` | `Name(name::Topic)` |
 | `name: Msg` | leaf message | `Name(Msg)` |
 | `name(Type): Msg` | parameter, then message | `Name(Type, Msg)` |
+| `name: Msg => Reply` | request leaf (see [Request/reply](#requestreply)) | `Name(Msg)` |
 | `name(Type) { … }` | parameter, then level, in module `name` | `Name(Type, name::Topic)` |
 | `name.…` | chain: a level with a single child, no braces | same as `name { … }` |
 | `name = path::to::module` | mount the tree of another `topics!` | `Name(path::to::module::Topic)` |
@@ -220,13 +223,14 @@ let any_delete    = at!(any_user, delete);            // user.*.delete, from any
 | `user.<alice>.>` | `at!(bus, user.id(alice)).subscribe()` |
 | `user.*.delete` | `at!(bus, user.id().delete).subscribe()` |
 | queue group | `.subscribe().queue(jobs::Queue::Mailer)` |
-| request/reply | `channel.request(msg)` / `msg.respond(reply)` |
+| request/reply | `channel.request(msg)` / `channel.respond()`, then `req.respond(reply)` |
 | scatter-gather | `channel.scatter(msg)` (a stream of replies) |
 
 ## Publishing
 
 A channel without wildcards can publish its own type: a leaf message, or a whole
-level value.
+level value. Request leaves are the exception: they take requests only (see
+[Request/reply](#requestreply)).
 
 ```rust
 pushes.publish(GitPushMsg { branch: "main".into() }).await;
@@ -287,10 +291,10 @@ while let Some(msg) = sub.next().await {
   together:
 
   ```rust
-  let mut batches = fetches_sub.ready_chunks(64);
+  let mut batches = fetch_responder.ready_chunks(64);
   while let Some(batch) = batches.next().await {
       let acks = fetch_all(batch.iter().map(|req| &req.branch)).await;
-      for (req, ack) in batch.iter().zip(acks) {
+      for (req, ack) in batch.into_iter().zip(acks) {
           req.respond(ack);
       }
   }
@@ -362,22 +366,23 @@ Other channels keep the default (`Channel<T, P>` is `Channel<T, P, T>`).
 
 ## Request/reply
 
-Make a leaf request-reply by giving it the type `nattes::Request<Payload, Reply>`:
+Make a leaf request-reply by declaring its reply type after the message,
+`name: Msg => Reply`:
 
 ```rust
 topics! {
     topics {
-        git { push: Request<GitPushMsg, PushAck> },
+        git { push: GitPushMsg => PushAck },
     }
 }
 
 let pushes = at!(bus, git.push);
 
-// responder: `msg` derefs to the `Request`, which derefs to `GitPushMsg`
-let mut requests = pushes.subscribe().await;
+// responder: each `req` is an `Incoming`, which derefs to `GitPushMsg`
+let mut responder = pushes.respond().await;
 tokio::spawn(async move {
-    while let Some(msg) = requests.next().await {
-        msg.respond(PushAck { accepted: true });
+    while let Some(req) = responder.next().await {
+        req.respond(PushAck { accepted: true });
     }
 });
 
@@ -388,14 +393,25 @@ let ack = pushes
     .await?;
 ```
 
-Responders can check `msg.is_pending()` to skip work nobody is waiting for. Leaves
-under `a.b.c` chains can't use a type with a top-level comma; use a type
-alias there.
+Only responders, made with `respond()`, answer requests. `respond()` returns
+the same builder as `subscribe()` (`filter`, `queue`, `buffer`, `on_full`),
+and awaiting it gives a `Responder`, a stream of `Incoming` requests. Each
+responder gets its own reply token: `req.respond(reply)` takes `req` by value,
+so a responder answers each request at most once, and dropping `req` without
+answering counts as no reply from this responder. `req.is_pending()` tells
+whether anyone still waits for a reply, to skip work nobody needs.
+
+Subscribers of the leaf, or of anything above it (`bus.subscribe()` on `>`),
+see the requests as plain messages, but they don't count as responders and
+can't answer: a logger never delays or breaks a request. A request leaf takes
+requests only: it has no `publish`. Responders and subscribers joining the same
+queue group form two separate groups.
 
 The first reply wins. Possible errors:
 
-- `BusError::NoResponders`: nobody is subscribed.
-- `BusError::NoReply`: every responder dropped the request without answering.
+- `BusError::NoResponders`: no responder matches the request.
+- `BusError::NoReply`: every responder dropped the request without answering,
+  including when a full buffer dropped it.
 - `BusError::Timeout`: `request_timeout` ran out of time.
 
 `request` on its own waits for as long as some responder still holds the request, so
@@ -403,7 +419,7 @@ prefer `request_timeout` unless you know a responder will answer.
 
 ### Scatter-gather
 
-`scatter` sends the request to every subscriber and streams their replies, one per
+`scatter` sends the request to every responder and streams their replies, one per
 responder (a queue group counts as one responder). The stream ends once each of
 them answered or dropped the request; `replies.remaining()` tells how many are
 still expected. `Replies` is a `FusedStream`, so `StreamExt` adapters cover the
@@ -424,9 +440,8 @@ let acks: Vec<PushAck> = pushes
     .await;
 ```
 
-Responders use the same `msg.respond(reply)`, and should answer once: an extra
-reply takes the place of another responder's. Both fail with
-`BusError::NoResponders` when nobody is subscribed; dropping the stream makes
+Responders use the same `req.respond(reply)`. Both fail with
+`BusError::NoResponders` when no responder matches; dropping the stream makes
 `respond` return `false` and `is_pending` turn `false`.
 
 ## Delivery guarantees
@@ -463,14 +478,14 @@ Per method:
 
 | Method | Returns | Waits for |
 |---|---|---|
-| `publish` | How many subscriptions the message was delivered to. | Room in full `Overflow::Wait` buffers. |
-| `request` | The first reply. `NoResponders` if it was delivered to nobody, `NoReply` once every responder dropped it without answering. | Delivery, then a reply, with no time limit. |
+| `publish` | How many subscriptions the message was delivered to. Not on request leaves. | Room in full `Overflow::Wait` buffers. |
+| `request` | The first reply. `NoResponders` if no responder matches it, `NoReply` once every responder dropped it without answering. | Delivery, then a reply, with no time limit. |
 | `request_timeout` | Same as `request`, or `Timeout`. | Delivery and the reply, both within the timeout. |
 | `scatter` | A stream of replies, at most one per responder, or `NoResponders`. | Delivery. The stream ends once every responder answered or dropped the request. |
 
-A request goes to every matching subscriber, like any message, and only the
-first reply counts. To have exactly one handler, subscribe through a queue group.
-A request that is lost from a buffer counts as dropped without a reply. After a
+A request goes to every matching subscriber and responder, and only the
+first reply counts. To have exactly one handler, respond through a queue group.
+A request that is lost from a responder's buffer counts as dropped without a reply. After a
 `Timeout`, the request may still sit in buffers and be handled, but its reply is
 discarded: `respond` returns `false`.
 
@@ -573,6 +588,26 @@ pushes.subscribe().queue(Queue::Mailer);
 // wrong value for a queue group
 pushes.subscribe().queue(PushQueue::Indexer("0"));
 // error: expected `u32`, found `&str`
+
+// a request on a leaf declared without a reply (`push: GitPushMsg`)
+pushes.request(GitPushMsg { branch: "main".into() });
+// error: the method `request` exists for struct `Channel<GitPushMsg, (), PushQueue>`,
+//        but its trait bounds were not satisfied
+pushes.respond();
+// error: `GitPushMsg` isn't the payload of a request leaf
+
+// answering twice (`req` is an `Incoming`)
+req.respond(ack);
+req.respond(ack);
+// error: use of moved value: `req`
+
+// answering from a subscription (`msg` is a `Msg`)
+msg.respond(ack);
+// error: no method named `respond` found for struct `Msg`
+
+// publishing on a request leaf (`fetches` is on `fetch: GitFetchMsg => FetchAck`)
+fetches.publish(GitFetchMsg { branch: "main".into() });
+// error: can't publish on a request leaf
 ```
 
 ## Requirements

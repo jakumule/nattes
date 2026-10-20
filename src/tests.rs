@@ -3,7 +3,7 @@ use crate::at;
 use futures::stream::FusedStream;
 use futures::{FutureExt, StreamExt};
 use std::pin::pin;
-use topics::git::{PushQueue, Queue as GitQueue};
+use topics::git::{LookupQueue, PushQueue, Queue as GitQueue};
 use topics::user::id::Queue as AdminQueue;
 use uuid::Uuid;
 
@@ -51,7 +51,8 @@ crate::topics! {
             pull: GitPullMsg,
             new(Uuid): GitNewMsg,
             count(u32) [Workers]: U32Event,
-            fetch: Request<GitFetchMsg, FetchAck>,
+            fetch: GitFetchMsg => FetchAck,
+            lookup(u32) [Workers]: GitFetchMsg => FetchAck,
         },
         user {
             new: UserNewMsg,
@@ -237,10 +238,11 @@ async fn request_reply() -> anyhow::Result<()> {
         Err(BusError::NoResponders)
     ));
 
-    let mut responder = fetches.subscribe().await;
+    let mut responder = fetches.respond().await;
     tokio::spawn(async move {
         while let Some(msg) = responder.next().await {
-            msg.respond(FetchAck(msg.0.len()));
+            let len = msg.0.len();
+            msg.respond(FetchAck(len));
         }
     });
 
@@ -254,8 +256,8 @@ async fn request_reply() -> anyhow::Result<()> {
 #[tokio::test]
 async fn first_reply_wins() {
     let fetches = fetch_channel();
-    let mut a = fetches.subscribe().await;
-    let mut b = fetches.subscribe().await;
+    let mut a = fetches.respond().await;
+    let mut b = fetches.respond().await;
     let reply = tokio::spawn({
         let fetches = fetches.clone();
         async move { fetches.request(GitFetchMsg("main".into())).await }
@@ -272,7 +274,7 @@ async fn first_reply_wins() {
 #[tokio::test]
 async fn request_dropped_without_reply() {
     let fetches = fetch_channel();
-    let mut silent = fetches.subscribe().await;
+    let mut silent = fetches.respond().await;
     tokio::spawn(async move { while silent.next().await.is_some() {} });
     assert!(matches!(
         fetches.request(GitFetchMsg("main".into())).await,
@@ -289,7 +291,7 @@ async fn scatter_gathers_one_reply_per_responder() -> anyhow::Result<()> {
     ));
 
     for n in 1..=3 {
-        let mut responder = fetches.subscribe().await;
+        let mut responder = fetches.respond().await;
         tokio::spawn(async move {
             while let Some(msg) = responder.next().await {
                 msg.respond(FetchAck(n));
@@ -308,14 +310,13 @@ async fn scatter_gathers_one_reply_per_responder() -> anyhow::Result<()> {
 #[tokio::test]
 async fn scatter_ends_when_responders_drop_the_request() -> anyhow::Result<()> {
     let fetches = fetch_channel();
-    let mut a = fetches.subscribe().await;
-    let mut silent = fetches.subscribe().await;
+    let mut a = fetches.respond().await;
+    let mut silent = fetches.respond().await;
     let mut replies = fetches.scatter(GitFetchMsg("main".into())).await?;
 
     let a = a.next().await.unwrap();
     assert!(a.respond(FetchAck(1)));
     drop(silent.next().await.unwrap());
-    drop(a);
 
     assert_eq!(replies.next().await, Some(FetchAck(1)));
     assert_eq!(replies.next().await, None);
@@ -325,30 +326,41 @@ async fn scatter_ends_when_responders_drop_the_request() -> anyhow::Result<()> {
 #[tokio::test]
 async fn scatter_stops_listening_once_everyone_replied() -> anyhow::Result<()> {
     let fetches = fetch_channel();
-    let mut sub = fetches.subscribe().await;
+    let mut sub = fetches.respond().await;
     let mut replies = fetches.scatter(GitFetchMsg("main".into())).await?;
 
     let msg = sub.next().await.unwrap();
     assert!(msg.respond(FetchAck(1)));
-    // Still held by the responder, but the one expected reply is in
     assert_eq!(replies.next().await, Some(FetchAck(1)));
     assert!(replies.is_terminated());
     assert_eq!(replies.next().await, None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn dropping_the_replies_stops_responders() -> anyhow::Result<()> {
+    let fetches = fetch_channel();
+    let mut sub = fetches.respond().await;
+    let replies = fetches.scatter(GitFetchMsg("main".into())).await?;
+
+    let msg = sub.next().await.unwrap();
+    assert!(msg.is_pending());
+    drop(replies);
     assert!(!msg.is_pending());
-    assert!(!msg.respond(FetchAck(2)));
+    assert!(!msg.respond(FetchAck(1)));
     Ok(())
 }
 
 #[tokio::test]
 async fn scatter_replies_until_a_deadline() -> anyhow::Result<()> {
     let fetches = fetch_channel();
-    let mut fast = fetches.subscribe().await;
+    let mut fast = fetches.respond().await;
     tokio::spawn(async move {
         while let Some(msg) = fast.next().await {
             msg.respond(FetchAck(1));
         }
     });
-    let _silent = fetches.subscribe().await;
+    let _silent = fetches.respond().await;
 
     let deadline = tokio::time::sleep(std::time::Duration::from_millis(20));
     let acks: Vec<_> = fetches
@@ -374,7 +386,7 @@ fn push_channel() -> Channel<GitPushMsg, (), topics::git::PushQueue> {
     at!(Channel::<topics::Topic>::new(), git.push)
 }
 
-fn fetch_channel() -> Channel<Request<GitFetchMsg, FetchAck>> {
+fn fetch_channel() -> Channel<GitFetchMsg, (), topics::git::FetchScope> {
     at!(Channel::<topics::Topic>::new(), git.fetch)
 }
 
@@ -475,7 +487,7 @@ async fn panicking_filter_does_not_break_the_bus() {
 #[tokio::test]
 async fn request_timeout() {
     let fetches = fetch_channel();
-    let _silent = fetches.subscribe().await;
+    let _silent = fetches.respond().await;
     let result = fetches
         .request_timeout(
             GitFetchMsg("main".into()),
@@ -499,7 +511,8 @@ fn handles_are_send_and_sync() {
     assert_send(fetch_channel().request(GitFetchMsg("a".into())));
     assert_send(fetch_channel().scatter(GitFetchMsg("a".into())));
     assert_send_sync::<Replies<FetchAck>>();
-    assert_send_sync::<Msg<Request<GitFetchMsg, FetchAck>, ()>>();
+    assert_send_sync::<Responder<GitFetchMsg, FetchAck, ()>>();
+    assert_send_sync::<Incoming<GitFetchMsg, FetchAck, ()>>();
 }
 
 #[tokio::test]
@@ -649,9 +662,143 @@ async fn waiting_publishers_resume_once_the_buffer_drains_to_half() {
 }
 
 #[tokio::test]
+async fn subscribers_are_not_responders() -> anyhow::Result<()> {
+    let bus = Channel::<topics::Topic>::new();
+    let fetches = at!(bus, git.fetch);
+    // a logger on `>` that keeps what it reads
+    let mut all = bus.subscribe().await;
+    assert!(matches!(
+        fetches.request(GitFetchMsg("a".into())).await,
+        Err(BusError::NoResponders)
+    ));
+    let mut logged = vec![all.next().await.unwrap()];
+
+    let mut responder = fetches.respond().await;
+    let request = tokio::spawn({
+        let fetches = fetches.clone();
+        async move { fetches.request(GitFetchMsg("b".into())).await }
+    });
+    drop(responder.next().await.unwrap());
+    assert!(matches!(request.await?, Err(BusError::NoReply)));
+    logged.push(all.next().await.unwrap());
+
+    let mut other = fetches.respond().await;
+    let replies = fetches.scatter(GitFetchMsg("c".into())).await?;
+    assert_eq!(replies.remaining(), 2);
+    for (n, responder) in [&mut responder, &mut other].into_iter().enumerate() {
+        assert!(responder.next().await.unwrap().respond(FetchAck(n)));
+    }
+    let mut acks: Vec<_> = replies.collect().await;
+    acks.sort_by_key(|ack| ack.0);
+    assert_eq!(acks, [FetchAck(0), FetchAck(1)]);
+
+    logged.extend(drain(&mut all));
+    let subjects: Vec<_> = logged.iter().map(|msg| msg.subject()).collect();
+    assert_eq!(subjects, ["git.fetch", "git.fetch", "git.fetch"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_level_subscriber_sees_the_payload() -> anyhow::Result<()> {
+    let bus = Channel::<topics::Topic>::new();
+    let mut git = at!(bus, git).subscribe().await;
+    let mut responder = at!(bus, git.fetch).respond().await;
+    let replies = at!(bus, git.fetch)
+        .scatter(GitFetchMsg("main".into()))
+        .await?;
+
+    let msg = git.next().await.unwrap();
+    let topics::git::Topic::Fetch(payload) = &*msg else {
+        panic!("not a fetch: {msg:?}")
+    };
+    assert_eq!(payload.0, "main");
+    assert!(responder.next().await.unwrap().respond(FetchAck(1)));
+    assert_eq!(replies.collect::<Vec<_>>().await, [FetchAck(1)]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_responder_queue_group_answers_once() -> anyhow::Result<()> {
+    let bus = Channel::<topics::Topic>::new();
+    // one group over two trie nodes: `git.lookup.*` and `git.lookup.1`
+    let mut any = at!(bus, git.lookup())
+        .respond()
+        .queue(LookupQueue::Workers)
+        .await;
+    let mut one = at!(bus, git.lookup(1))
+        .respond()
+        .queue(LookupQueue::Workers)
+        .await;
+    let replies = at!(bus, git.lookup(1))
+        .scatter(GitFetchMsg("a".into()))
+        .await?;
+    assert_eq!(replies.remaining(), 1);
+
+    let (any, one) = (drain_incoming(&mut any), drain_incoming(&mut one));
+    assert_eq!(any.len() + one.len(), 1);
+    for incoming in any {
+        assert_eq!(incoming.params(), (1,));
+        incoming.respond(FetchAck(1));
+    }
+    for incoming in one {
+        assert_eq!(incoming.subject(), "git.lookup.1");
+        incoming.respond(FetchAck(1));
+    }
+    assert_eq!(replies.collect::<Vec<_>>().await, [FetchAck(1)]);
+    Ok(())
+}
+
+/// Every request already in the buffer of a responder.
+fn drain_incoming<M, R: Send + 'static, P>(
+    responder: &mut Responder<M, R, P>,
+) -> Vec<Incoming<M, R, P>> {
+    let mut out = Vec::new();
+    while let Some(Some(incoming)) = responder.next().now_or_never() {
+        out.push(incoming);
+    }
+    out
+}
+
+#[tokio::test]
+async fn a_request_dropped_by_a_full_responder_gets_no_reply() -> anyhow::Result<()> {
+    let fetches = fetch_channel();
+    let mut responder = fetches.respond().buffer(1).await;
+    let mut first = pin!(fetches.request(GitFetchMsg("a".into())));
+    assert!(first.as_mut().now_or_never().is_none(), "waits for a reply");
+    assert!(matches!(
+        fetches.request(GitFetchMsg("b".into())).await,
+        Err(BusError::NoReply)
+    ));
+    assert_eq!(responder.dropped(), 1);
+
+    let incoming = responder.next().await.unwrap();
+    assert_eq!(incoming.0, "a");
+    incoming.respond(FetchAck(1));
+    assert_eq!(first.await?, FetchAck(1));
+    Ok(())
+}
+
+#[tokio::test]
+async fn subscribers_and_responders_join_separate_groups() {
+    let bus = Channel::<topics::Topic>::new();
+    let lookups = at!(bus, git.lookup(1));
+    let mut sub = lookups.subscribe().queue(LookupQueue::Workers).await;
+    let mut responder = lookups.respond().queue(LookupQueue::Workers).await;
+    assert_eq!(bus.bus.group_count(), 2);
+
+    let request = tokio::spawn({
+        let lookups = lookups.clone();
+        async move { lookups.request(GitFetchMsg("a".into())).await }
+    });
+    responder.next().await.unwrap().respond(FetchAck(1));
+    assert_eq!(request.await.unwrap(), Ok(FetchAck(1)));
+    assert_eq!(drain(&mut sub).len(), 1);
+}
+
+#[tokio::test]
 async fn requests_stack_up_while_the_responder_is_busy() -> anyhow::Result<()> {
     let fetches = fetch_channel();
-    let mut responder = fetches.subscribe().await;
+    let mut responder = fetches.respond().await;
     let mut requests =
         ["a", "bb", "ccc"].map(|branch| Box::pin(fetches.request(GitFetchMsg(branch.into()))));
     for request in &mut requests {
@@ -663,8 +810,9 @@ async fn requests_stack_up_while_the_responder_is_busy() -> anyhow::Result<()> {
 
     let batch = (&mut responder).ready_chunks(16).next().await.unwrap();
     assert_eq!(batch.len(), 3);
-    for msg in &batch {
-        msg.respond(FetchAck(msg.0.len()));
+    for msg in batch {
+        let len = msg.0.len();
+        msg.respond(FetchAck(len));
     }
     let mut acks = Vec::new();
     for request in requests {

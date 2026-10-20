@@ -38,11 +38,13 @@ pub struct Entry {
     pub kind: Kind,
 }
 
+// a few per tree, only while expanding: their size doesn't matter
+#[allow(clippy::large_enum_variant)]
 pub enum Kind {
     /// `name { … }`, and `name.rest` for `name { rest }`
     Level(Vec<Entry>),
-    /// `name: Message`
-    Leaf(Type),
+    /// `name: Message`, or `name: Message => Reply` for a request leaf
+    Leaf { msg: Type, reply: Option<Type> },
     /// `name = module`
     Mount(Path),
 }
@@ -153,13 +155,22 @@ fn topic(input: ParseStream, docs: Vec<Attribute>, errors: &mut Vec<Error>) -> R
         let msg = input
             .parse()
             .map_err(|e| Error::new(e.span(), "expected the message type"))?;
-        (docs, Kind::Leaf(msg))
+        let reply = if input.peek(Token![=>]) {
+            input.parse::<Token![=>]>()?;
+            let reply = input
+                .parse()
+                .map_err(|e| Error::new(e.span(), "expected the reply type"))?;
+            Some(reply)
+        } else {
+            None
+        };
+        (docs, Kind::Leaf { msg, reply })
     } else if input.peek(Token![=]) && param.is_none() && groups.is_none() {
         input.parse::<Token![=]>()?;
         (docs, Kind::Mount(Path::parse_mod_style(input)?))
     } else {
         return Err(input.error(
-            "expected `{ … }`, `: Message`, `.name` or, without parameter and groups, `= module`",
+            "expected `{ … }`, `: Message`, `: Message => Reply`, `.name` or, without parameter and groups, `= module`",
         ));
     };
     Ok(Entry {
@@ -171,7 +182,8 @@ fn topic(input: ParseStream, docs: Vec<Attribute>, errors: &mut Vec<Error>) -> R
     })
 }
 
-/// Skips past the next `,` that isn't inside a generic argument list.
+/// Skips past the next `,` that isn't inside a generic argument list. The `>`
+/// of `->` and `=>` doesn't close one.
 fn skip_entry(input: ParseStream) {
     let _ = input.step(|cursor| {
         let mut rest = *cursor;
@@ -186,7 +198,7 @@ fn skip_entry(input: ParseStream) {
                     _ => {}
                 }
             }
-            arrow = matches!(&tt, TokenTree::Punct(p) if p.as_char() == '-');
+            arrow = matches!(&tt, TokenTree::Punct(p) if matches!(p.as_char(), '-' | '='));
             rest = next;
         }
         Ok(((), rest))
@@ -262,6 +274,42 @@ mod tests {
             (entries[0].docs.len(), b.docs.len(), c.docs.len()),
             (0, 0, 1)
         );
+    }
+
+    fn leaf(entry: &Entry) -> (String, Option<String>) {
+        let Kind::Leaf { msg, reply } = &entry.kind else {
+            panic!("not a leaf")
+        };
+        let text = |ty: &Type| quote!(#ty).to_string();
+        (text(msg), reply.as_ref().map(text))
+    }
+
+    #[test]
+    fn request_leaves_declare_a_reply() {
+        let (entries, errors) = parse_tree(quote! {
+            a: A => B,
+            b(u32) [G]: A => Vec<B>,
+            c.d: A => B,
+            e: A,
+        });
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(leaf(&entries[0]), ("A".into(), Some("B".into())));
+        assert_eq!(leaf(&entries[1]), ("A".into(), Some("Vec < B >".into())));
+        assert!(entries[1].param.is_some() && entries[1].groups.is_some());
+        assert_eq!(leaf(&children(&entries[2])[0]).1.as_deref(), Some("B"));
+        assert_eq!(leaf(&entries[3]), ("A".into(), None));
+    }
+
+    #[test]
+    fn a_wrong_request_leaf_keeps_its_siblings() {
+        let (entries, errors) = parse_tree(quote! {
+            a: A =>,
+            b: A B => Result<X, Y>,
+            c: C => D,
+        });
+        assert_eq!(names(&entries), ["b", "c"]);
+        assert_eq!(errors.len(), 2, "{errors:?}");
+        assert!(errors[0].contains("reply type"), "{errors:?}");
     }
 
     #[test]

@@ -128,7 +128,7 @@ impl Cx<'_> {
         let (inner, bind, next) = match &entry.kind {
             Kind::Level(_) => (quote!(#name::Topic), quote!(x), quote!(Some(x))),
             Kind::Mount(module) => (quote!(#module::Topic), quote!(x), quote!(Some(x))),
-            Kind::Leaf(msg) => (quote!(#msg), quote!(_), quote!(None)),
+            Kind::Leaf { msg, .. } => (quote!(#msg), quote!(_), quote!(None)),
         };
         let (variant, arm) = match &entry.param {
             None => (
@@ -195,23 +195,53 @@ impl Cx<'_> {
                 quote!(<#module::Topic as #k::Navigable>::steps(self.0.step(#step))),
                 quote!(),
             ),
-            Kind::Leaf(msg) => match &entry.groups {
-                None => (
-                    quote!(#k::Channel<#msg, #params>),
-                    quote!(self.0.step(#step)),
-                    quote!(),
-                ),
-                // the leaf's scope is its group enum: the message type may be
-                // used by other leaves
-                Some(groups) => {
-                    let queue = format_ident!("{}Queue", var);
-                    (
-                        quote!(#k::Channel<#msg, #params, #queue>),
-                        quote!(self.0.step(#step).with_scope()),
-                        self.group_enum(&queue, &queue, groups, "Queue groups of this topic."),
-                    )
+            Kind::Leaf { msg, reply } => {
+                // the leaf's scope is its group enum, or for a request leaf
+                // without groups an empty enum: the message type may be used
+                // by other leaves
+                let (scope, mut item) = match (&entry.groups, reply) {
+                    (None, None) => (None, quote!()),
+                    (Some(groups), _) => {
+                        let queue = format_ident!("{}Queue", var);
+                        let doc = "Queue groups of this topic.";
+                        let item = self.group_enum(&queue, &queue, groups, doc);
+                        (Some(queue), item)
+                    }
+                    (None, Some(_)) => {
+                        let scope = format_ident!("{}Scope", var);
+                        let doc = format!("Scope of the request leaf `{subject}`.");
+                        (
+                            Some(scope.clone()),
+                            quote!(#[doc = #doc] pub enum #scope {}),
+                        )
+                    }
+                };
+                // a request leaf answers, any other leaf publishes; without
+                // scope, the leaf publishes through `impl<T> Publish<T> for T`
+                match (&scope, reply) {
+                    (Some(scope), Some(reply)) => item.extend(quote! {
+                        impl #k::Answer<#msg> for #scope {
+                            type Reply = #reply;
+                        }
+                    }),
+                    (Some(scope), None) => {
+                        item.extend(quote!(impl #k::Publish<#msg> for #scope {}))
+                    }
+                    (None, _) => {}
                 }
-            },
+                match scope {
+                    None => (
+                        quote!(#k::Channel<#msg, #params>),
+                        quote!(self.0.step(#step)),
+                        item,
+                    ),
+                    Some(scope) => (
+                        quote!(#k::Channel<#msg, #params, #scope>),
+                        quote!(self.0.step(#step).with_scope()),
+                        item,
+                    ),
+                }
+            }
         };
         let method = quote! {
             #doc

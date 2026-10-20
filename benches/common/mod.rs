@@ -11,6 +11,7 @@ topics! {
     topics {
         load [Workers]: Message,
         user { id(u64) { delete: Message } },
+        ask: Message => u64,
     }
 }
 

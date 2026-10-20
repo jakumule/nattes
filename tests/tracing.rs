@@ -73,8 +73,8 @@ fn logs_subscriptions_publishes_and_drops() {
     assert_eq!(
         *recorder.0.lock().unwrap(),
         [
-            "subscribe subscription=0 pattern=user.id.*.delete.> group=None filtered=false",
-            "subscribe subscription=1 pattern=git.push.> group=Some(tracing::topics::git::PushQueue) filtered=false",
+            "subscribe subscription=0 pattern=user.id.*.delete.> group=None responder=false filtered=false",
+            "subscribe subscription=1 pattern=git.push.> group=Some(tracing::topics::git::PushQueue) responder=false filtered=false",
             "publish subject=user.id.7.delete delivered=1 waiting=0",
             "buffer full, dropped the message subscription=0 subject=user.id.7.delete",
             "publish subject=user.id.7.delete delivered=0 waiting=0",

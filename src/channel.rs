@@ -1,9 +1,10 @@
 //! [`Channel`]: a typed view on part of the tree.
 
+use crate::Level;
 use crate::bus::{Bus, Event};
 use crate::nav::{Append, AppendParams, Key, Navigable, Pattern, Prism};
-use crate::subscription::SubscriptionBuilder;
-use crate::{DEFAULT_BUFFER, Level, Overflow};
+use crate::request::Answer;
+use crate::subscription::{Respond, SubscriptionBuilder};
 use std::any::Any;
 use std::fmt;
 use std::marker::PhantomData;
@@ -182,25 +183,53 @@ impl<T: 'static, P: 'static, S> Channel<T, P, S> {
 
     /// Everything at or below this channel (NATS `subject.>`).
     pub fn subscribe(&self) -> SubscriptionBuilder<T, P, S> {
-        SubscriptionBuilder {
-            channel: self.clone(),
-            filters: Vec::new(),
-            group: None,
-            buffer: DEFAULT_BUFFER,
-            overflow: Overflow::default(),
-        }
+        SubscriptionBuilder::new(self.clone())
+    }
+
+    /// Answer the requests sent to this request leaf: awaited, it gives a
+    /// [`Responder`](crate::Responder), a stream of
+    /// [`Incoming`](crate::Incoming) requests.
+    ///
+    /// Only responders count for [`request`](Self::request) and
+    /// [`scatter`](Self::scatter), and each one gets its own reply token.
+    /// Subscribers see the requests too, but can't answer them.
+    pub fn respond(&self) -> SubscriptionBuilder<T, P, S, Respond>
+    where
+        S: Answer<T>,
+    {
+        SubscriptionBuilder::new(self.clone())
     }
 }
+
+/// A channel with the scope `Self` can publish a `T`: every level, and every
+/// leaf but request leaves, which take requests only.
+///
+/// Implemented for every type with itself as `T`, which covers levels
+/// (`S = Topic`) and leaves without groups (`S` is the message type), and by
+/// [`topics!`](crate::topics) on the group enum of a leaf with groups.
+#[diagnostic::on_unimplemented(
+    message = "can't publish on a request leaf",
+    label = "takes requests only",
+    note = "send with `request`, `request_timeout` or `scatter`"
+)]
+pub trait Publish<T> {}
+
+impl<T> Publish<T> for T {}
 
 impl<T: 'static, S> Channel<T, (), S> {
     /// Publish `msg` here. Returns how many subscriptions it was delivered to.
     ///
     /// The message is first delivered to every subscription with room in its
     /// buffer. Only then does `publish` wait for room in the full buffers of
-    /// [`Overflow::Wait`] subscribers. If this future is dropped during that
+    /// [`Overflow::Wait`](crate::Overflow::Wait) subscribers. If this future is dropped during that
     /// wait, those subscribers miss the message. Delivery is at most once:
     /// see [delivery guarantees](crate#delivery-guarantees).
-    pub async fn publish(&self, msg: T) -> usize {
+    ///
+    /// Not on a request leaf, which takes [`request`](Self::request)s only.
+    pub async fn publish(&self, msg: T) -> usize
+    where
+        S: Publish<T>,
+    {
         let event = self.to_event(msg);
         self.bus.deliver(event).await
     }

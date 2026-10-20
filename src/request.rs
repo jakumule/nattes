@@ -1,18 +1,22 @@
 //! Request/reply plumbing, kept apart from the bus.
 //!
-//! A [`Request<RQ, RP>`] wraps the request payload `RQ` together with the means
-//! to answer it with an `RP`. The requester keeps the other end of the reply
-//! handle and awaits it. A scattered request goes to every subscription and each
-//! responder can answer, so the requester gathers several replies.
+//! A request leaf, `name: Msg => Reply` in [`topics!`](crate::topics), holds
+//! its message like any leaf. A request is delivered as that event to
+//! subscribers, and to each responder as an [`Answering`]: the same event
+//! with the responder's own reply token, answered once through
+//! [`Incoming::respond`]. The requester awaits the other end of the tokens.
 
-use crate::Channel;
-use crate::bus::lock;
+use crate::bus::{Event, lock};
+use crate::channel::Route;
+use crate::tree::{Step, Subject};
+use crate::{Channel, Level, subject};
 use futures::Stream;
 use futures::stream::FusedStream;
+use std::any::Any;
 use std::fmt;
 use std::ops::Deref;
 use std::pin::Pin;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, ready};
 use std::time::Duration;
 use thiserror::Error;
@@ -20,7 +24,7 @@ use tokio::sync::{mpsc, oneshot};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum BusError {
-    #[error("No subscriber is listening on this topic")]
+    #[error("No responder is listening on this topic")]
     NoResponders,
     #[error("Every responder dropped the request without replying")]
     NoReply,
@@ -28,77 +32,125 @@ pub enum BusError {
     Timeout,
 }
 
-/// A request payload `RQ` that can be answered with a reply `RP`:
-/// once if it was sent with [`request`](Channel::request), once per responder
-/// if it was sent with [`scatter`](Channel::scatter).
+/// The scope of a request leaf, `name: Msg => Reply` in
+/// [`topics!`](crate::topics): its channel can send requests with the payload
+/// `M` and answer them with a [`Reply`](Self::Reply).
 ///
-/// Derefs to `RQ`. Buffers only need to carry this value around; they never
-/// touch the reply logic.
-pub struct Request<RQ, RP> {
-    payload: RQ,
-    reply: Reply<RP>,
+/// Implemented by the macro on the leaf's group enum if it declares queue
+/// groups, else on an empty enum named after the leaf (`git::FetchScope`).
+#[diagnostic::on_unimplemented(
+    message = "`{M}` isn't the payload of a request leaf",
+    note = "declare a request leaf in `topics!` with `name: Message => Reply`"
+)]
+pub trait Answer<M> {
+    type Reply: Send + 'static;
 }
 
-enum Reply<RP> {
-    /// The first reply wins.
-    One(Mutex<Option<oneshot::Sender<RP>>>),
-    /// Every reply goes through, until the requester stops listening.
-    Many(mpsc::UnboundedSender<RP>),
+/// A responder's reply token. The requester waits until a reply comes or
+/// every token is gone.
+enum Reply<R> {
+    /// The first reply wins. The sender is dropped, and the requester sees
+    /// [`BusError::NoReply`], once every responder's token is gone.
+    One(Arc<Mutex<Option<oneshot::Sender<R>>>>),
+    /// One clone per responder: every reply goes through.
+    Many(mpsc::UnboundedSender<R>),
 }
 
-impl<RQ, RP> Request<RQ, RP> {
-    /// Wrap `payload`; returns the request to deliver and the end to await.
-    fn new(payload: RQ) -> (Self, oneshot::Receiver<RP>) {
-        let (tx, rx) = oneshot::channel();
-        let request = Self {
-            payload,
-            reply: Reply::One(Mutex::new(Some(tx))),
-        };
-        (request, rx)
+impl<R> Clone for Reply<R> {
+    fn clone(&self) -> Self {
+        match self {
+            Reply::One(tx) => Reply::One(tx.clone()),
+            Reply::Many(tx) => Reply::Many(tx.clone()),
+        }
     }
+}
 
-    /// Wrap `payload` to be answered by every responder.
-    fn scattered(payload: RQ) -> (Self, mpsc::UnboundedReceiver<RP>) {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let request = Self {
-            payload,
-            reply: Reply::Many(tx),
-        };
-        (request, rx)
+/// The event delivered to one responder: the request's event, shared with
+/// subscribers, and this responder's reply token. Unwrapped into an
+/// [`Incoming`] when the responder reads it.
+struct Answering<R> {
+    event: Event,
+    reply: Reply<R>,
+}
+
+/// Only so it can sit in a buffer: the subject is the request's.
+impl<R: Send + 'static> Level for Answering<R> {
+    fn step(&self) -> Step<'_> {
+        self.event.step()
     }
+}
 
-    /// Unwrap the payload, dropping the reply handle (the requester then sees
-    /// [`BusError::NoReply`]).
-    pub fn into_payload(self) -> RQ {
-        self.payload
-    }
-
-    /// Answer the request. Returns `false` if the requester is gone or, for a
-    /// [`request`](Channel::request), someone already replied.
+/// Sends the requests of [`request`](Channel::request) and
+/// [`scatter`](Channel::scatter), on a request leaf.
+impl<M, S> Channel<M, (), S>
+where
+    M: Send + Sync + 'static,
+    S: Answer<M>,
+{
+    /// Send `payload` and wait for the first reply from a responder.
     ///
-    /// A [`scatter`](Channel::scatter) expects one reply per responder: answer
-    /// once, since an extra reply takes the place of another responder's.
-    pub fn respond(&self, reply: RP) -> bool {
-        match &self.reply {
-            Reply::One(tx) => {
-                // Release the lock first: a failed send drops `reply`, which is user code
-                let tx = lock(tx).take();
-                match tx {
-                    Some(tx) => tx.send(reply).is_ok(),
-                    None => false,
-                }
-            }
-            Reply::Many(tx) => tx.send(reply).is_ok(),
+    /// It is delivered like [`publish`](Channel::publish) does it, to
+    /// subscribers too, but only responders can answer. Later replies are
+    /// discarded. Fails with [`BusError::NoResponders`] if no responder matches
+    /// it, and with [`BusError::NoReply`] once every responder dropped it
+    /// without answering, including when it was lost from a full buffer or a
+    /// dropped responder. Waits as long as a responder holds the
+    /// request: prefer [`request_timeout`](Self::request_timeout).
+    pub async fn request(&self, payload: M) -> Result<S::Reply, BusError> {
+        let (tx, rx) = oneshot::channel();
+        let token = Reply::One(Arc::new(Mutex::new(Some(tx))));
+        if self.deliver_request(payload, token).await == 0 {
+            return Err(BusError::NoResponders);
         }
+        // The sender goes away once every responder dropped its token
+        rx.await.map_err(|_| BusError::NoReply)
     }
 
-    /// Whether a reply is still possible (requester waiting and, for a
-    /// [`request`](Channel::request), nobody replied yet).
-    pub fn is_pending(&self) -> bool {
-        match &self.reply {
-            Reply::One(tx) => lock(tx).as_ref().is_some_and(|tx| !tx.is_closed()),
-            Reply::Many(tx) => !tx.is_closed(),
+    /// [`request`](Self::request) giving up after `timeout`, which covers both
+    /// delivery and the reply. After a [`BusError::Timeout`] the request may
+    /// still be handled, but its reply is discarded.
+    /// Needs a tokio runtime with the timer enabled.
+    pub async fn request_timeout(
+        &self,
+        payload: M,
+        timeout: Duration,
+    ) -> Result<S::Reply, BusError> {
+        tokio::time::timeout(timeout, self.request(payload))
+            .await
+            .map_err(|_| BusError::Timeout)?
+    }
+
+    /// Send `payload` to every responder and stream their replies, one per
+    /// responder (a queue group counts as one responder).
+    ///
+    /// It is delivered like [`publish`](Channel::publish) does it, to
+    /// subscribers too, and expects one reply from each responder it matches.
+    /// The stream ends once every responder answered or dropped the request,
+    /// including when it was lost from a full buffer or a dropped responder.
+    /// Fails with [`BusError::NoResponders`] if no responder matches it.
+    pub async fn scatter(&self, payload: M) -> Result<Replies<S::Reply>, BusError> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let remaining = self.deliver_request(payload, Reply::Many(tx)).await;
+        if remaining == 0 {
+            return Err(BusError::NoResponders);
         }
+        Ok(Replies {
+            rx: Some(rx),
+            remaining,
+        })
+    }
+
+    /// Deliver `payload`, with a clone of `token` for each responder. Drops
+    /// `token`, so only responders hold one. Returns how many responders got it.
+    async fn deliver_request(&self, payload: M, token: Reply<S::Reply>) -> usize {
+        let event = self.to_event(payload);
+        let respond = || {
+            Arc::new(Answering {
+                event: event.clone(),
+                reply: token.clone(),
+            }) as Event
+        };
+        self.bus.deliver_request(&event, &respond).await
     }
 }
 
@@ -106,12 +158,12 @@ impl<RQ, RP> Request<RQ, RP> {
 ///
 /// Ends once every responder answered or dropped the request. Dropping it
 /// tells the responders nobody is waiting anymore.
-pub struct Replies<RP> {
-    rx: Option<mpsc::UnboundedReceiver<RP>>,
+pub struct Replies<R> {
+    rx: Option<mpsc::UnboundedReceiver<R>>,
     remaining: usize,
 }
 
-impl<RP> Replies<RP> {
+impl<R> Replies<R> {
     /// How many replies are still expected: one per responder, minus the
     /// replies received so far.
     pub fn remaining(&self) -> usize {
@@ -119,10 +171,10 @@ impl<RP> Replies<RP> {
     }
 }
 
-impl<RP> Stream for Replies<RP> {
-    type Item = RP;
+impl<R> Stream for Replies<R> {
+    type Item = R;
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<RP>> {
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<R>> {
         let Some(rx) = self.rx.as_mut() else {
             return Poll::Ready(None);
         };
@@ -142,13 +194,13 @@ impl<RP> Stream for Replies<RP> {
     }
 }
 
-impl<RP> FusedStream for Replies<RP> {
+impl<R> FusedStream for Replies<R> {
     fn is_terminated(&self) -> bool {
         self.rx.is_none()
     }
 }
 
-impl<RP> fmt::Debug for Replies<RP> {
+impl<R> fmt::Debug for Replies<R> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Replies")
             .field("remaining", &self.remaining)
@@ -156,73 +208,85 @@ impl<RP> fmt::Debug for Replies<RP> {
     }
 }
 
-/// A channel whose leaf type is `Request<RQ, RP>` is explicitly request-reply:
-/// requesters send an `RQ` and get an `RP` back; responders receive the
-/// `Request` (derefs to `RQ`) and call [`Request::respond`].
-impl<RQ: 'static, RP: Send + 'static, S> Channel<Request<RQ, RP>, (), S> {
-    /// Send `payload` and wait for the first reply from a responder.
-    ///
-    /// It is delivered like [`publish`](Channel::publish) does it: to every
-    /// matching subscription and one member per queue group. Later replies are
-    /// discarded. Fails with [`BusError::NoResponders`] if it was delivered to
-    /// no subscription, and with [`BusError::NoReply`] once every responder
-    /// dropped it without answering, including when it was lost from a full buffer or a
-    /// dropped subscription. Waits as long as a responder holds the request:
-    /// prefer [`request_timeout`](Self::request_timeout).
-    pub async fn request(&self, payload: RQ) -> Result<RP, BusError> {
-        let (request, rx) = Request::new(payload);
-        let event = self.to_event(request);
-        if self.bus.deliver(event).await == 0 {
-            return Err(BusError::NoResponders);
-        }
-        // The sender goes away only once every responder dropped the request
-        rx.await.map_err(|_| BusError::NoReply)
-    }
+/// An incoming request, received by a [`Responder`](crate::Responder); derefs
+/// to the payload `M`.
+///
+/// Answer it once with [`respond`](Self::respond). Dropping it unanswered
+/// counts as no reply from this responder.
+pub struct Incoming<M, R, P> {
+    event: Event,
+    reply: Reply<R>,
+    route: Arc<dyn Route<M, P>>,
+}
 
-    /// [`request`](Self::request) giving up after `timeout`, which covers both
-    /// delivery and the reply. After a [`BusError::Timeout`] the request may
-    /// still be handled, but its reply is discarded.
-    /// Needs a tokio runtime with the timer enabled.
-    pub async fn request_timeout(&self, payload: RQ, timeout: Duration) -> Result<RP, BusError> {
-        tokio::time::timeout(timeout, self.request(payload))
-            .await
-            .map_err(|_| BusError::Timeout)?
-    }
-
-    /// Send `payload` to every subscription and stream their replies, one per
-    /// responder (a queue group counts as one responder).
-    ///
-    /// It is delivered like [`publish`](Channel::publish) does it, and expects
-    /// one reply from each subscription it was delivered to. The stream ends
-    /// once every responder answered or dropped the request, including when it was
-    /// lost from a full buffer or a dropped subscription. Fails with
-    /// [`BusError::NoResponders`] if it was delivered to no subscription.
-    pub async fn scatter(&self, payload: RQ) -> Result<Replies<RP>, BusError> {
-        let (request, rx) = Request::scattered(payload);
-        let event = self.to_event(request);
-        let remaining = self.bus.deliver(event).await;
-        if remaining == 0 {
-            return Err(BusError::NoResponders);
+impl<M, R: Send + 'static, P> Incoming<M, R, P> {
+    /// Unwrap the [`Answering`] event a responder read.
+    pub(crate) fn new(event: Event, route: Arc<dyn Route<M, P>>) -> Self {
+        let any: Arc<dyn Any + Send + Sync> = event;
+        let answering = (any.downcast::<Answering<R>>().ok())
+            .and_then(Arc::into_inner)
+            .expect("each responder gets its own `Answering`");
+        Self {
+            event: answering.event,
+            reply: answering.reply,
+            route,
         }
-        Ok(Replies {
-            rx: Some(rx),
-            remaining,
-        })
     }
 }
 
-impl<RQ, RP> Deref for Request<RQ, RP> {
-    type Target = RQ;
+impl<M, R, P> Incoming<M, R, P> {
+    /// Values of the wildcard parameters on the way to this channel.
+    pub fn params(&self) -> P {
+        self.view().0
+    }
 
-    fn deref(&self) -> &RQ {
-        &self.payload
+    /// NATS-style subject of the whole event.
+    pub fn subject(&self) -> String {
+        subject(&*self.event)
+    }
+
+    /// Whether a reply is still possible: the requester is waiting and, for a
+    /// [`request`](Channel::request), nobody replied yet.
+    pub fn is_pending(&self) -> bool {
+        match &self.reply {
+            Reply::One(tx) => lock(tx).as_ref().is_some_and(|tx| !tx.is_closed()),
+            Reply::Many(tx) => !tx.is_closed(),
+        }
+    }
+
+    /// Answer the request. Returns `false` if the requester is gone or, for a
+    /// [`request`](Channel::request), another responder already replied.
+    pub fn respond(self, reply: R) -> bool {
+        match self.reply {
+            Reply::One(tx) => {
+                // Release the lock first: a failed send drops `reply`, which is user code
+                let tx = lock(&tx).take();
+                tx.is_some_and(|tx| tx.send(reply).is_ok())
+            }
+            Reply::Many(tx) => tx.send(reply).is_ok(),
+        }
+    }
+
+    fn view(&self) -> (P, &M) {
+        self.route
+            .project(&*self.event as &dyn Any)
+            .expect("delivered only if it matched")
     }
 }
 
-impl<RQ: fmt::Debug, RP> fmt::Debug for Request<RQ, RP> {
+impl<M, R, P> Deref for Incoming<M, R, P> {
+    type Target = M;
+
+    fn deref(&self) -> &M {
+        self.view().1
+    }
+}
+
+impl<M: fmt::Debug, R, P> fmt::Debug for Incoming<M, R, P> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Request")
-            .field("payload", &self.payload)
+        f.debug_struct("Incoming")
+            .field("subject", &format_args!("{}", Subject(&*self.event)))
+            .field("msg", &**self)
             .field("pending", &self.is_pending())
             .finish()
     }
