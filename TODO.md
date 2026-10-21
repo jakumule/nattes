@@ -3,13 +3,6 @@
 
 Found in a design review, in priority order.
 
-- [ ] **User `Drop` runs under our locks.** `lock()` (`src/bus.rs`) claims no
-  user code runs under them, but `Buffer::close` clears events under the
-  buffer lock, `DropOldest` pops the evicted event under it (often its last
-  reference), and `Interest::remove` + `store` can drop the last `Arc<Sub>`
-  (user filter closures) under `state`. A message whose `Drop` publishes to
-  its own subscription deadlocks. Fix: take the events / evicted event / old
-  trie out and drop them after unlocking.
 - [ ] **Subscriptions never end; no shutdown.** `Subscription` never yields
   `None` and holds an `Arc<Bus>`, so `while let Some(m) = sub.next().await`
   can't end once every publisher is gone. Fix: close the buffers when the

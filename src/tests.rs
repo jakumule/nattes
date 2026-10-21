@@ -1076,3 +1076,68 @@ async fn queue_groups_can_be_declared_on_any_level() {
 fn drain_on<T: 'static, P: 'static>(mut sub: Subscription<T, P>) -> Box<dyn FnMut() -> usize> {
     Box::new(move || drain(&mut sub).len())
 }
+
+/// Publishes to its channel when dropped, to catch user code run under our locks.
+pub struct Echo(Option<Channel<Echo>>);
+
+impl Drop for Echo {
+    fn drop(&mut self) {
+        if let Some(echo) = self.0.take() {
+            echo.publish(Echo(None)).now_or_never();
+        }
+    }
+}
+
+crate::topics! {
+    reentrant {
+        echo: Echo,
+    }
+}
+
+/// Runs `f` on its own thread: re-locking a `Mutex` on the same thread
+/// deadlocks, so a regression fails here instead of hanging.
+fn without_deadlock(f: impl FnOnce() + Send + 'static) {
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        f();
+        let _ = done.send(());
+    });
+    finished
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("deadlocked");
+}
+
+#[test]
+fn evicted_message_can_publish_on_drop() {
+    without_deadlock(|| {
+        let echo = at!(Channel::<reentrant::Topic>::new(), echo);
+        let mut sub = (echo.subscribe().buffer(1).on_full(Overflow::DropOldest))
+            .into_future()
+            .now_or_never()
+            .unwrap();
+        echo.publish(Echo(Some(echo.clone()))).now_or_never();
+        // Evicts the first, whose `Drop` publishes and evicts this one
+        echo.publish(Echo(None)).now_or_never();
+        assert_eq!(drain(&mut sub).len(), 1);
+        assert_eq!(sub.dropped(), 2);
+    });
+}
+
+#[test]
+fn dropped_filter_can_unsubscribe() {
+    without_deadlock(|| {
+        let echo = at!(Channel::<reentrant::Topic>::new(), echo);
+        let inner = echo.subscribe().into_future().now_or_never().unwrap();
+        let outer = (echo.subscribe())
+            .filter(move |_, _| {
+                let _ = &inner;
+                true
+            })
+            .into_future()
+            .now_or_never()
+            .unwrap();
+        // Drops the last reference to the filter, and with it `inner`
+        drop(outer);
+        assert!(echo.bus.interest.load().is_empty());
+    });
+}

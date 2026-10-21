@@ -40,7 +40,8 @@ pub(crate) type Event = Arc<dyn Level>;
 pub(crate) type Matcher = Box<dyn Fn(&dyn Any) -> bool + Send + Sync>;
 
 /// Locks without propagating poison: no user code runs while our locks are held,
-/// so a poisoned lock still holds consistent data.
+/// so a poisoned lock still holds consistent data. That includes `Drop`: events
+/// and filters are moved out and dropped after unlocking.
 pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -105,7 +106,7 @@ impl Buffer {
         if state.closed {
             return Push::Closed;
         }
-        let mut evicted = false;
+        let mut evicted = None;
         if state.events.len() >= self.capacity {
             if !OVERFLOW {
                 return Push::Full(event);
@@ -116,9 +117,9 @@ impl Buffer {
                     return Push::Dropped;
                 }
                 Overflow::DropOldest => {
-                    state.events.pop_front();
+                    // Often its last reference: dropped after unlocking
+                    evicted = state.events.pop_front();
                     self.dropped.fetch_add(1, Ordering::Relaxed);
-                    evicted = true;
                 }
                 Overflow::Wait => {
                     // Set under the lock, so the pop that frees room sees it
@@ -134,7 +135,7 @@ impl Buffer {
         if self.parked.load(Ordering::Relaxed) && self.parked.swap(false, Ordering::AcqRel) {
             self.waker.wake();
         }
-        if evicted {
+        if evicted.is_some() {
             Push::Evicted
         } else {
             Push::Delivered
@@ -189,10 +190,11 @@ impl Buffer {
     pub(crate) fn close(&self) {
         let mut state = lock(&self.state);
         state.closed = true;
-        // Drop pending requests now so requesters see `NoReply`
-        state.events.clear();
+        let events = std::mem::take(&mut state.events);
         drop(state);
         self.space.notify_waiters();
+        // Drop pending requests now so requesters see `NoReply`
+        drop(events);
     }
 }
 
@@ -665,9 +667,10 @@ impl Bus {
         });
         let mut interest = self.interest.load_full();
         interest.insert(path, sub, responder, turn);
-        self.interest.store(interest);
+        let old = self.interest.swap(interest);
         // No user code under our lock, and a tracing subscriber is user code
         drop(state);
+        drop(old);
         debug!(
             subscription = id,
             pattern = %Pattern(path),
@@ -688,19 +691,24 @@ impl Bus {
     ) {
         // Writers are serialized by `state`, so no update is lost
         let mut state = lock(&self.state);
+        let mut forgotten = None;
         if let Some(key) = group {
             let key = (key.clone(), responder);
             if let Some((_, members)) = state.groups.get_mut(&key) {
                 *members -= 1;
                 if *members == 0 {
-                    state.groups.remove(&key);
+                    forgotten = state.groups.remove_entry(&key);
                 }
             }
         }
         let mut interest = self.interest.load_full();
         interest.remove(path, id, responder);
-        self.interest.store(interest);
+        let old = self.interest.swap(interest);
         drop(state);
+        // The old trie may hold the last reference to the subscription, and
+        // its filters are user code: drop them after unlocking
+        drop(old);
+        drop(forgotten);
         debug!(subscription = id, pattern = %Pattern(path), "unsubscribe");
     }
 
