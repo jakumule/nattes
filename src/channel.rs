@@ -8,6 +8,7 @@ use crate::subscription::{Respond, SubscriptionBuilder};
 use std::any::Any;
 use std::fmt;
 use std::marker::PhantomData;
+use std::ops::Deref;
 use std::sync::Arc;
 
 /// Route from the root event down to `T`, with the wildcard values `P` met on
@@ -61,6 +62,24 @@ where
     }
 }
 
+/// The bus as the channels hold it: subscriptions hold the [`Bus`] itself, so
+/// the bus closes when the last channel drops this.
+pub(crate) struct Handle(pub(crate) Arc<Bus>);
+
+impl Deref for Handle {
+    type Target = Bus;
+
+    fn deref(&self) -> &Bus {
+        &self.0
+    }
+}
+
+impl Drop for Handle {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
+
 /// Typed view on the part `T` of a tree; behaves like a bus rooted at `T`.
 ///
 /// `P` holds the parameters left as wildcards on the way down. Only fully fixed
@@ -69,6 +88,10 @@ where
 /// `S` is the scope of the channel, which tells the queue groups it can join: the
 /// level's `Topic` enum (so `S = T`), or the group enum of a leaf that
 /// declares one.
+///
+/// Every channel of a bus, sub-channels included, keeps it open. Once the last
+/// one is dropped, nothing can publish anymore: each subscription yields its
+/// buffered messages, then ends.
 ///
 /// A function taking `&Channel<T, P, S>` accepts any channel, root or not, with
 /// or without wildcards:
@@ -92,7 +115,7 @@ where
 /// # }
 /// ```
 pub struct Channel<T, P = (), S = T> {
-    pub(crate) bus: Arc<Bus>,
+    pub(crate) bus: Arc<Handle>,
     // The path from the root is a chain of trait objects, not a type:
     // `at!(bus, user.id(alice))` and `at!(bus, user.id(bob))` are both
     // `Channel<user::id::Topic>`, and a mounted tree has the same channel type
@@ -125,7 +148,7 @@ impl<R: Level> Channel<R> {
     /// New bus with `R` as its root.
     pub fn new() -> Self {
         Self {
-            bus: Arc::default(),
+            bus: Arc::new(Handle(Arc::default())),
             route: Arc::new(Root(PhantomData)),
             scope: PhantomData,
         }

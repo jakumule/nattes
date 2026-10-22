@@ -54,6 +54,7 @@ topics! {
 |---|---|---|
 | **bus** | The shared state behind every channel that comes from one `Channel::new()`. Two `Channel::new()` are two buses. | core |
 | **channel** | A typed view `Channel<T, P, S>` on part of a tree, which publishes and subscribes relative to it. | — |
+| **closed** | A bus whose last channel was dropped. Its subscriptions end once they have read their buffers. | shut down, dead |
 | **sub-channel** | A channel taken from another one with `at!`: `at!(bus, git)`. | — |
 | **path** | The argument of `at!`, `user.id(alice).delete`, and the keys it stands for in the interest trie (`Vec<Key>`). | route (for keys) |
 | **route** | The typed chain of `Root` and `Hop`s behind a channel, which projects an event to its message and injects a message into an event. | — |
@@ -100,7 +101,7 @@ The internal types, by term:
 
 | Term | Type |
 |---|---|
-| bus | `Bus` (`bus.rs`) |
+| bus | `Bus` (`bus.rs`), held by channels through a `Handle` (`channel.rs`) that closes it on drop |
 | buffer | `Buffer` |
 | subscription, in the trie | `Sub` |
 | queue group, in the trie | `Members`, sharing a `RoundRobin` position, keyed by `GroupKey` |

@@ -382,6 +382,77 @@ async fn drop_unsubscribes() {
     assert_eq!(pushes.publish(GitPushMsg("b".into())).await, 0);
 }
 
+#[tokio::test]
+async fn subscriptions_end_once_every_channel_is_dropped() {
+    let bus = Channel::<topics::Topic>::new();
+    let pushes = at!(bus, git.push);
+    let mut sub = pushes.subscribe().await;
+    let mut git = at!(bus, git).subscribe().await;
+    pushes.publish(GitPushMsg("a".into())).await;
+
+    drop(bus);
+    // A sub-channel keeps the bus open
+    assert!(sub.next().now_or_never().is_some_and(|m| m.is_some()));
+    assert!(sub.next().now_or_never().is_none());
+    assert!(!sub.is_terminated());
+
+    pushes.publish(GitPushMsg("b".into())).await;
+    drop(pushes);
+    // Buffered messages are read first
+    assert_eq!(sub.next().await.map(|m| m.0.clone()).as_deref(), Some("b"));
+    assert!(sub.next().await.is_none());
+    assert!(sub.is_terminated());
+    assert_eq!(drain(&mut git).len(), 2);
+    assert!(git.next().await.is_none());
+}
+
+#[tokio::test]
+async fn closing_wakes_a_waiting_subscriber() {
+    let pushes = push_channel();
+    let mut sub = pushes.subscribe().await;
+    let mut worker = pushes.subscribe().queue(PushQueue::Workers).await;
+    let wait = pushes.subscribe().on_full(Overflow::Wait).await;
+    let waiting = tokio::spawn(async move { sub.next().await.is_none() });
+    tokio::task::yield_now().await;
+
+    drop(pushes);
+    assert!(waiting.await.unwrap());
+    assert!(worker.next().await.is_none());
+    assert!(wait.is_terminated());
+}
+
+#[tokio::test]
+async fn responders_answer_buffered_requests_after_close() -> anyhow::Result<()> {
+    let fetches = fetch_channel();
+    let mut responder = fetches.respond().await;
+    let request = tokio::spawn(async move { fetches.request(GitFetchMsg("main".into())).await });
+    let incoming = responder.next().await.expect("one request");
+    // The requester holds the last channel until it gets its reply
+    assert!(responder.next().now_or_never().is_none());
+    incoming.respond(FetchAck(4));
+    assert_eq!(request.await??, FetchAck(4));
+    assert!(responder.next().await.is_none());
+    Ok(())
+}
+
+#[test]
+fn dropped_filter_can_unsubscribe_on_close() {
+    without_deadlock(|| {
+        let echo = at!(Channel::<reentrant::Topic>::new(), echo);
+        let inner = echo.subscribe().into_future().now_or_never().unwrap();
+        let _outer = (echo.subscribe())
+            .filter(move |_, _| {
+                let _ = &inner;
+                true
+            })
+            .into_future()
+            .now_or_never()
+            .unwrap();
+        // Closing drops the trie, the filter, and with it `inner`
+        drop(echo);
+    });
+}
+
 fn push_channel() -> Channel<GitPushMsg, (), topics::git::PushQueue> {
     at!(Channel::<topics::Topic>::new(), git.push)
 }

@@ -306,9 +306,13 @@ while let Some(msg) = sub.next().await {
   (with wildcards). Its cost doesn't grow with subscribers on unrelated subjects.
 - **Filters.** Filters run outside the bus's internal lock. A filter that panics
   counts as "no match" and doesn't affect other subscribers or publishers.
-- **Streams.** A subscription never ends and is a `FusedStream`, so every
-  `StreamExt` adapter applies and it goes straight into `futures::select!`
-  without `.fuse()`.
+- **Streams.** A subscription is a `FusedStream`, so every `StreamExt` adapter
+  applies and it goes straight into `futures::select!` without `.fuse()`.
+- **Closing.** Every channel of a bus, sub-channels included, keeps it open.
+  Once the last one is dropped, nothing can publish anymore: each subscription
+  and responder yields what its buffer holds, then ends, so
+  `while let Some(msg) = sub.next().await` returns. A task, a message or a
+  filter holding a channel keeps the bus open, like an `mpsc` sender.
 - **Unsubscribing.** Drop the subscription. Publishers waiting on it are released.
 - **Subjects.** `msg.subject()` gives a NATS-style subject for logging, built from
   names and parameter values, e.g. `user.id.42.delete`.

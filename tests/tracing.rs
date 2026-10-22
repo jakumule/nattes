@@ -53,7 +53,7 @@ impl Subscriber for Recorder {
 }
 
 #[test]
-fn logs_subscriptions_publishes_and_drops() {
+fn logs_subscriptions_publishes_drops_and_close() {
     let recorder = Recorder::default();
     tracing::subscriber::with_default(recorder.clone(), || {
         futures::executor::block_on(async {
@@ -80,6 +80,7 @@ fn logs_subscriptions_publishes_and_drops() {
             "publish subject=user.id.7.delete delivered=0 waiting=0",
             "unsubscribe subscription=0 pattern=user.id.*.delete.>",
             "unsubscribe subscription=1 pattern=git.push.>",
+            "bus closed",
         ]
     );
 }

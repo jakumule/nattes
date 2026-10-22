@@ -100,7 +100,7 @@ impl<T: 'static, P: 'static, S, K> SubscriptionBuilder<T, P, S, K> {
             }) as Matcher
         });
 
-        let bus = self.channel.bus;
+        let bus = self.channel.bus.0.clone();
         let id = bus.subscribe(
             &path,
             matcher,
@@ -175,7 +175,8 @@ impl<T, P> Drop for Active<T, P> {
     }
 }
 
-/// Active subscription, a [`Stream`] of [`Msg`]. Unsubscribes on drop.
+/// Active subscription, a [`Stream`] of [`Msg`]. Unsubscribes on drop. Ends
+/// once every channel of the bus is dropped and the buffer read.
 pub struct Subscription<T, P>(Active<T, P>);
 
 impl<T, P> Subscription<T, P> {
@@ -189,8 +190,8 @@ impl<T, P> Stream for Subscription<T, P> {
     type Item = Msg<T, P>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.0.buffer.poll_pop(cx).map(|event| {
-            Some(Msg {
+        (self.0.buffer.poll_next(cx)).map(|event| {
+            event.map(|event| Msg {
                 event,
                 route: self.0.route.clone(),
             })
@@ -198,10 +199,11 @@ impl<T, P> Stream for Subscription<T, P> {
     }
 }
 
-/// A subscription never ends, so it can go straight into `futures::select!`.
+/// Terminated once the bus is closed and the buffer read; goes straight into
+/// `futures::select!`.
 impl<T, P> FusedStream for Subscription<T, P> {
     fn is_terminated(&self) -> bool {
-        false
+        self.0.buffer.is_terminated()
     }
 }
 
@@ -213,6 +215,7 @@ impl<T, P> fmt::Debug for Subscription<T, P> {
 
 /// Active responder on a request leaf, a [`Stream`] of [`Incoming`]
 /// requests. Unsubscribes on drop, which drops the requests it didn't read.
+/// Ends once every channel of the bus is dropped and the buffer read.
 pub struct Responder<M, R, P> {
     active: Active<M, P>,
     reply: PhantomData<fn() -> R>,
@@ -229,15 +232,16 @@ impl<M, R: Send + 'static, P> Stream for Responder<M, R, P> {
     type Item = Incoming<M, R, P>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        (self.active.buffer.poll_pop(cx))
-            .map(|event| Some(Incoming::new(event, self.active.route.clone())))
+        (self.active.buffer.poll_next(cx))
+            .map(|event| event.map(|event| Incoming::new(event, self.active.route.clone())))
     }
 }
 
-/// A responder never ends, so it can go straight into `futures::select!`.
+/// Terminated once the bus is closed and the buffer read; goes straight into
+/// `futures::select!`.
 impl<M, R: Send + 'static, P> FusedStream for Responder<M, R, P> {
     fn is_terminated(&self) -> bool {
-        false
+        self.active.buffer.is_terminated()
     }
 }
 

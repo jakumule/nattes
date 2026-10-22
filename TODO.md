@@ -3,10 +3,6 @@
 
 Found in a design review, in priority order.
 
-- [ ] **Subscriptions never end; no shutdown.** `Subscription` never yields
-  `None` and holds an `Arc<Bus>`, so `while let Some(m) = sub.next().await`
-  can't end once every publisher is gone. Fix: close the buffers when the
-  last `Channel` of a bus drops, or add an explicit close.
 - [ ] **A subscriber can't own a message.** `Msg` and `Incoming` only deref to
   `&T`, and the event is shared, so non-`Clone` messages can't be moved out
   even with one receiver (queue group). Fix: `try_into_inner` through

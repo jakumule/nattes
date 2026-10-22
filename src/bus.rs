@@ -170,23 +170,48 @@ impl Buffer {
         event
     }
 
-    /// Next event, or register `cx` and park until a push.
-    pub(crate) fn poll_pop(&self, cx: &mut Context<'_>) -> Poll<Event> {
-        if let Some(event) = self.pop() {
-            return Poll::Ready(event);
+    /// Next event, or `None` once the bus is closed and the buffer drained.
+    #[inline]
+    pub(crate) fn poll_next(&self, cx: &mut Context<'_>) -> Poll<Option<Event>> {
+        match self.pop() {
+            Some(event) => Poll::Ready(Some(event)),
+            None => self.park(cx),
         }
+    }
+
+    /// `poll_next` on an empty buffer: register `cx` and park until a push.
+    #[inline(never)]
+    fn park(&self, cx: &mut Context<'_>) -> Poll<Option<Event>> {
         self.waker.register(cx.waker());
-        // Park before checking again, so a push in between isn't missed
+        // Park before checking again, so a push or `end` in between isn't missed
         self.parked.store(true, Ordering::Release);
         match self.pop() {
             Some(event) => {
                 self.parked.store(false, Ordering::Relaxed);
-                Poll::Ready(event)
+                Poll::Ready(Some(event))
             }
+            None if self.is_terminated() => Poll::Ready(None),
             None => Poll::Pending,
         }
     }
 
+    /// Whether `poll_next` has nothing left to give.
+    #[cold]
+    pub(crate) fn is_terminated(&self) -> bool {
+        let state = lock(&self.state);
+        state.closed && state.events.is_empty()
+    }
+
+    /// The bus is closed: take no more events, but keep the buffered ones for
+    /// the subscriber to read before its stream ends.
+    fn end(&self) {
+        lock(&self.state).closed = true;
+        self.space.notify_waiters();
+        self.parked.store(false, Ordering::Relaxed);
+        self.waker.wake();
+    }
+
+    /// The subscription is gone: drop what it didn't read.
     pub(crate) fn close(&self) {
         let mut state = lock(&self.state);
         state.closed = true;
@@ -393,6 +418,20 @@ impl Interest {
                         node.children.swap_remove(i);
                     }
                 }
+            }
+        }
+    }
+
+    /// Calls `f` with every subscription in the trie.
+    fn for_each_sub(&self, f: &mut impl FnMut(&Sub)) {
+        let members = self.groups.iter().chain(&self.responder_groups);
+        (self.subs.iter().chain(&self.responders))
+            .chain(members.flat_map(|m| &m.subs))
+            .for_each(|sub| f(sub));
+        for (_, edges) in &self.children {
+            let fixed = edges.fixed.values();
+            for child in edges.plain.iter().chain(&edges.wild).chain(fixed) {
+                child.for_each_sub(f);
             }
         }
     }
@@ -710,6 +749,18 @@ impl Bus {
         drop(old);
         drop(forgotten);
         debug!(subscription = id, pattern = %Pattern(path), "unsubscribe");
+    }
+
+    /// The last channel is gone, so nothing can publish or subscribe anymore:
+    /// every subscription ends once it has read its buffer.
+    pub(crate) fn close(&self) {
+        let state = lock(&self.state);
+        let old = self.interest.swap(Arc::default());
+        drop(state);
+        old.for_each_sub(&mut |sub| sub.buffer.end());
+        // Holds the filters, which are user code: dropped after unlocking
+        drop(old);
+        debug!("bus closed");
     }
 
     #[cfg(test)]
