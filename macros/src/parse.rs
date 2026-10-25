@@ -1,7 +1,7 @@
 //! Parsing the `topics!` tree. Errors are collected entry by entry: a wrong
 //! entry is skipped up to the next `,` and its siblings are still parsed.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use proc_macro2::{TokenStream, TokenTree};
 use syn::ext::IdentExt;
@@ -9,14 +9,14 @@ use syn::parse::discouraged::Speculative;
 use syn::parse::{ParseStream, Parser};
 use syn::punctuated::Punctuated;
 use syn::{
-    Attribute, Error, Ident, Path, Result, Token, Type, Variant, braced, bracketed, parenthesized,
-    token,
+    Attribute, Error, Ident, Path, Result, Token, Type, Variant, braced, bracketed,
+    parenthesized, token,
 };
 
 pub struct Input {
     /// Path of the nattes crate: `$crate`.
     pub krate: TokenTree,
-    /// Attributes other than docs, applied to every `Topic` enum.
+    /// Attributes other than docs, applied to every `TopicRef` enum.
     pub attrs: Vec<Attribute>,
     /// Always a `Kind::Level`.
     pub root: Entry,
@@ -71,6 +71,7 @@ pub fn parse(tokens: TokenStream, errors: &mut Vec<Error>) -> Result<Input> {
     parser.parse2(tokens)
 }
 
+/// The group enum after a topic's name and parameter, if any.
 fn group_enum(input: ParseStream) -> Result<Option<GroupEnum>> {
     if !input.peek(token::Bracket) {
         return Ok(None);
@@ -83,20 +84,58 @@ fn group_enum(input: ParseStream) -> Result<Option<GroupEnum>> {
     }))
 }
 
+/// Method names of `Channel`, and of the traits of the std prelude that it
+/// implements: a topic with one of these names couldn't be stepped to.
+const RESERVED: &[&str] = &[
+    "subscribe",
+    "respond",
+    "publish",
+    "publish_many",
+    "request",
+    "scatter",
+    "clone",
+    "clone_from",
+    "clone_into",
+    "to_owned",
+    "into",
+    "try_into",
+];
+
+/// The segment id of a topic name: its FNV-1a hash. It identifies the topic
+/// among its siblings, in the interest trie and on the wire, and doesn't
+/// depend on the order of the siblings.
+pub fn segment_id(name: &str) -> u32 {
+    name.bytes().fold(0x811c_9dc5, |hash, byte| {
+        (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193)
+    })
+}
+
 /// The entries of one level, up to the end of `input`.
 fn entries(input: ParseStream, errors: &mut Vec<Error>) -> Vec<Entry> {
     let mut out = Vec::new();
     let mut names = HashSet::new();
+    let mut ids = HashMap::new();
     while !input.is_empty() {
         let fork = input.fork();
         match entry(&fork, errors) {
             Ok(entry) => {
                 input.advance_to(&fork);
-                if names.insert(entry.name.unraw().to_string()) {
-                    out.push(entry);
-                } else {
+                let name = entry.name.unraw().to_string();
+                if RESERVED.contains(&name.as_str()) {
+                    let msg = format!(
+                        "`{name}` can't be a topic name: channels have a method `{name}`"
+                    );
+                    errors.push(Error::new(entry.name.span(), msg));
+                } else if !names.insert(name.clone()) {
                     let msg = format!("`{}` is already a topic of this level", entry.name);
                     errors.push(Error::new(entry.name.span(), msg));
+                } else if let Some(other) = ids.insert(segment_id(&name), name.clone()) {
+                    let msg = format!(
+                        "`{name}` and `{other}` have the same segment id: rename one of them"
+                    );
+                    errors.push(Error::new(entry.name.span(), msg));
+                } else {
+                    out.push(entry);
                 }
                 if !input.is_empty()
                     && let Err(error) = input.parse::<Token![,]>()
@@ -310,6 +349,49 @@ mod tests {
         assert_eq!(names(&entries), ["b", "c"]);
         assert_eq!(errors.len(), 2, "{errors:?}");
         assert!(errors[0].contains("reply type"), "{errors:?}");
+    }
+
+    fn groups(entry: &Entry) -> Vec<String> {
+        let groups = entry.groups.as_ref().expect("no groups");
+        groups.variants.iter().map(|v| v.ident.to_string()).collect()
+    }
+
+    #[test]
+    fn groups_go_on_every_kind_of_topic() {
+        let mut errors = Vec::new();
+        let body = quote! {
+            krate ev [Root] {
+                a [#![derive(Debug)] A, B(u32)] { x: X },
+                b(u32) [C]: B,
+                c [D]: C => R,
+                d.e(u64) [E].f: F,
+            }
+        };
+        let input = parse(body, &mut errors).unwrap();
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(groups(&input.root), ["Root"]);
+        let entries = children(&input.root);
+        assert_eq!(groups(&entries[0]), ["A", "B"]);
+        assert_eq!(entries[0].groups.as_ref().unwrap().attrs.len(), 1);
+        assert_eq!(groups(&entries[1]), ["C"]);
+        assert_eq!(groups(&entries[2]), ["D"]);
+        let e = &children(&entries[3])[0];
+        assert!(entries[3].groups.is_none());
+        assert_eq!(groups(e), ["E"]);
+        assert!(children(e)[0].groups.is_none());
+    }
+
+    #[test]
+    fn a_wrong_group_enum_keeps_its_siblings() {
+        let (entries, errors) = parse_tree(quote! {
+            a [A, 3]: A,
+            b [B] = other,
+            c [C, D]: C,
+        });
+        assert_eq!(names(&entries), ["c"]);
+        assert_eq!(groups(&entries[0]), ["C", "D"]);
+        assert_eq!(errors.len(), 2, "{errors:?}");
+        assert!(errors[1].contains("without parameter and groups"), "{errors:?}");
     }
 
     #[test]

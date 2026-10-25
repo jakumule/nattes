@@ -16,3 +16,7 @@ proc-macro = true
 proc-macro2 = "1"
 quote = "1"
 syn = { version = "3", features = ["full"] }
+
+[features]
+# Implement `Wire<C>` on every topic, for bridges: enabled by nattes's `bridge`
+bridge = []

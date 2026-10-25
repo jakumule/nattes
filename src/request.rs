@@ -1,20 +1,23 @@
 //! Request/reply plumbing, kept apart from the bus.
 //!
-//! A request leaf, `name: Msg => Reply` in [`topics!`](crate::topics), holds
+//! A request leaf, `name: Msg => Reply` in [`topics!`](crate::topics), carries
 //! its message like any leaf. A request is delivered as that event to
 //! subscribers, and to each responder as an [`Answering`]: the same event
 //! with the responder's own reply token, answered once through
 //! [`Incoming::respond`]. The requester awaits the other end of the tokens.
 
-use crate::bus::{Event, lock};
-use crate::channel::Route;
-use crate::tree::{Step, Subject};
-use crate::{Channel, Level, subject};
+use crate::Channel;
+use crate::bus::lock;
+use crate::event::{envelope, take, Envelope, Event};
+use crate::nav::{Params, Seg, Shape};
+use crate::subscription::view;
+use crate::tree::{Request, Subject, Topic, __payload};
 use futures::channel::{mpsc, oneshot};
-use futures::{Stream, StreamExt};
 use futures::stream::FusedStream;
+use futures::{Stream, StreamExt};
 use std::any::Any;
 use std::fmt;
+use std::marker::PhantomData;
 use std::ops::Deref;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -27,20 +30,6 @@ pub enum BusError {
     NoResponders,
     #[error("Every responder dropped the request without replying")]
     NoReply,
-}
-
-/// The scope of a request leaf, `name: Msg => Reply` in
-/// [`topics!`](crate::topics): its channel can send requests with the payload
-/// `M` and answer them with a [`Reply`](Self::Reply).
-///
-/// Implemented by the macro on the leaf's group enum if it declares queue
-/// groups, else on an empty enum named after the leaf (`git::FetchScope`).
-#[diagnostic::on_unimplemented(
-    message = "`{M}` isn't the payload of a request leaf",
-    note = "declare a request leaf in `topics!` with `name: Message => Reply`"
-)]
-pub trait Answer<M> {
-    type Reply: Send + 'static;
 }
 
 /// A responder's reply token. The requester waits until a reply comes or
@@ -70,20 +59,26 @@ struct Answering<R> {
     reply: Reply<R>,
 }
 
-/// Only so it can sit in a buffer: the subject is the request's.
-impl<R: Send + 'static> Level for Answering<R> {
-    fn step(&self) -> Step<'_> {
-        self.event.step()
+/// Sits in a responder's buffer like the request's event.
+impl<R: Send + 'static> Envelope for Answering<R> {
+    fn path(&self) -> &[Seg] {
+        self.event.path()
+    }
+    fn payload(&self) -> &dyn Any {
+        self.event.payload()
+    }
+    #[cfg(feature = "bridge")]
+    fn imported(&self) -> bool {
+        self.event.imported()
+    }
+    fn into_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
+        self
     }
 }
 
 /// Sends the requests of [`request`](Channel::request) and
 /// [`scatter`](Channel::scatter), on a request leaf.
-impl<M, S> Channel<M, (), S>
-where
-    M: Send + Sync + 'static,
-    S: Answer<M>,
-{
+impl<L: Request> Channel<L> {
     /// Send `payload` and wait for the first reply from a responder.
     ///
     /// It is delivered like [`publish`](Channel::publish) does it, to
@@ -97,7 +92,7 @@ where
     /// runtime's timer, e.g. `tokio::time::timeout(d, chan.request(msg))`,
     /// which covers both delivery and the reply. Once the future is dropped,
     /// the request may still be handled, but its reply is discarded.
-    pub async fn request(&self, payload: M) -> Result<S::Reply, BusError> {
+    pub async fn request(&self, payload: L::Msg) -> Result<L::Reply, BusError> {
         let (tx, rx) = oneshot::channel();
         let token = Reply::One(Arc::new(Mutex::new(Some(tx))));
         if self.deliver_request(payload, token).await == 0 {
@@ -119,7 +114,7 @@ where
     /// Bound delivery with your runtime's timer like for
     /// [`request`](Self::request), and the replies with
     /// [`StreamExt::take_until`](futures::StreamExt::take_until).
-    pub async fn scatter(&self, payload: M) -> Result<Replies<S::Reply>, BusError> {
+    pub async fn scatter(&self, payload: L::Msg) -> Result<Replies<L::Reply>, BusError> {
         let (tx, rx) = mpsc::unbounded();
         let remaining = self.deliver_request(payload, Reply::Many(tx)).await;
         if remaining == 0 {
@@ -133,8 +128,8 @@ where
 
     /// Deliver `payload`, with a clone of `token` for each responder. Drops
     /// `token`, so only responders hold one. Returns how many responders got it.
-    async fn deliver_request(&self, payload: M, token: Reply<S::Reply>) -> usize {
-        let event = self.to_event(payload);
+    async fn deliver_request(&self, payload: L::Msg, token: Reply<L::Reply>) -> usize {
+        let event = envelope(&self.path, payload);
         let respond = || {
             Arc::new(Answering {
                 event: event.clone(),
@@ -200,14 +195,15 @@ impl<R> fmt::Debug for Replies<R> {
 }
 
 /// An incoming request, received by a [`Responder`](crate::Responder); derefs
-/// to the payload `M`.
+/// to the leaf's message.
 ///
 /// Answer it once with [`respond`](Self::respond). Dropping it unanswered
 /// counts as no reply from this responder.
-pub struct Incoming<M, R, P> {
+pub struct Incoming<L: Request, P> {
     event: Event,
-    reply: ReplyToken<R>,
-    route: Arc<dyn Route<M, P>>,
+    reply: ReplyToken<L::Reply>,
+    shape: Shape,
+    leaf: PhantomData<fn() -> (L, P)>,
 }
 
 /// A responder's reply token, out of an [`Incoming`] by
@@ -248,30 +244,36 @@ impl<R> fmt::Debug for ReplyToken<R> {
     }
 }
 
-impl<M, R: Send + 'static, P> Incoming<M, R, P> {
+impl<L: Request, P> Incoming<L, P> {
     /// Unwrap the [`Answering`] event a responder read.
-    pub(crate) fn new(event: Event, route: Arc<dyn Route<M, P>>) -> Self {
-        let any: Arc<dyn Any + Send + Sync> = event;
-        let answering = (any.downcast::<Answering<R>>().ok())
+    pub(crate) fn new(event: Event, shape: Shape) -> Self {
+        let answering = (event.into_any().downcast::<Answering<L::Reply>>().ok())
             .and_then(Arc::into_inner)
             .expect("each responder gets its own `Answering`");
         Self {
             event: answering.event,
             reply: ReplyToken(answering.reply),
-            route,
+            shape,
+            leaf: PhantomData,
         }
     }
-}
 
-impl<M, R, P> Incoming<M, R, P> {
     /// Values of the wildcard parameters on the way to this channel.
-    pub fn params(&self) -> P {
-        self.view().0
+    pub fn params(&self) -> P
+    where
+        P: Params,
+    {
+        self.shape.params(self.event.path())
     }
 
-    /// NATS-style subject of the whole event.
+    /// NATS-style subject of the request.
     pub fn subject(&self) -> String {
-        subject(&*self.event)
+        Subject(self.event.path()).to_string()
+    }
+
+    /// The request's message, like [`Msg::view`](crate::Msg::view).
+    pub fn view(&self) -> <L as Topic>::View<'_> {
+        view::<L>(&*self.event, self.shape)
     }
 
     /// Whether a reply is still possible: the requester is waiting and, for a
@@ -282,46 +284,45 @@ impl<M, R, P> Incoming<M, R, P> {
 
     /// Answer the request. Returns `false` if the requester is gone or, for a
     /// [`request`](Channel::request), another responder already replied.
-    pub fn respond(self, reply: R) -> bool {
+    pub fn respond(self, reply: L::Reply) -> bool {
         self.reply.respond(reply)
     }
 
-    /// Take the payload out, which needs no `Clone`, with the reply token to
+    /// Take the message out, which needs no `Clone`, with the reply token to
     /// answer it. Fails, giving `self` back, while subscribers that received
     /// the request still hold it (see [`Msg::try_into_inner`](crate::Msg::try_into_inner)),
     /// or while the requester is still delivering it.
     ///
     /// Read [`params`](Self::params) first if needed.
-    pub fn try_into_inner(self) -> Result<(M, ReplyToken<R>), Self> {
-        match self.route.project_owned(self.event) {
+    #[allow(clippy::type_complexity)]
+    pub fn try_into_inner(self) -> Result<(L::Msg, ReplyToken<L::Reply>), Self> {
+        match take(self.event) {
             Ok(payload) => Ok((payload, self.reply)),
             Err(event) => Err(Self {
                 event,
                 reply: self.reply,
-                route: self.route,
+                shape: self.shape,
+                leaf: PhantomData,
             }),
         }
     }
+}
 
-    fn view(&self) -> (P, &M) {
-        self.route
-            .project(&*self.event as &dyn Any)
-            .expect("delivered only if it matched")
+impl<L: Request, P> Deref for Incoming<L, P> {
+    type Target = L::Msg;
+
+    fn deref(&self) -> &L::Msg {
+        __payload(self.event.payload())
     }
 }
 
-impl<M, R, P> Deref for Incoming<M, R, P> {
-    type Target = M;
-
-    fn deref(&self) -> &M {
-        self.view().1
-    }
-}
-
-impl<M: fmt::Debug, R, P> fmt::Debug for Incoming<M, R, P> {
+impl<L: Request, P> fmt::Debug for Incoming<L, P>
+where
+    L::Msg: fmt::Debug,
+{
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Incoming")
-            .field("subject", &format_args!("{}", Subject(&*self.event)))
+            .field("subject", &format_args!("{}", Subject(self.event.path())))
             .field("msg", &**self)
             .field("pending", &self.is_pending())
             .finish()

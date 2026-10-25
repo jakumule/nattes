@@ -18,7 +18,8 @@ mod common;
 use common::{Message, start, topics};
 use futures::{FutureExt, StreamExt};
 use gungraun::prelude::*;
-use nattes::{Channel, Msg, Overflow, Replies, Subscription, at};
+use nattes::{Channel, Msg, Overflow, Replies, Subscription, Wild};
+use topics::prelude::*;
 use std::future::Future;
 use std::future::IntoFuture;
 use std::hint::black_box;
@@ -27,10 +28,11 @@ use std::hint::black_box;
 const BATCH: u64 = 100;
 
 type Bus = Channel<topics::Topic>;
-type Load = Channel<Message, (), topics::LoadQueue>;
-type Sub<P = ()> = Subscription<Message, P>;
-type Ask = Channel<Message, (), topics::AskScope>;
-type Responder = nattes::Responder<Message, u64, ()>;
+type Load = Channel<topics::LoadLeaf>;
+type Sub = Subscription<topics::LoadLeaf, ()>;
+type DelSub<P = ()> = Subscription<topics::user::id::DeleteLeaf, P>;
+type Ask = Channel<topics::AskLeaf>;
+type Responder = nattes::Responder<topics::AskLeaf, ()>;
 
 /// Poll `fut` once: everything measured here completes without waiting.
 fn now<F: Future>(fut: F) -> F::Output {
@@ -38,16 +40,14 @@ fn now<F: Future>(fut: F) -> F::Output {
 }
 
 /// Subscriptions that hold a whole batch.
-fn buffered<T: 'static, P: 'static, S>(
-    builder: nattes::SubscriptionBuilder<T, P, S>,
-) -> Subscription<T, P> {
+fn buffered<T: nattes::Topic, P: 'static>(builder: nattes::SubscriptionBuilder<T, P>) -> Subscription<T, P> {
     start(builder.buffer(BATCH as usize).on_full(Overflow::DropNewest))
 }
 
 /// `n` subscribers on `load`.
 fn fan_out_setup(n: u64) -> (Load, Vec<Sub>) {
     let bus = Channel::<topics::Topic>::new();
-    let load = at!(bus, load);
+    let load = bus.load();
     let subs = (0..n).map(|_| buffered(load.subscribe())).collect();
     (load, subs)
 }
@@ -62,11 +62,41 @@ fn publish_fan_out((load, subs): (Load, Vec<Sub>)) -> (Load, Vec<Sub>) {
     (load, subs)
 }
 
+// Publish a batch with one `publish_many` to `n` subscribers of the same topic.
+#[library_benchmark]
+#[benches::subs(args = [1, 16, 256], setup = fan_out_setup)]
+fn publish_many_fan_out((load, subs): (Load, Vec<Sub>)) -> (Load, Vec<Sub>) {
+    black_box(now(load.publish_many((0..BATCH).map(Message))));
+    (load, subs)
+}
+
+/// `n` handlers on `load`.
+fn handlers_setup(n: u64) -> (Load, Vec<nattes::Handler<topics::LoadLeaf, ()>>) {
+    let bus = Channel::<topics::Topic>::new();
+    let load = bus.load();
+    let handlers = (0..n)
+        .map(|_| load.subscribe().handler(|msg| drop(black_box(msg))))
+        .collect();
+    (load, handlers)
+}
+
+// Publish a batch to `n` handlers, which drop each message.
+#[library_benchmark]
+#[benches::subs(args = [1, 16, 256], setup = handlers_setup)]
+fn publish_handlers(
+    (load, handlers): (Load, Vec<nattes::Handler<topics::LoadLeaf, ()>>),
+) -> (Load, Vec<nattes::Handler<topics::LoadLeaf, ()>>) {
+    for i in 0..BATCH {
+        black_box(now(load.publish(Message(i))));
+    }
+    (load, handlers)
+}
+
 /// One subscriber on each `user.<id>.delete`, for `n` ids.
-fn routing_setup(n: u64) -> (Bus, u64, Vec<Sub>) {
+fn routing_setup(n: u64) -> (Bus, u64, Vec<DelSub>) {
     let bus = Channel::<topics::Topic>::new();
     let subs = (0..n)
-        .map(|id| buffered(at!(bus, user.id(id).delete).subscribe()))
+        .map(|id| buffered(bus.user().id(id).delete().subscribe()))
         .collect();
     (bus, n, subs)
 }
@@ -75,21 +105,21 @@ fn routing_setup(n: u64) -> (Bus, u64, Vec<Sub>) {
 // for each message as an application would.
 #[library_benchmark]
 #[benches::subs(args = [1, 100, 1000], setup = routing_setup)]
-fn publish_routing((bus, n, subs): (Bus, u64, Vec<Sub>)) -> (Bus, u64, Vec<Sub>) {
+fn publish_routing((bus, n, subs): (Bus, u64, Vec<DelSub>)) -> (Bus, u64, Vec<DelSub>) {
     for i in 0..BATCH {
         let id = black_box(i % n);
-        black_box(now(at!(bus, user.id(id).delete).publish(Message(i))));
+        black_box(now(bus.user().id(id).delete().publish(Message(i))));
     }
     (bus, n, subs)
 }
 
 /// `n` subscribers on `user.*.delete`, each keeping only its own ids.
-fn filter_setup(n: u64) -> (Bus, Vec<Sub<(u64,)>>) {
+fn filter_setup(n: u64) -> (Bus, Vec<DelSub<(u64,)>>) {
     let bus = Channel::<topics::Topic>::new();
     let subs = (0..n)
         .map(|k| {
             buffered(
-                at!(bus, user.id().delete)
+                bus.user().id(Wild).delete()
                     .subscribe()
                     .filter(move |&(id,), _| id % n == k),
             )
@@ -101,9 +131,9 @@ fn filter_setup(n: u64) -> (Bus, Vec<Sub<(u64,)>>) {
 // Publish a batch to wildcard subscribers that each run a filter.
 #[library_benchmark]
 #[benches::subs(args = [1, 16], setup = filter_setup)]
-fn publish_filtered((bus, subs): (Bus, Vec<Sub<(u64,)>>)) -> (Bus, Vec<Sub<(u64,)>>) {
+fn publish_filtered((bus, subs): (Bus, Vec<DelSub<(u64,)>>)) -> (Bus, Vec<DelSub<(u64,)>>) {
     for i in 0..BATCH {
-        black_box(now(at!(bus, user.id(i).delete).publish(Message(i))));
+        black_box(now(bus.user().id(i).delete().publish(Message(i))));
     }
     (bus, subs)
 }
@@ -111,7 +141,7 @@ fn publish_filtered((bus, subs): (Bus, Vec<Sub<(u64,)>>)) -> (Bus, Vec<Sub<(u64,
 /// `n` members of one queue group on `load`.
 fn queue_setup(n: u64) -> (Load, Vec<Sub>) {
     let bus = Channel::<topics::Topic>::new();
-    let load = at!(bus, load);
+    let load = bus.load();
     let subs = (0..n)
         .map(|_| buffered(load.subscribe().queue(topics::LoadQueue::Workers)))
         .collect();
@@ -140,7 +170,7 @@ fn receive_setup() -> (Load, Sub) {
 // Receive a batch and read each message.
 #[library_benchmark]
 #[bench::batch(setup = receive_setup)]
-fn receive((load, mut sub): (Load, Sub)) -> (Load, Sub, Vec<Msg<Message, ()>>) {
+fn receive((load, mut sub): (Load, Sub)) -> (Load, Sub, Vec<Msg<topics::LoadLeaf, ()>>) {
     let msgs: Vec<_> = (0..BATCH)
         .map(|_| {
             let msg = now(sub.next()).expect("subscription closed");
@@ -151,25 +181,37 @@ fn receive((load, mut sub): (Load, Sub)) -> (Load, Sub, Vec<Msg<Message, ()>>) {
     (load, sub, msgs)
 }
 
+// Receive a batch with one `recv_many` and read each message.
+#[library_benchmark]
+#[bench::batch(setup = receive_setup)]
+fn receive_many((load, mut sub): (Load, Sub)) -> (Load, Sub, Vec<Msg<topics::LoadLeaf, ()>>) {
+    let mut msgs = Vec::with_capacity(BATCH as usize);
+    now(sub.recv_many(&mut msgs, BATCH as usize));
+    for msg in &msgs {
+        black_box(msg.0);
+    }
+    (load, sub, msgs)
+}
+
 // Subscribe once, to a bus that has `n` subscriptions (copy-on-write of the trie).
 #[library_benchmark]
 #[benches::existing(args = [0, 1000, 10000], setup = routing_setup)]
-fn subscribe((bus, n, subs): (Bus, u64, Vec<Sub>)) -> (Bus, Vec<Sub>, Sub) {
-    let sub = buffered(at!(bus, user.id(n).delete).subscribe());
+fn subscribe((bus, n, subs): (Bus, u64, Vec<DelSub>)) -> (Bus, Vec<DelSub>, DelSub) {
+    let sub = buffered(bus.user().id(n).delete().subscribe());
     (bus, subs, sub)
 }
 
 /// A bus with `n` other subscriptions, and one to drop.
-fn unsubscribe_setup(n: u64) -> (Bus, Vec<Sub>, Sub) {
+fn unsubscribe_setup(n: u64) -> (Bus, Vec<DelSub>, DelSub) {
     let (bus, n, subs) = routing_setup(n);
-    let sub = buffered(at!(bus, user.id(n).delete).subscribe());
+    let sub = buffered(bus.user().id(n).delete().subscribe());
     (bus, subs, sub)
 }
 
 // Unsubscribe once, from a bus that keeps `n` other subscriptions.
 #[library_benchmark]
 #[benches::existing(args = [0, 1000, 10000], setup = unsubscribe_setup)]
-fn unsubscribe((bus, subs, sub): (Bus, Vec<Sub>, Sub)) -> (Bus, Vec<Sub>) {
+fn unsubscribe((bus, subs, sub): (Bus, Vec<DelSub>, DelSub)) -> (Bus, Vec<DelSub>) {
     drop(black_box(sub));
     (bus, subs)
 }
@@ -198,10 +240,10 @@ fn unsubscribe_same_channel((load, subs, sub): (Load, Vec<Sub>, Sub)) -> (Load, 
 }
 
 /// A received `user.<id>.delete` message.
-fn subject_setup() -> (Sub<(u64,)>, Msg<Message, (u64,)>) {
+fn subject_setup() -> (DelSub<(u64,)>, Msg<topics::user::id::DeleteLeaf, (u64,)>) {
     let bus = Channel::<topics::Topic>::new();
-    let mut sub = buffered(at!(bus, user.id().delete).subscribe());
-    now(at!(bus, user.id(42).delete).publish(Message(0)));
+    let mut sub = buffered(bus.user().id(Wild).delete().subscribe());
+    now(bus.user().id(42).delete().publish(Message(0)));
     let msg = now(sub.next()).unwrap();
     (sub, msg)
 }
@@ -209,7 +251,7 @@ fn subject_setup() -> (Sub<(u64,)>, Msg<Message, (u64,)>) {
 // Format a message's subject and read its params.
 #[library_benchmark]
 #[bench::param(setup = subject_setup)]
-fn subject((sub, msg): (Sub<(u64,)>, Msg<Message, (u64,)>)) -> (Sub<(u64,)>, String) {
+fn subject((sub, msg): (DelSub<(u64,)>, Msg<topics::user::id::DeleteLeaf, (u64,)>)) -> (DelSub<(u64,)>, String) {
     black_box(msg.params());
     (sub, black_box(msg.subject()))
 }
@@ -217,7 +259,7 @@ fn subject((sub, msg): (Sub<(u64,)>, Msg<Message, (u64,)>)) -> (Sub<(u64,)>, Str
 /// `n` responders on `ask`.
 fn responders_setup(n: u64) -> (Ask, Vec<Responder>) {
     let bus = Channel::<topics::Topic>::new();
-    let ask = at!(bus, ask);
+    let ask = bus.ask();
     let responders = (0..n)
         .map(|_| {
             let builder = ask.respond().buffer(BATCH as usize);
@@ -266,13 +308,15 @@ library_benchmark_group!(
     name = publishing,
     benchmarks = [
         publish_fan_out,
+        publish_many_fan_out,
+        publish_handlers,
         publish_routing,
         publish_filtered,
         publish_queue_group
     ]
 );
 
-library_benchmark_group!(name = receiving, benchmarks = [receive, subject]);
+library_benchmark_group!(name = receiving, benchmarks = [receive, receive_many, subject]);
 
 library_benchmark_group!(
     name = subscriptions,

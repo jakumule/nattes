@@ -1,18 +1,19 @@
-//! The untyped bus: works only with `Arc<dyn Level>` events and `&dyn Any`
-//! matchers. [`Channel`](crate::Channel) adds the types on top.
+//! The untyped bus: works only with [`Event`]s and matchers on them.
+//! [`Channel`](crate::Channel) adds the types on top.
 
-use crate::Level;
+use crate::event::{Envelope, Event};
 use crate::group::GroupKey;
 use crate::log::{debug, trace, warning};
 #[cfg(feature = "tracing")]
 use crate::nav::Pattern;
-use crate::nav::{Key, KeyParam, ParamKey};
+use crate::nav::{Key, KeyParam, ParamKey, Seg};
 #[cfg(feature = "tracing")]
 use crate::tree::Subject;
 use arc_swap::ArcSwap;
+#[cfg(feature = "bridge")]
+use futures::channel::mpsc;
 use futures::task::AtomicWaker;
 use smallvec::SmallVec;
-use std::any::Any;
 use std::collections::{HashMap, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::future::poll_fn;
@@ -37,17 +38,14 @@ pub enum Overflow {
     /// buffer is full, since only it can make room. A queue group whose members
     /// are all full waits if any of them has `Wait`, and delivers to the first
     /// of those to have room.
-    ///
-    /// `try_publish` never waits: it drops the new message instead, like
-    /// `DropNewest`.
     Wait,
 }
 
 /// Default number of messages a subscription buffers.
 pub const DEFAULT_BUFFER: usize = 1024;
 
-pub(crate) type Event = Arc<dyn Level>;
-pub(crate) type Matcher = Box<dyn Fn(&dyn Any) -> bool + Send + Sync>;
+/// Runs the filters of a subscription on an event and the segments of its subject.
+pub(crate) type Matcher = Box<dyn Fn(&dyn Envelope, &[Seg]) -> bool + Send + Sync>;
 
 /// Locks without propagating poison: no user code runs while our locks are held,
 /// so a poisoned lock still holds consistent data. That includes `Drop`: events
@@ -65,9 +63,15 @@ pub(crate) struct Buffer {
     /// Wakes the subscriber when a message arrives, if it is `parked`.
     waker: AtomicWaker,
     /// Set while the subscriber waits for a message on an empty buffer: pushes
-    /// skip the wake otherwise, and queue groups prefer idle members.
+    /// skip the wake otherwise, and queue groups prefer idle members. Always
+    /// set on a handler's buffer until it is closed.
     parked: AtomicBool,
+    /// A handler's buffer stores nothing: pushes call this instead.
+    handler: Option<HandlerFn>,
 }
+
+/// Called with each event delivered to a handler, on the publisher's thread.
+pub(crate) type HandlerFn = Box<dyn Fn(Event) + Send + Sync>;
 
 #[derive(Default)]
 struct BufferState {
@@ -110,6 +114,33 @@ impl Buffer {
             dropped: AtomicU64::new(0),
             waker: AtomicWaker::new(),
             parked: AtomicBool::new(false),
+            handler: None,
+        }
+    }
+
+    /// The buffer of a handler: never full, always idle until closed.
+    pub(crate) fn handler(handler: HandlerFn) -> Self {
+        Self {
+            parked: AtomicBool::new(true),
+            handler: Some(handler),
+            ..Self::new(usize::MAX, Overflow::DropNewest)
+        }
+    }
+
+    /// Call the handler with `event`, unless the handler is gone. A panic
+    /// drops the event.
+    #[inline(never)]
+    fn handle(&self, handler: &HandlerFn, event: Event) -> Push {
+        if !self.parked.load(Ordering::Acquire) {
+            return Push::Closed;
+        }
+        match catch_unwind(AssertUnwindSafe(|| handler(event))) {
+            Ok(()) => Push::Delivered,
+            Err(_) => {
+                warning!("handler panicked, counted as dropped");
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+                Push::Dropped
+            }
         }
     }
 
@@ -123,43 +154,65 @@ impl Buffer {
     /// `OVERFLOW`, else hand the event back as `Full`.
     #[inline]
     fn try_push<const OVERFLOW: bool>(&self, event: Event) -> Push {
+        if let Some(handler) = &self.handler {
+            return self.handle(handler, event);
+        }
         let mut state = lock(&self.state);
         if state.closed {
             return Push::Closed;
         }
-        let mut evicted = None;
         if state.events.len() >= self.capacity {
-            if !OVERFLOW {
-                return Push::Full(event);
+            let (push, dropped) = self.push_full::<OVERFLOW>(&mut state, event);
+            drop(state);
+            drop(dropped);
+            if matches!(push, Push::Evicted) {
+                self.wake();
             }
-            match self.overflow {
-                Overflow::DropNewest => {
-                    self.dropped.fetch_add(1, Ordering::Relaxed);
-                    return Push::Dropped;
-                }
-                Overflow::DropOldest => {
-                    // Often its last reference: dropped after unlocking
-                    evicted = state.events.pop_front();
-                    self.dropped.fetch_add(1, Ordering::Relaxed);
-                }
-                Overflow::Wait => {
-                    // Set under the lock, so the pop that frees room sees it
-                    state.wanted = true;
-                    return Push::Full(event);
-                }
-            }
+            return push;
         }
         state.events.push_back(event);
         drop(state);
-        // The subscriber sets `parked` before its last check of the buffer, under
-        // the same lock: either it sees this event, or this sees `parked`
+        self.wake();
+        Push::Delivered
+    }
+
+    /// Push `event` into the full, open buffer of `state`, as `try_push` does.
+    /// Also returns the event it dropped, often its last reference: the
+    /// caller drops it after unlocking.
+    fn push_full<const OVERFLOW: bool>(
+        &self,
+        state: &mut BufferState,
+        event: Event,
+    ) -> (Push, Option<Event>) {
+        if !OVERFLOW {
+            return (Push::Full(event), None);
+        }
+        match self.overflow {
+            Overflow::DropNewest => {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+                (Push::Dropped, Some(event))
+            }
+            Overflow::DropOldest => {
+                let oldest = state.events.pop_front();
+                state.events.push_back(event);
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+                (Push::Evicted, oldest)
+            }
+            Overflow::Wait => {
+                // Set under the lock, so the pop that frees room sees it
+                state.wanted = true;
+                (Push::Full(event), None)
+            }
+        }
+    }
+
+    /// Wake the subscriber after a push, if it is parked. It sets `parked`
+    /// before its last check of the buffer, under the same lock: either it
+    /// sees the event, or this sees `parked`.
+    #[inline]
+    fn wake(&self) {
         if self.parked.load(Ordering::Relaxed) && self.parked.swap(false, Ordering::AcqRel) {
             self.waker.wake();
-        }
-        if evicted.is_some() {
-            Push::Evicted
-        } else {
-            Push::Delivered
         }
     }
 
@@ -241,6 +294,81 @@ impl Buffer {
         event
     }
 
+    /// Deliver `events` under one lock, applying the overflow policy to each.
+    /// Returns how many were delivered; the ones a full `Overflow::Wait`
+    /// buffer can't take go to `full`, in order.
+    fn push_many(&self, events: impl Iterator<Item = Event>, full: &mut Vec<Event>) -> usize {
+        if let Some(handler) = &self.handler {
+            let pushed = events.map(|event| self.handle(handler, event));
+            return pushed.filter(|push| matches!(push, Push::Delivered)).count();
+        }
+        let mut state = lock(&self.state);
+        if state.closed {
+            return 0;
+        }
+        let mut dropped = Vec::new();
+        let mut delivered = 0;
+        for event in events {
+            if state.events.len() < self.capacity {
+                state.events.push_back(event);
+                delivered += 1;
+                continue;
+            }
+            let (push, old) = self.push_full::<true>(&mut state, event);
+            dropped.extend(old);
+            match push {
+                Push::Evicted => delivered += 1,
+                Push::Full(event) => full.push(event),
+                Push::Delivered | Push::Dropped | Push::Closed => {}
+            }
+        }
+        drop(state);
+        drop(dropped);
+        if delivered > 0 {
+            self.wake();
+        }
+        delivered
+    }
+
+    /// Pass up to `max` events to `f`, under one lock. Returns how many.
+    fn pop_many(&self, max: usize, f: &mut impl FnMut(Event)) -> usize {
+        let mut state = lock(&self.state);
+        let n = max.min(state.events.len());
+        state.events.drain(..n).for_each(&mut *f);
+        if state.wanted && state.events.len() <= self.capacity / 2 {
+            Self::refill(state);
+        }
+        n
+    }
+
+    /// Up to `max` events, passed to `f`, under one lock: how many, or 0 once
+    /// the bus is closed and the buffer drained.
+    pub(crate) fn poll_many(
+        &self,
+        cx: &mut Context<'_>,
+        max: usize,
+        mut f: impl FnMut(Event),
+    ) -> Poll<usize> {
+        if max == 0 {
+            return Poll::Ready(0);
+        }
+        let n = self.pop_many(max, &mut f);
+        if n > 0 {
+            return Poll::Ready(n);
+        }
+        self.waker.register(cx.waker());
+        // Park before checking again, so a push or `end` in between isn't missed
+        self.parked.store(true, Ordering::Release);
+        match self.pop_many(max, &mut f) {
+            0 if self.is_terminated() => Poll::Ready(0),
+            0 => Poll::Pending,
+            n => {
+                self.parked.store(false, Ordering::Relaxed);
+                Poll::Ready(n)
+            }
+        }
+    }
+
     /// `pop` freed enough room: wake the waiting publishers.
     #[cold]
     fn refill(mut state: MutexGuard<'_, BufferState>) {
@@ -296,6 +424,8 @@ impl Buffer {
 
     /// The subscription is gone: drop what it didn't read.
     pub(crate) fn close(&self) {
+        // A handler is called only while this is set
+        self.parked.store(false, Ordering::Release);
         let mut state = lock(&self.state);
         state.closed = true;
         let events = std::mem::take(&mut state.events);
@@ -314,15 +444,18 @@ pub(crate) struct Sub {
     /// the trie matches names and parameter values exactly.
     matcher: Option<Matcher>,
     buffer: Arc<Buffer>,
+    /// Its path, if watchers hear about it: not for responders and bridges.
+    #[cfg(feature = "bridge")]
+    watched: Option<Arc<[Key]>>,
 }
 
 impl Sub {
     /// Whether the event really is for this subscription. Filters are user
     /// code: a panic counts as no match.
     #[inline]
-    fn accepts(&self, event: &dyn Any) -> bool {
+    fn accepts(&self, event: &dyn Envelope, segs: &[Seg]) -> bool {
         self.matcher.as_ref().is_none_or(|matcher| {
-            catch_unwind(AssertUnwindSafe(|| matcher(event))).unwrap_or_else(|_| {
+            catch_unwind(AssertUnwindSafe(|| matcher(event, segs))).unwrap_or_else(|_| {
                 warning!(
                     subscription = self.id,
                     "filter panicked, counted as no match"
@@ -364,9 +497,9 @@ pub(crate) struct Interest {
     /// Queue groups of responders. Responders and subscribers joining the same
     /// group form two groups.
     pub(crate) responder_groups: Vec<Members>,
-    /// By segment name. A list: siblings are few, and comparing short names
-    /// beats hashing them.
-    pub(crate) children: Vec<(&'static str, Edges)>,
+    /// By segment id. A list: siblings are few, and comparing ids beats
+    /// hashing them.
+    pub(crate) children: Vec<(u32, Edges)>,
 }
 
 /// Children under one segment name, by parameter. Fixed values are keyed by
@@ -410,10 +543,10 @@ impl Edges {
 
 impl Interest {
     #[inline]
-    fn edges(&self, name: &str) -> Option<&Edges> {
+    fn edges(&self, id: u32) -> Option<&Edges> {
         self.children
             .iter()
-            .find(|(n, _)| *n == name)
+            .find(|(i, _)| *i == id)
             .map(|(_, e)| e)
     }
 
@@ -448,10 +581,10 @@ impl Interest {
                 }
             },
             Some((key, rest)) => {
-                let i = match node.children.iter().position(|(n, _)| *n == key.name) {
+                let i = match node.children.iter().position(|(i, _)| *i == key.id) {
                     Some(i) => i,
                     None => {
-                        node.children.push((key.name, Edges::default()));
+                        node.children.push((key.id, Edges::default()));
                         node.children.len() - 1
                     }
                 };
@@ -486,7 +619,7 @@ impl Interest {
                 }
             }
             Some((key, rest)) => {
-                let Some(i) = node.children.iter().position(|(n, _)| *n == key.name) else {
+                let Some(i) = node.children.iter().position(|(i, _)| *i == key.id) else {
                     return;
                 };
                 let edges = &mut node.children[i].1;
@@ -518,32 +651,31 @@ impl Interest {
         }
     }
 
-    /// Calls `found` with every trie node along the subject of `event`. Walks only
-    /// the branches that match: the segment name and, on a parameter, both `*`
+    /// Calls `found` with every trie node along the subject `segs`. Walks only
+    /// the branches that match: the segment id and, on a parameter, both `*`
     /// and the value.
-    fn visit<'s>(&'s self, event: Option<&dyn Level>, found: &mut impl FnMut(&'s Interest)) {
+    fn visit<'s>(&'s self, segs: &[Seg], found: &mut impl FnMut(&'s Interest)) {
         found(self);
-        let Some(event) = event else {
+        let Some((seg, rest)) = segs.split_first() else {
             return;
         };
-        let step = event.step();
-        let Some(edges) = self.edges(step.name) else {
+        let Some(edges) = self.edges(seg.id()) else {
             return;
         };
-        match step.param {
-            None => {
-                if let Some(child) = &edges.plain {
-                    child.visit(step.next, found);
-                }
-            }
+        match seg.param() {
             Some(value) => {
                 if let Some(child) = &edges.wild {
-                    child.visit(step.next, found);
+                    child.visit(rest, found);
                 }
-                if !edges.fixed.is_empty() {
-                    if let Some(child) = edges.fixed.get(value) {
-                        child.visit(step.next, found);
-                    }
+                if !edges.fixed.is_empty()
+                    && let Some(child) = edges.fixed.get(value)
+                {
+                    child.visit(rest, found);
+                }
+            }
+            None => {
+                if let Some(child) = &edges.plain {
+                    child.visit(rest, found);
                 }
             }
         }
@@ -662,24 +794,27 @@ fn pick<'e>(
     len: usize,
     member: impl Fn(usize) -> &'e Sub,
     event: &Event,
+    segs: &[Seg],
     pushed: impl Fn() -> Event,
 ) -> Picked<'e> {
-    let any = &**event as &dyn Any;
+    let any = &**event;
     let start = turn.next.fetch_add(1, Ordering::Relaxed);
     let at = |i| member((start + i) % len);
     // An idle member waits in `next()`, so its buffer is empty
     for i in 0..len {
         let sub = at(i);
-        if sub.buffer.is_idle() && sub.accepts(any) {
+        if sub.buffer.is_idle() && sub.accepts(any, segs) {
             return Picked::Member(sub);
         }
     }
-    // Checking for room and delivering take the same lock
+    // Checking for room and delivering take the same lock. Every member is
+    // tried, idle or not: one that parked since the loop above would be
+    // skipped by both, losing the message
     let mut full = None;
     let mut wait = SmallVec::new();
     for i in 0..len {
         let sub = at(i);
-        if !sub.buffer.is_idle() && sub.accepts(any) {
+        if sub.accepts(any, segs) {
             match sub.buffer.try_push::<false>(pushed()) {
                 Push::Delivered => return Picked::Delivered,
                 Push::Full(_) => {
@@ -698,22 +833,161 @@ fn pick<'e>(
     full.map_or(Picked::None, Picked::Member)
 }
 
+/// The member of the queue group `groups[i]` that gets `event`, or `None` if
+/// the group came earlier in `groups`. A group usually sits on one trie node;
+/// members spread over several trie nodes of the subject are merged in
+/// subscription order.
+#[inline]
+fn pick_group<'e>(
+    groups: &[&'e Members],
+    i: usize,
+    event: &Event,
+    segs: &[Seg],
+    pushed: impl Fn() -> Event,
+) -> Option<Picked<'e>> {
+    let members = groups[i];
+    let same = |m: &&Members| Arc::ptr_eq(&m.turn, &members.turn);
+    if groups[..i].iter().any(same) {
+        return None;
+    }
+    let merged = groups[i + 1..].iter().any(same);
+    Some(match members.subs.chunks.as_slice() {
+        [subs] if !merged => {
+            let subs: &[Arc<Sub>] = subs;
+            pick(&members.turn, subs.len(), |i| &subs[i], event, segs, pushed)
+        }
+        // Over several trie nodes, or more than one chunk on this one
+        _ => {
+            let mut all: Vec<&Sub> = (groups[i..].iter().filter(|m| same(m)))
+                .flat_map(|m| m.subs.iter())
+                .collect();
+            if merged {
+                all.sort_unstable_by_key(|sub| sub.id);
+            }
+            pick(&members.turn, all.len(), |i| all[i], event, segs, pushed)
+        }
+    })
+}
+
+/// Deliver to `sub`: a `responder` of a `REQUEST` gets its own event, built
+/// by `respond`, and counts; a subscriber gets `event`, and counts only when
+/// publishing. Returns 1 if it counts and got the event, or for a responder
+/// whose full buffer dropped it: the requester sees `NoReply` rather than
+/// `NoResponders` once its token is gone. A full `Overflow::Wait` buffer goes
+/// to `waiting`.
+#[inline]
+fn push_to<const REQUEST: bool>(
+    sub: &Sub,
+    responder: bool,
+    event: &Event,
+    respond: ForResponder,
+    waiting: &mut Vec<Waiting>,
+) -> usize {
+    let (pushed, counts) = if REQUEST && responder {
+        (respond(), true)
+    } else {
+        (event.clone(), !REQUEST)
+    };
+    match sub.buffer.try_push::<true>(pushed) {
+        Push::Delivered => usize::from(counts),
+        Push::Evicted => {
+            debug!(
+                subscription = sub.id,
+                subject = %Subject(event.path()),
+                "buffer full, dropped the oldest message"
+            );
+            usize::from(counts)
+        }
+        Push::Full(pushed) => {
+            waiting.push(Waiting {
+                buffers: SmallVec::from_buf([sub.buffer.clone()]),
+                event: pushed,
+                counts,
+            });
+            0
+        }
+        Push::Dropped => {
+            debug!(
+                subscription = sub.id,
+                subject = %Subject(event.path()),
+                "buffer full, dropped the message"
+            );
+            usize::from(REQUEST && counts)
+        }
+        Push::Closed => 0,
+    }
+}
+
+/// Deliver `event` to one member per queue group of `groups`, as `push_to`
+/// does: only requests reach responder groups. `segs` is its subject. Returns how many count.
+fn deliver_to_groups<const REQUEST: bool>(
+    groups: &[&Members],
+    event: &Event,
+    segs: &[Seg],
+    respond: ForResponder,
+    waiting: &mut Vec<Waiting>,
+) -> usize {
+    let mut delivered = 0;
+    for (i, members) in groups.iter().enumerate() {
+        let responders = REQUEST && members.responder;
+        let pushed = || if responders { respond() } else { event.clone() };
+        let Some(member) = pick_group(groups, i, event, segs, pushed) else {
+            continue;
+        };
+        let counts = responders || !REQUEST;
+        match member {
+            Picked::Delivered => delivered += usize::from(counts),
+            Picked::Member(member) => {
+                delivered += push_to::<REQUEST>(member, responders, event, respond, waiting);
+            }
+            Picked::Wait(subs) => waiting.push(Waiting {
+                buffers: subs.iter().map(|sub| sub.buffer.clone()).collect(),
+                event: pushed(),
+                counts,
+            }),
+            Picked::None => {}
+        }
+    }
+    delivered
+}
+
 #[derive(Default)]
 struct State {
     /// Queue groups by value, topic and whether they are responders, with
     /// their member count: a group is forgotten with its last member.
     groups: HashMap<GroupId, (Arc<RoundRobin>, usize)>,
     next_id: u64,
+    /// Told about every watched subscription and unsubscription.
+    #[cfg(feature = "bridge")]
+    watchers: Vec<mpsc::UnboundedSender<Change>>,
 }
 
-/// A queue group's value, the names of its topic's path and whether its
-/// members are responders. The names tell the mounts of a tree apart, and
-/// leave out parameters, so a group spans `user.id(alice)` and `user.id()`.
-type GroupId = (GroupKey, Box<[&'static str]>, bool);
+/// A watched subscription that came or went, with the keys of its path.
+#[cfg(feature = "bridge")]
+pub(crate) enum Change {
+    Added(Arc<[Key]>),
+    Removed(Arc<[Key]>),
+}
+
+#[cfg(feature = "bridge")]
+impl State {
+    /// Tell the watchers, forgetting those that are gone. Under the lock, so
+    /// changes reach them in order. No user code runs: the keys are shared
+    /// with the subscription.
+    fn tell(&mut self, change: impl Fn() -> Change) {
+        self.watchers
+            .retain(|watcher| watcher.unbounded_send(change()).is_ok());
+    }
+}
+
+/// A queue group's value, the segment ids of its topic's path and whether its
+/// members are responders. The ids tell the mounts of a tree apart, and leave
+/// out parameters, so a group spans `user.id(alice)` and `user.id(Wild)`.
+type GroupId = (GroupKey, Box<[u32]>, bool);
 
 fn group_id(key: &GroupKey, path: &[Key], responder: bool) -> GroupId {
-    let names = path.iter().map(|key| key.name).collect();
-    (key.clone(), names, responder)
+    let ids = path.iter().map(|key| key.id).collect();
+    (key.clone(), ids, responder)
 }
 
 /// An event to deliver once there is room: in its subscriber's full buffer,
@@ -743,22 +1017,6 @@ impl Bus {
         delivered + Self::deliver_waiting(waiting).await
     }
 
-    /// `deliver` without waiting: a full `Overflow::Wait` buffer drops the
-    /// event, as with `DropNewest`. In a queue group, the first such member
-    /// counts it.
-    pub(crate) fn deliver_now(&self, event: Event) -> usize {
-        let none = || unreachable!("publishing reaches no responder");
-        let (delivered, waiting) = self.try_deliver::<false>(&event, &none);
-        for Waiting { buffers, .. } in &waiting {
-            buffers[0].dropped.fetch_add(1, Ordering::Relaxed);
-            debug!(
-                subject = %Subject(&*event),
-                "buffer full, dropped the message instead of waiting"
-            );
-        }
-        delivered
-    }
-
     /// Deliver a request: `shared` to subscribers, and an event built by
     /// `respond` to each responder. Returns how many responders it reached,
     /// including those whose full buffer dropped it.
@@ -768,6 +1026,59 @@ impl Bus {
             return delivered;
         }
         delivered + Self::deliver_waiting(waiting).await
+    }
+
+    /// Deliver published events that share one subject: the trie is walked
+    /// once, and each buffer takes its events under one lock. Returns how many
+    /// deliveries were made.
+    pub(crate) async fn deliver_many(&self, events: &[Event]) -> usize {
+        let (delivered, waiting) = self.try_deliver_many(events);
+        if waiting.is_empty() {
+            return delivered;
+        }
+        delivered + Self::deliver_waiting(waiting).await
+    }
+
+    /// `try_deliver` for events that share one subject. Queue groups pick a
+    /// member per event.
+    fn try_deliver_many(&self, events: &[Event]) -> (usize, Vec<Waiting>) {
+        let Some(first) = events.first() else {
+            return (0, Vec::new());
+        };
+        let interest = self.interest.load();
+        let segs = first.path();
+        let mut delivered = 0;
+        let mut waiting = Vec::new();
+        let mut full = Vec::new();
+        let mut groups: SmallVec<[&Members; 4]> = SmallVec::new();
+        interest.visit(segs, &mut |node| {
+            node.subs.each(|sub| {
+                let accepted = (events.iter())
+                    .filter(|event| sub.accepts(&***event, segs))
+                    .cloned();
+                delivered += sub.buffer.push_many(accepted, &mut full);
+                waiting.extend(full.drain(..).map(|event| Waiting {
+                    buffers: SmallVec::from_buf([sub.buffer.clone()]),
+                    event,
+                    counts: true,
+                }));
+            });
+            groups.extend(&node.groups);
+        });
+        let none = || unreachable!("publishing reaches no responder");
+        if !groups.is_empty() {
+            for event in events {
+                delivered += deliver_to_groups::<false>(&groups, event, segs, &none, &mut waiting);
+            }
+        }
+        trace!(
+            subject = %Subject(first.path()),
+            messages = events.len(),
+            delivered,
+            waiting = waiting.len(),
+            "publish"
+        );
+        (delivered, waiting)
     }
 
     /// Wait for room in each full `Overflow::Wait` buffer. Kept out of
@@ -806,50 +1117,14 @@ impl Bus {
         let interest = self.interest.load();
         let mut delivered = 0;
         let mut waiting = Vec::new();
-        // A responder gets its own event, and counts only for a request; a
-        // subscriber gets `event`, and counts only when publishing
-        let mut push = |waiting: &mut Vec<Waiting>, sub: &Sub, responder: bool| {
-            let (pushed, counts) = if REQUEST && responder {
-                (respond(), true)
-            } else {
-                (event.clone(), !REQUEST)
-            };
-            match sub.buffer.try_push::<true>(pushed) {
-                Push::Delivered => delivered += usize::from(counts),
-                Push::Evicted => {
-                    debug!(
-                        subscription = sub.id,
-                        subject = %Subject(&**event),
-                        "buffer full, dropped the oldest message"
-                    );
-                    delivered += usize::from(counts);
-                }
-                Push::Full(pushed) => waiting.push(Waiting {
-                    buffers: SmallVec::from_buf([sub.buffer.clone()]),
-                    event: pushed,
-                    counts,
-                }),
-                Push::Dropped => {
-                    debug!(
-                        subscription = sub.id,
-                        subject = %Subject(&**event),
-                        "buffer full, dropped the message"
-                    );
-                    // A responder was there: the requester sees `NoReply`, not
-                    // `NoResponders`, once its token is gone
-                    delivered += usize::from(REQUEST && counts);
-                }
-                Push::Closed => {}
-            }
-        };
-
         // The trie matches the subject exactly; matchers only run filters
-        let any = &**event as &dyn Any;
+        let any = &**event;
+        let segs = event.path();
         let mut groups: SmallVec<[&Members; 4]> = SmallVec::new();
-        interest.visit(Some(&**event), &mut |node| {
+        interest.visit(segs, &mut |node| {
             node.subs.each(|sub| {
-                if sub.accepts(any) {
-                    push(&mut waiting, sub, false);
+                if sub.accepts(any, segs) {
+                    delivered += push_to::<REQUEST>(sub, false, event, respond, &mut waiting);
                 }
             });
             if !node.groups.is_empty() {
@@ -857,57 +1132,18 @@ impl Bus {
             }
             if REQUEST {
                 node.responders.each(|sub| {
-                    if sub.accepts(any) {
-                        push(&mut waiting, sub, true);
+                    if sub.accepts(any, segs) {
+                        delivered += push_to::<REQUEST>(sub, true, event, respond, &mut waiting);
                     }
                 });
                 groups.extend(&node.responder_groups);
             }
         });
-
-        // One member per queue group. A group usually sits on one trie node; members
-        // spread over several trie nodes of the subject are merged in subscription order
-        let mut group_delivered = 0;
-        for (i, members) in groups.iter().enumerate() {
-            let same = |m: &&Members| Arc::ptr_eq(&m.turn, &members.turn);
-            if groups[..i].iter().any(same) {
-                continue;
-            }
-            // Only requests reach responder groups
-            let responders = REQUEST && members.responder;
-            let pushed = || if responders { respond() } else { event.clone() };
-            let merged = groups[i + 1..].iter().any(same);
-            let member = match members.subs.chunks.as_slice() {
-                [subs] if !merged => {
-                    let subs: &[Arc<Sub>] = subs;
-                    pick(&members.turn, subs.len(), |i| &subs[i], event, pushed)
-                }
-                // Over several trie nodes, or more than one chunk on this one
-                _ => {
-                    let mut all: Vec<&Sub> = (groups[i..].iter().filter(|m| same(m)))
-                        .flat_map(|m| m.subs.iter())
-                        .collect();
-                    if merged {
-                        all.sort_unstable_by_key(|sub| sub.id);
-                    }
-                    pick(&members.turn, all.len(), |i| all[i], event, pushed)
-                }
-            };
-            let counts = responders || !REQUEST;
-            match member {
-                Picked::Delivered => group_delivered += usize::from(counts),
-                Picked::Member(member) => push(&mut waiting, member, responders),
-                Picked::Wait(subs) => waiting.push(Waiting {
-                    buffers: subs.iter().map(|sub| sub.buffer.clone()).collect(),
-                    event: pushed(),
-                    counts,
-                }),
-                Picked::None => {}
-            }
+        if !groups.is_empty() {
+            delivered += deliver_to_groups::<REQUEST>(&groups, event, segs, respond, &mut waiting);
         }
-        delivered += group_delivered;
         trace!(
-            subject = %Subject(&**event),
+            subject = %Subject(event.path()),
             delivered,
             waiting = waiting.len(),
             "publish"
@@ -915,12 +1151,15 @@ impl Bus {
         (delivered, waiting)
     }
 
+    /// Register a subscription on `path`. Watchers hear about it if `watched`.
+    #[cfg_attr(not(feature = "bridge"), allow(unused_variables))]
     pub(crate) fn subscribe(
         &self,
-        path: &[Key],
+        path: &Arc<[Key]>,
         matcher: Option<Matcher>,
         group_key: Option<&GroupKey>,
         responder: bool,
+        watched: bool,
         buffer: Arc<Buffer>,
     ) -> u64 {
         let mut state = lock(&self.state);
@@ -934,10 +1173,18 @@ impl Bus {
         });
         #[cfg(feature = "tracing")]
         let filtered = matcher.is_some();
+        #[cfg(feature = "bridge")]
+        let watched = watched.then(|| path.clone());
+        #[cfg(feature = "bridge")]
+        if let Some(path) = &watched {
+            state.tell(|| Change::Added(path.clone()));
+        }
         let sub = Arc::new(Sub {
             id,
             matcher,
             buffer,
+            #[cfg(feature = "bridge")]
+            watched,
         });
         let mut interest = self.interest.load_full();
         interest.insert(path, sub, responder, turn);
@@ -956,15 +1203,21 @@ impl Bus {
         id
     }
 
+    #[cfg_attr(not(feature = "bridge"), allow(unused_variables))]
     pub(crate) fn unsubscribe(
         &self,
-        path: &[Key],
+        path: &Arc<[Key]>,
         id: u64,
         group: Option<&GroupKey>,
         responder: bool,
+        watched: bool,
     ) {
         // Writers are serialized by `state`, so no update is lost
         let mut state = lock(&self.state);
+        #[cfg(feature = "bridge")]
+        if watched {
+            state.tell(|| Change::Removed(path.clone()));
+        }
         let mut forgotten = None;
         if let Some(key) = group {
             let key = group_id(key, path, responder);
@@ -986,10 +1239,30 @@ impl Bus {
         debug!(subscription = id, pattern = %Pattern(path), "unsubscribe");
     }
 
+    /// The watched subscriptions, then every change to them, until the bus
+    /// closes.
+    #[cfg(feature = "bridge")]
+    pub(crate) fn watch(&self) -> mpsc::UnboundedReceiver<Change> {
+        let (tx, rx) = mpsc::unbounded();
+        let mut state = lock(&self.state);
+        self.interest.load().for_each_sub(&mut |sub| {
+            if let Some(path) = &sub.watched {
+                // The receiver is right here: this can't fail
+                let _ = tx.unbounded_send(Change::Added(path.clone()));
+            }
+        });
+        state.watchers.push(tx);
+        rx
+    }
+
     /// The last channel is gone, so nothing can publish or subscribe anymore:
     /// every subscription ends once it has read its buffer.
     pub(crate) fn close(&self) {
-        let state = lock(&self.state);
+        #[cfg_attr(not(feature = "bridge"), allow(unused_mut))]
+        let mut state = lock(&self.state);
+        // Their streams end
+        #[cfg(feature = "bridge")]
+        state.watchers.clear();
         let old = self.interest.swap(Arc::default());
         drop(state);
         old.for_each_sub(&mut |sub| sub.buffer.end());

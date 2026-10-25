@@ -32,5 +32,8 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --verbose
 
+      - name: Run tests with bridges
+        run: cargo test --workspace --features bridge --verbose
+
       - name: Run tests with tracing
         run: cargo test --features tracing --verbose

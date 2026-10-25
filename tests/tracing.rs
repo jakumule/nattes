@@ -3,7 +3,7 @@
 //! the scoped subscriber.
 #![cfg(feature = "tracing")]
 
-use nattes::{Channel, at, topics};
+use nattes::{Channel, Wild, topics};
 use std::fmt::Debug;
 use std::sync::{Arc, Mutex};
 use tracing::field::{Field, Visit};
@@ -19,6 +19,7 @@ topics! {
         user { id(u32) { delete: DeleteMsg } },
     }
 }
+use topics::prelude::*;
 
 /// Records every log record as `message field=value …`.
 #[derive(Clone, Default)]
@@ -58,12 +59,12 @@ fn logs_subscriptions_publishes_drops_and_close() {
     tracing::subscriber::with_default(recorder.clone(), || {
         futures::executor::block_on(async {
             let bus = Channel::<topics::Topic>::new();
-            let sub = at!(bus, user.id().delete).subscribe().buffer(1).await;
-            let group = at!(bus, git.push)
+            let sub = bus.user().id(Wild).delete().subscribe().buffer(1).await;
+            let group = bus.git().push()
                 .subscribe()
                 .queue(topics::git::PushQueue::Workers)
                 .await;
-            let deletes = at!(bus, user.id(7).delete);
+            let deletes = bus.user().id(7).delete();
             deletes.publish(DeleteMsg).await;
             deletes.publish(DeleteMsg).await;
             drop(sub);

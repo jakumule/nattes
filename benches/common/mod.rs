@@ -1,6 +1,6 @@
 //! Tree and helpers shared by the benchmarks.
 
-use nattes::{Subscription, SubscriptionBuilder, topics};
+use nattes::{Subscription, SubscriptionBuilder, Topic, topics};
 use std::future::IntoFuture;
 
 // `throughput` never reads the value
@@ -16,8 +16,6 @@ topics! {
 }
 
 /// Subscribing is immediate: no need to await it outside the measured part.
-pub fn start<T: 'static, P: 'static, S>(
-    builder: SubscriptionBuilder<T, P, S>,
-) -> Subscription<T, P> {
+pub fn start<T: Topic, P: 'static>(builder: SubscriptionBuilder<T, P>) -> Subscription<T, P> {
     builder.into_future().into_inner()
 }

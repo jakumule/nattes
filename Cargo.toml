@@ -29,6 +29,7 @@ keywords = ["message-queue", "nats"]
 nattes-macros = { path = "macros", version = "0.2.1" }
 
 futures = "0.3"
+bytes = { version = "1", optional = true }
 arc-swap = "1"
 smallvec = "1"
 thiserror = "2"
@@ -38,13 +39,23 @@ tracing = { version = "0.1", default-features = false, features = ["std"], optio
 [features]
 # Log subscriptions, publishes and lost messages with `tracing`
 tracing = ["dep:tracing"]
+# Bridges: extend a bus over a byte transport (`Bridge`, `Codec`, `Wire`)
+bridge = ["dep:bytes", "nattes-macros/bridge"]
 
 [dev-dependencies]
-tokio = { version = "1.42.0", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio = { version = "1.42.0", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
+tokio-util = { version = "0.7", features = ["codec"] }
 anyhow = "1.0.94"
 uuid = { version = "1.11.0", features = ["v7"] }
 criterion = { version = "0.8.2", features = ["async_tokio"] }
 gungraun = "0.20.0"
+
+[[test]]
+name = "bridge"
+required-features = ["bridge"]
+
+[package.metadata.docs.rs]
+all-features = true
 
 [[bench]]
 name = "throughput"

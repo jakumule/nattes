@@ -1,13 +1,14 @@
 //! Typesafe subject-based message queue inspired by NATS.
 //!
 //! Declare the tree with [`topics!`](crate::topics), then walk down it with
-//! [`at!`](crate::at) to get a [`Channel`] on any part of it. A channel
+//! the methods it generates to get a [`Channel`] on any part of it. A channel
 //! is a bus rooted at that part: hand a `Channel<topics::git::Topic>` to a
 //! component and it publishes and subscribes relative to `git`.
 //!
 //! ```
 //! use futures::StreamExt;
-//! use nattes::{at, topics, Channel};
+//! use nattes::{topics, Channel, Wild};
+//! use topics::prelude::*;
 //!
 //! pub struct PushMsg;
 //! pub struct DeleteMsg;
@@ -22,17 +23,18 @@
 //! # fn main() {
 //! # futures::executor::block_on(async {
 //! let bus = Channel::<topics::Topic>::new();
-//! let git = at!(bus, git);                    // git
-//! let pushes = at!(bus, git.push);            // git.push
-//! let alice_deletes = at!(bus, user.id(7).delete); // user.7.delete
+//! let git = bus.git();                            // git
+//! let pushes = bus.git().push();                  // git.push
+//! let alice_deletes = bus.user().id(7).delete();  // user.id.7.delete
 //!
-//! let mut git_sub = git.subscribe().await;                  // git.>
-//! let mut deletes = at!(bus, user.id().delete).subscribe().await; // user.*.delete
+//! let mut git_sub = git.subscribe().await;                           // git.>
+//! let mut deletes = bus.user().id(Wild).delete().subscribe().await;  // user.id.*.delete
 //!
 //! pushes.publish(PushMsg).await;
 //! alice_deletes.publish(DeleteMsg).await;
 //!
-//! assert!(matches!(*git_sub.next().await.unwrap(), topics::git::Topic::Push(_)));
+//! let msg = git_sub.next().await.unwrap();
+//! assert!(matches!(msg.view(), topics::git::TopicRef::Push(_)));
 //! assert_eq!(deletes.next().await.unwrap().params(), (7,));
 //! # });
 //! # }
@@ -41,37 +43,53 @@
 //! A channel with a wildcard can't publish:
 //!
 //! ```compile_fail,E0599
-//! # use nattes::{at, topics, Channel};
+//! # use nattes::{topics, Channel, Wild};
 //! # pub struct DeleteMsg;
 //! # topics! { topics { user { id(u32) { delete: DeleteMsg } } } }
+//! # use topics::prelude::*;
 //! # async fn f() {
 //! let bus = Channel::<topics::Topic>::new();
-//! at!(bus, user.id().delete).publish(DeleteMsg).await;
+//! bus.user().id(Wild).delete().publish(DeleteMsg).await;
 //! # }
 //! # fn main() {}
 //! ```
 //!
-//! not even without waiting:
+//! nor can a level, which only subscribes:
+//!
+//! ```compile_fail,E0277
+//! # use nattes::{topics, Channel};
+//! # pub struct PushMsg;
+//! # topics! { topics { git { push: PushMsg } } }
+//! # use topics::prelude::*;
+//! # async fn f() {
+//! let bus = Channel::<topics::Topic>::new();
+//! bus.git().publish(PushMsg).await;
+//! # }
+//! # fn main() {}
+//! ```
+//!
+//! each path must start where the channel is:
 //!
 //! ```compile_fail,E0599
-//! # use nattes::{at, topics, Channel};
-//! # pub struct DeleteMsg;
-//! # topics! { topics { user { id(u32) { delete: DeleteMsg } } } }
+//! # use nattes::{topics, Channel};
+//! # pub struct PushMsg;
+//! # topics! { topics { git { push: PushMsg }, user { new: PushMsg } } }
+//! # use topics::prelude::*;
 //! # fn main() {
-//! let bus = Channel::<topics::Topic>::new();
-//! at!(bus, user.id().delete).try_publish(DeleteMsg);
+//! let users = Channel::<topics::Topic>::new().user();
+//! users.git();
 //! # }
 //! ```
 //!
-//! and each path must start where the channel is:
+//! and a parameter takes a value of its type, or [`Wild`]:
 //!
-//! ```compile_fail,E0599
-//! # use nattes::{at, topics, Channel};
-//! # pub struct PushMsg;
-//! # topics! { topics { git { push: PushMsg }, user { new: PushMsg } } }
+//! ```compile_fail,E0277
+//! # use nattes::{topics, Channel};
+//! # pub struct DeleteMsg;
+//! # topics! { topics { user { id(u32) { delete: DeleteMsg } } } }
+//! # use topics::prelude::*;
 //! # fn main() {
-//! let users = at!(Channel::<topics::Topic>::new(), user);
-//! at!(users, git.push);
+//! Channel::<topics::Topic>::new().user().id("alice");
 //! # }
 //! ```
 //!
@@ -94,12 +112,22 @@
 //! # fn main() {}
 //! ```
 //!
-//! Queue groups are declared on a topic, with `[ … ]` right after its name:
-//! `git [Mailer] { … }`, `push [Indexer(u32)]: Msg`. Each value is a group, so
-//! `Indexer(0)` and `Indexer(1)` are two groups:
+//! and can't be a method of [`Channel`]:
+//!
+//! ```compile_fail
+//! # use nattes::topics;
+//! # pub struct Msg;
+//! topics! { topics { subscribe: Msg } }
+//! # fn main() {}
+//! ```
+//!
+//! Queue groups are declared on a topic, with `[ … ]` right after its name and
+//! parameter: `git [Mailer] { … }`, `push [Indexer(u32)]: Msg`. Each message
+//! goes to one member per group, and each value is a group, so `Indexer(0)`
+//! and `Indexer(1)` are two groups:
 //!
 //! ```
-//! # use nattes::{at, topics, Channel};
+//! # use nattes::{topics, Channel};
 //! # pub struct PushMsg;
 //! topics! {
 //!     topics {
@@ -109,15 +137,16 @@
 //!     }
 //! }
 //! use topics::git::{PushQueue, Queue};
+//! use topics::prelude::*;
 //!
 //! # fn main() {
 //! # futures::executor::block_on(async {
 //! let bus = Channel::<topics::Topic>::new();
-//! let pushes = at!(bus, git.push);
+//! let pushes = bus.git().push();
 //! let _a = pushes.subscribe().queue(PushQueue::Indexer(0)).await;
 //! let _b = pushes.subscribe().queue(PushQueue::Indexer(0)).await;
 //! let _c = pushes.subscribe().queue(PushQueue::Indexer(1)).await;
-//! let _m = at!(bus, git).subscribe().queue(Queue::Mailer).await; // git.>
+//! let _m = bus.git().subscribe().queue(Queue::Mailer).await; // git.>
 //!
 //! // one of _a and _b, _c, and _m
 //! assert_eq!(pushes.publish(PushMsg).await, 3);
@@ -125,42 +154,44 @@
 //! # }
 //! ```
 //!
-//! A group can only be joined on the topic that declares it, not above or
-//! below:
+//! A group is joined on the topic that declares it, not above or below:
 //!
 //! ```compile_fail,E0277
-//! # use nattes::{at, topics, Channel};
+//! # use nattes::{topics, Channel};
 //! # pub struct PushMsg;
 //! # topics! { topics { git [Mailer] { push: PushMsg } } }
+//! # use topics::prelude::*;
 //! # async fn f() {
 //! let bus = Channel::<topics::Topic>::new();
-//! at!(bus, git.push).subscribe().queue(topics::git::Queue::Mailer).await;
+//! bus.git().push().subscribe().queue(topics::git::Queue::Mailer).await;
 //! # }
 //! # fn main() {}
 //! ```
 //!
-//! and groups must be declared, not named with a string:
+//! groups are declared, not named with a string:
 //!
 //! ```compile_fail,E0277
-//! # use nattes::{at, topics, Channel};
+//! # use nattes::{topics, Channel};
 //! # pub struct PushMsg;
 //! # topics! { topics { git { push: PushMsg } } }
+//! # use topics::prelude::*;
 //! # async fn f() {
 //! let bus = Channel::<topics::Topic>::new();
-//! at!(bus, git.push).subscribe().queue("workers").await;
+//! bus.git().push().subscribe().queue("workers").await;
 //! # }
 //! # fn main() {}
 //! ```
 //!
-//! Their values are typed like parameters:
+//! and their values are typed like parameters:
 //!
 //! ```compile_fail,E0308
-//! # use nattes::{at, topics, Channel};
+//! # use nattes::{topics, Channel};
 //! # pub struct PushMsg;
 //! # topics! { topics { git { push [Indexer(u32)]: PushMsg } } }
+//! # use topics::prelude::*;
 //! # async fn f() {
 //! let bus = Channel::<topics::Topic>::new();
-//! at!(bus, git.push).subscribe().queue(topics::git::PushQueue::Indexer("0")).await;
+//! bus.git().push().subscribe().queue(topics::git::PushQueue::Indexer("0")).await;
 //! # }
 //! # fn main() {}
 //! ```
@@ -170,16 +201,17 @@
 //!
 //! ```
 //! # use futures::StreamExt;
-//! # use nattes::{at, topics, Channel};
+//! # use nattes::{topics, Channel};
 //! pub struct FetchMsg(pub String);
 //! pub struct FetchAck(pub usize);
 //!
 //! topics! { topics { git { fetch: FetchMsg => FetchAck } } }
+//! use topics::prelude::*;
 //!
 //! # fn main() {
 //! # futures::executor::block_on(async {
 //! let bus = Channel::<topics::Topic>::new();
-//! let fetches = at!(bus, git.fetch);
+//! let fetches = bus.git().fetch();
 //! let mut responder = fetches.respond().await;
 //! let answer = async {
 //!     let request = responder.next().await.unwrap(); // derefs to `FetchMsg`
@@ -195,12 +227,13 @@
 //! Other leaves take no requests:
 //!
 //! ```compile_fail,E0599
-//! # use nattes::{at, topics, Channel};
+//! # use nattes::{topics, Channel};
 //! # pub struct PushMsg;
 //! # topics! { topics { git { push: PushMsg } } }
+//! # use topics::prelude::*;
 //! # async fn f() {
 //! let bus = Channel::<topics::Topic>::new();
-//! at!(bus, git.push).request(PushMsg).await;
+//! bus.git().push().request(PushMsg).await;
 //! # }
 //! # fn main() {}
 //! ```
@@ -208,12 +241,13 @@
 //! and have no responders:
 //!
 //! ```compile_fail,E0277
-//! # use nattes::{at, topics, Channel};
+//! # use nattes::{topics, Channel};
 //! # pub struct PushMsg;
 //! # topics! { topics { git { push: PushMsg } } }
+//! # use topics::prelude::*;
 //! # async fn f() {
 //! let bus = Channel::<topics::Topic>::new();
-//! at!(bus, git.push).respond().await;
+//! bus.git().push().respond().await;
 //! # }
 //! # fn main() {}
 //! ```
@@ -221,41 +255,30 @@
 //! A request leaf takes requests only, so it can't publish:
 //!
 //! ```compile_fail,E0277
-//! # use nattes::{at, topics, Channel};
+//! # use nattes::{topics, Channel};
 //! # pub struct FetchMsg;
 //! # pub struct FetchAck;
 //! # topics! { topics { git { fetch: FetchMsg => FetchAck } } }
+//! # use topics::prelude::*;
 //! # async fn f() {
 //! let bus = Channel::<topics::Topic>::new();
-//! at!(bus, git.fetch).publish(FetchMsg).await;
+//! bus.git().fetch().publish(FetchMsg).await;
 //! # }
 //! # fn main() {}
-//! ```
-//!
-//! nor `try_publish`:
-//!
-//! ```compile_fail,E0277
-//! # use nattes::{at, topics, Channel};
-//! # pub struct FetchMsg;
-//! # pub struct FetchAck;
-//! # topics! { topics { git { fetch: FetchMsg => FetchAck } } }
-//! # fn main() {
-//! let bus = Channel::<topics::Topic>::new();
-//! at!(bus, git.fetch).try_publish(FetchMsg);
-//! # }
 //! ```
 //!
 //! A responder answers a request once:
 //!
 //! ```compile_fail,E0382
 //! # use futures::StreamExt;
-//! # use nattes::{at, topics, Channel};
+//! # use nattes::{topics, Channel};
 //! # pub struct FetchMsg;
 //! # pub struct FetchAck;
 //! # topics! { topics { git { fetch: FetchMsg => FetchAck } } }
+//! # use topics::prelude::*;
 //! # async fn f() {
 //! let bus = Channel::<topics::Topic>::new();
-//! let mut responder = at!(bus, git.fetch).respond().await;
+//! let mut responder = bus.git().fetch().respond().await;
 //! let request = responder.next().await.unwrap();
 //! request.respond(FetchAck);
 //! request.respond(FetchAck);
@@ -267,13 +290,14 @@
 //!
 //! ```compile_fail,E0599
 //! # use futures::StreamExt;
-//! # use nattes::{at, topics, Channel};
+//! # use nattes::{topics, Channel};
 //! # pub struct FetchMsg;
 //! # pub struct FetchAck;
 //! # topics! { topics { git { fetch: FetchMsg => FetchAck } } }
+//! # use topics::prelude::*;
 //! # async fn f() {
 //! let bus = Channel::<topics::Topic>::new();
-//! let mut sub = at!(bus, git.fetch).subscribe().await;
+//! let mut sub = bus.git().fetch().subscribe().await;
 //! sub.next().await.unwrap().respond(FetchAck);
 //! # }
 //! # fn main() {}
@@ -293,21 +317,19 @@
 //! Delivery is **at most once**, in memory. A message only lives in subscriber
 //! buffers: nothing is persisted, acknowledged or redelivered. "Delivered" means
 //! pushed into a subscription's buffer, not handled. This holds for
-//! [`publish`](Channel::publish), [`try_publish`](Channel::try_publish),
-//! [`request`](Channel::request) and [`scatter`](Channel::scatter):
+//! [`publish`](Channel::publish), [`request`](Channel::request) and
+//! [`scatter`](Channel::scatter):
 //!
-//! - Nothing is sent until the returned future is polled; `try_publish` sends
-//!   when called.
+//! - Nothing is sent until the returned future is polled.
 //! - The message goes to every subscription that matches the subject and whose
 //!   filters accept it, and to one member per queue group. A subscription counts
 //!   once its [`SubscriptionBuilder`] has been awaited. Earlier messages are
 //!   not replayed. Responders ([`Responder`]) are subscriptions that only get
 //!   requests, with their own reply token.
 //! - A message is lost for a subscriber when:
-//!   - its buffer is full with [`Overflow::DropNewest`] or [`Overflow::DropOldest`],
-//!     or with [`Overflow::Wait`] on `try_publish`. In a queue group, only when
-//!     every member's buffer is full and none of them has [`Overflow::Wait`] (or
-//!     on `try_publish`): the message goes to a member with room first;
+//!   - its buffer is full with [`Overflow::DropNewest`] or [`Overflow::DropOldest`].
+//!     In a queue group, only when every member's buffer is full and none of
+//!     them has [`Overflow::Wait`]: the message goes to a member with room first;
 //!   - one of its filters rejects the message or panics;
 //!   - it drops the [`Subscription`] or [`Responder`] before reading the
 //!     message;
@@ -318,8 +340,11 @@
 //!   Concurrent publishers have no common order, and members of a queue group
 //!   can handle consecutive messages in any order.
 
+#[cfg(feature = "bridge")]
+mod bridge;
 mod bus;
 mod channel;
+mod event;
 mod group;
 mod log;
 mod macros;
@@ -329,18 +354,31 @@ mod subscription;
 #[cfg(test)]
 mod tests;
 mod tree;
+#[cfg(feature = "bridge")]
+mod wire;
 
+#[cfg(feature = "bridge")]
+pub use bridge::{Bridge, BridgeError, FRAME_VERSION};
 pub use bus::{DEFAULT_BUFFER, Overflow};
-pub use channel::{Channel, Publish};
+pub use channel::Channel;
+#[doc(hidden)]
+pub use event::{Envelope, Event};
 pub use group::{InScope, QueueGroup};
 #[doc(hidden)]
-pub use nav::{Append, AppendParams, ParamStep, Plain, Prism};
-pub use nav::{IntoChannel, Is, Navigable, Param, Wild};
-pub use request::{Answer, BusError, Incoming, Replies, ReplyToken};
-pub use subscription::{Msg, Respond, Responder, Subscribe, Subscription, SubscriptionBuilder};
+pub use nav::{Append, AppendParams, Node, Path, Seg, SegInfo};
+pub use nav::{Param, Params, Wild};
+pub use request::{BusError, Incoming, Replies, ReplyToken};
+pub use subscription::{
+    Handler, Msg, Respond, Responder, Subscribe, Subscription, SubscriptionBuilder,
+};
 #[doc(hidden)]
-pub use tree::Step;
-pub use tree::{Level, ParamValue, subject};
+pub use tree::{DynValue, __param, __payload};
+pub use tree::{Leaf, Level, ParamValue, Publish, Request, Topic};
+#[cfg(feature = "bridge")]
+pub use wire::{Codec, CodecError, Wire};
+#[cfg(feature = "bridge")]
+#[doc(hidden)]
+pub use wire::{WireError, __decode_leaf, __decode_param, __encode_leaf, __encode_param};
 
 #[doc(hidden)]
 pub use nattes_macros::topics as __topics;

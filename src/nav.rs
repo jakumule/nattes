@@ -1,145 +1,186 @@
-//! Navigation: one step down the tree.
+//! Navigation: the path of a channel, one segment per step down the tree.
+//!
+//! A channel holds a [`Node`]: its whole path, flat, a few segments of two
+//! words whose parameter values are shared. A step copies its parent's
+//! segments and adds one, and an event holds the node of the channel it was
+//! published on, which gives its subject. So publishing on a channel allocates
+//! only the event, and the subscriber that drops it last frees at most one
+//! node. Measured against the alternatives: nodes linked to their parent (the
+//! subscriber then freed a channel's chain across threads, −10% throughput on
+//! `routing`); an event copying the path (+27% instructions to publish on a
+//! reused channel, 3× on `publish_many`); a copy for the first event then a
+//! shared one (in between on both, more code).
 
-use crate::Channel;
 use crate::ParamValue;
 use crate::tree::Escaped;
+use smallvec::SmallVec;
+use std::any::Any;
 use std::borrow::Borrow;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-/// One step from `A` down to a child `B`.
-///
-/// A prism rather than a lens: `project` can miss, since `A` is an enum. A
-/// wildcard step can't `inject`: there is no value to fill the `*` with.
-///
-/// Steps are plain values (`fn` pointers and the selected parameter), not
-/// closures: walking down with [`at!`](crate::at) costs one allocation
-/// per step, in [`Channel::step`], and the [`Key`] is only built when
-/// someone subscribes. That keeps `at!(bus, user.id(x).delete).publish(..)`
-/// cheap.
+/// One segment of a path: a topic's segment id and name and, on a fixed
+/// parameter, its value.
+/// A topic as segments name it: its segment id and name. `topics!` makes one
+/// static per topic, so a segment is two words.
 #[doc(hidden)]
-pub trait Prism<A>: Send + Sync + 'static {
-    type B: 'static;
-    /// `()` for a fixed step, `(X,)` for a wildcard parameter.
-    type Q: 'static;
-    /// The `B` inside an `A`, or `None` if `A` is another variant (or another
-    /// value for a fixed parameter).
-    fn project<'a>(&self, a: &'a A) -> Option<(Self::Q, &'a Self::B)>;
-    /// `project` by value, without the params: the `B` moved out of an `A`.
-    fn project_owned(&self, a: A) -> Option<Self::B>;
-    /// Wrap a `B` into its `A` variant; `None` on a wildcard step.
-    fn inject(&self, b: Self::B) -> Option<A>;
-    /// Key of this step in the interest trie.
-    fn key(&self) -> Key;
-}
-
-/// Step without a parameter.
-#[doc(hidden)]
-pub struct Plain<A, B> {
+pub struct SegInfo {
+    id: u32,
     name: &'static str,
-    project: for<'a> fn(&'a A) -> Option<&'a B>,
-    project_owned: fn(A) -> Option<B>,
-    inject: fn(B) -> A,
 }
 
-impl<A, B> Plain<A, B> {
-    pub fn new(
-        name: &'static str,
-        project: for<'a> fn(&'a A) -> Option<&'a B>,
-        project_owned: fn(A) -> Option<B>,
-        inject: fn(B) -> A,
-    ) -> Self {
-        Self {
-            name,
-            project,
-            project_owned,
-            inject,
-        }
+impl SegInfo {
+    #[doc(hidden)]
+    pub const fn new(id: u32, name: &'static str) -> Self {
+        Self { id, name }
     }
 }
 
-impl<A: 'static, B: 'static> Prism<A> for Plain<A, B> {
-    type B = B;
-    type Q = ();
-    fn project<'a>(&self, a: &'a A) -> Option<((), &'a B)> {
-        (self.project)(a).map(|b| ((), b))
-    }
-    fn project_owned(&self, a: A) -> Option<B> {
-        (self.project_owned)(a)
-    }
-    fn inject(&self, b: B) -> Option<A> {
-        Some((self.inject)(b))
-    }
-    fn key(&self) -> Key {
-        Key {
-            name: self.name,
-            param: KeyParam::None,
-        }
-    }
-}
-
-/// Step through a parameter, selected by `S`: [`Wild`] or [`Is`].
 #[doc(hidden)]
-pub struct ParamStep<A, V, B, S> {
-    name: &'static str,
-    select: S,
-    project: for<'a> fn(&'a A) -> Option<(&'a V, &'a B)>,
-    project_owned: fn(A) -> Option<(V, B)>,
-    inject: fn(V, B) -> A,
+#[derive(Clone)]
+pub struct Seg {
+    info: &'static SegInfo,
+    value: Option<Arc<dyn ParamValue>>,
 }
 
-impl<A, V, B, S> ParamStep<A, V, B, S> {
-    pub fn new(
-        name: &'static str,
-        select: S,
-        project: for<'a> fn(&'a A) -> Option<(&'a V, &'a B)>,
-        project_owned: fn(A) -> Option<(V, B)>,
-        inject: fn(V, B) -> A,
-    ) -> Self {
-        Self {
-            name,
-            select,
-            project,
-            project_owned,
-            inject,
-        }
-    }
-}
-
-impl<A, V, B, S> Prism<A> for ParamStep<A, V, B, S>
-where
-    A: 'static,
-    V: 'static,
-    B: 'static,
-    S: Param<V>,
-{
-    type B = B;
-    type Q = S::Q;
-    fn project<'a>(&self, a: &'a A) -> Option<(S::Q, &'a B)> {
-        let (v, b) = (self.project)(a)?;
-        Some((self.select.select(v)?, b))
-    }
-    fn project_owned(&self, a: A) -> Option<B> {
-        let (v, b) = (self.project_owned)(a)?;
-        self.select.select(&v)?;
-        Some(b)
-    }
-    fn inject(&self, b: B) -> Option<A> {
-        Some((self.inject)(self.select.value()?, b))
-    }
-    fn key(&self) -> Key {
-        Key {
-            name: self.name,
-            param: self.select.key(),
-        }
-    }
-}
-
-/// A step as stored in the interest trie: the segment name and, on a parameter step,
-/// the value or `*`.
+/// The segments of a path, root first.
 #[doc(hidden)]
-#[derive(Clone, PartialEq, Eq, Hash)]
+pub type Path = SmallVec<[Seg; 4]>;
+
+impl Seg {
+    /// A segment without parameter value, for the code generated by
+    /// [`topics!`](crate::topics).
+    #[doc(hidden)]
+    pub fn plain(info: &'static SegInfo) -> Self {
+        Self { info, value: None }
+    }
+
+    /// A segment with its parameter value, for the code generated by
+    /// [`topics!`](crate::topics).
+    #[doc(hidden)]
+    pub fn fixed(info: &'static SegInfo, value: impl ParamValue) -> Self {
+        Self {
+            info,
+            value: Some(Arc::new(value)),
+        }
+    }
+
+    #[doc(hidden)]
+    #[inline]
+    pub fn id(&self) -> u32 {
+        self.info.id
+    }
+
+    pub(crate) fn name(&self) -> &'static str {
+        self.info.name
+    }
+
+    /// The parameter value, on a fixed parameter.
+    #[inline]
+    pub(crate) fn param(&self) -> Option<&dyn ParamValue> {
+        self.value.as_deref()
+    }
+}
+
+/// The path of a channel or the subject of an event: its segments, and which
+/// of them are wildcards (events have none).
+#[doc(hidden)]
+pub struct Node {
+    path: Path,
+    /// Bit `i` is set when segment `i` is a wildcard.
+    wild: u64,
+}
+
+impl Node {
+    /// The root: no segment.
+    pub(crate) fn root() -> Arc<Node> {
+        Self::subject(Path::new())
+    }
+
+    /// The subject `path`, of an event.
+    pub(crate) fn subject(path: Path) -> Arc<Node> {
+        Arc::new(Node { path, wild: 0 })
+    }
+
+    /// The path `self` and one more segment, a wildcard if `wild`.
+    pub(crate) fn step(&self, seg: Seg, wild: bool) -> Arc<Node> {
+        let depth = self.path.len();
+        assert!(!wild || depth < 64, "wildcards must be at most 64 segments deep");
+        let mut path = self.path.clone();
+        path.push(seg);
+        Arc::new(Node {
+            path,
+            wild: self.wild | (u64::from(wild) << depth),
+        })
+    }
+
+    /// The segments, root first.
+    #[inline]
+    pub(crate) fn segs(&self) -> &[Seg] {
+        &self.path
+    }
+
+    /// A copy of the segments, to extend.
+    #[cfg(feature = "bridge")]
+    pub(crate) fn to_path(&self) -> Path {
+        self.path.clone()
+    }
+
+    /// The keys of the path. Built on subscribe only.
+    pub(crate) fn keys(&self) -> Box<[Key]> {
+        (self.path.iter().enumerate())
+            .map(|(i, seg)| Key {
+                id: seg.info.id,
+                name: seg.info.name,
+                param: match &seg.value {
+                    _ if self.wild & (1 << i) != 0 => KeyParam::Wild,
+                    Some(value) => KeyParam::Is(ParamKey(value.clone())),
+                    None => KeyParam::None,
+                },
+            })
+            .collect()
+    }
+
+    /// The shape of the path, for the messages received on it.
+    pub(crate) fn shape(&self) -> Shape {
+        Shape {
+            depth: self.path.len() as u32,
+            wild: self.wild,
+        }
+    }
+}
+
+/// What a received message needs of its channel's path: its depth and where
+/// its wildcards are. Copied into every `Msg` instead of the path's `Arc`,
+/// whose count the publisher's thread touches too.
+#[derive(Clone, Copy)]
+pub(crate) struct Shape {
+    depth: u32,
+    /// Bit `i` is set when segment `i` is a wildcard.
+    wild: u64,
+}
+
+impl Shape {
+    pub(crate) fn depth(self) -> usize {
+        self.depth as usize
+    }
+
+    /// The params `P` of an event of subject `path`: its values where the
+    /// channel has wildcards.
+    pub(crate) fn params<P: Params>(self, path: &[Seg]) -> P {
+        let mut values = (path.iter().enumerate())
+            .filter(|(i, _)| self.wild & (1 << i) != 0)
+            .map(|(_, seg)| seg.param().expect("events have the parameter values of their topics"));
+        P::from_values(&mut values)
+    }
+}
+
+/// A step as stored in the interest trie: the segment id and, on a parameter
+/// step, the value or `*`. The name is kept for patterns.
+#[doc(hidden)]
+#[derive(Clone)]
 pub struct Key {
+    pub(crate) id: u32,
     pub(crate) name: &'static str,
     pub(crate) param: KeyParam,
 }
@@ -178,113 +219,90 @@ impl Borrow<dyn ParamValue> for ParamKey {
     }
 }
 
-/// Wildcard parameter (`*`): `id()` in [`at!`](crate::at).
+/// Wildcard parameter (`*`): `id(Wild)`. Its value then shows up in
+/// [`Msg::params`](crate::Msg::params), and the channel can't publish.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct Wild;
 
-/// Fixed parameter: `id(alice)` in [`at!`](crate::at).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Is<V>(pub V);
-
-/// Selects a parameter of type `V`: [`Wild`] or [`Is`].
+/// Selects a parameter of type `V`: a value of it (fixed) or [`Wild`].
 #[diagnostic::on_unimplemented(
     message = "`{Self}` can't select a `{V}` parameter",
-    label = "expected `_` or a `{V}` value"
+    label = "expected `Wild` or a `{V}` value"
 )]
 pub trait Param<V>: Sized + Send + Sync + 'static {
     /// Params the step adds to the channel: `(V,)` for a wildcard, `()` otherwise.
     type Q: 'static;
 
-    /// Params for the parameter value `v`, or `None` if `v` isn't selected.
     #[doc(hidden)]
-    fn select(&self, v: &V) -> Option<Self::Q>;
-
-    /// Value to publish with; `None` for a wildcard.
-    #[doc(hidden)]
-    fn value(&self) -> Option<V>;
-
-    #[doc(hidden)]
-    fn key(&self) -> KeyParam;
+    fn node(self, at: &Node, info: &'static SegInfo) -> Arc<Node>;
 }
 
 impl<V: Clone + Send + Sync + 'static> Param<V> for Wild {
     type Q = (V,);
-    fn select(&self, v: &V) -> Option<(V,)> {
-        Some((v.clone(),))
-    }
-    fn value(&self) -> Option<V> {
-        None
-    }
-    fn key(&self) -> KeyParam {
-        KeyParam::Wild
+    fn node(self, at: &Node, info: &'static SegInfo) -> Arc<Node> {
+        at.step(Seg::plain(info), true)
     }
 }
 
-impl<V: ParamValue + Clone + Eq> Param<V> for Is<V> {
+impl<V: ParamValue> Param<V> for V {
     type Q = ();
-    fn select(&self, v: &V) -> Option<()> {
-        (*v == self.0).then_some(())
-    }
-    fn value(&self) -> Option<V> {
-        Some(self.0.clone())
-    }
-    fn key(&self) -> KeyParam {
-        KeyParam::Is(ParamKey(Arc::new(self.0.clone())))
+    fn node(self, at: &Node, info: &'static SegInfo) -> Arc<Node> {
+        at.step(Seg::fixed(info, self), false)
     }
 }
 
-/// Implemented by every `Topic` enum generated with [`topics!`](crate::topics):
-/// links it to its navigation type, which has one method per child.
-pub trait Navigable: Sized + 'static {
-    type Steps<P: 'static>;
-    fn steps<P: 'static>(channel: Channel<Self, P>) -> Self::Steps<P>;
+/// Wildcard params: `()` or a tuple of up to 6 parameter types, read out of
+/// the subject of a message.
+pub trait Params: Sized + 'static {
+    #[doc(hidden)]
+    fn from_values(values: &mut dyn Iterator<Item = &dyn ParamValue>) -> Self;
 }
 
-/// What a [`at!`](crate::at) path can end on: a channel, or the navigation
-/// type of a level.
-pub trait IntoChannel {
-    type T;
-    type P;
-    type S;
-    fn into_channel(self) -> Channel<Self::T, Self::P, Self::S>;
+/// The next wildcard value, of type `V`.
+fn next_value<V: Clone + 'static>(values: &mut dyn Iterator<Item = &dyn ParamValue>) -> V {
+    let value: &dyn Any = values.next().expect("one value per wildcard").as_any();
+    value
+        .downcast_ref::<V>()
+        .expect("wildcard values have their parameter's type")
+        .clone()
 }
 
-impl<T, P, S> IntoChannel for Channel<T, P, S> {
-    type T = T;
-    type P = P;
-    type S = S;
-    fn into_channel(self) -> Self {
-        self
-    }
+macro_rules! impl_params {
+    ($($a:ident)*) => {
+        #[allow(unused_variables, clippy::unused_unit)]
+        impl<$($a: Clone + 'static,)*> Params for ($($a,)*) {
+            fn from_values(values: &mut dyn Iterator<Item = &dyn ParamValue>) -> Self {
+                ($(next_value::<$a>(values),)*)
+            }
+        }
+    };
 }
+impl_params!();
+impl_params!(A);
+impl_params!(A B);
+impl_params!(A B C);
+impl_params!(A B C D);
+impl_params!(A B C D E);
+impl_params!(A B C D E F);
 
 /// Append the wildcard params of one step to those collected so far.
 #[doc(hidden)]
 pub trait AppendParams<Q> {
-    type Out: 'static;
-    fn append_params(self, q: Q) -> Self::Out;
+    type Out: Params;
 }
 
 /// Params `P` followed by those of one more step `Q`.
 #[doc(hidden)]
 pub type Append<P, Q> = <P as AppendParams<Q>>::Out;
 
-impl<P: 'static> AppendParams<()> for P {
+impl<P: Params> AppendParams<()> for P {
     type Out = P;
-    fn append_params(self, _: ()) -> P {
-        self
-    }
 }
 
 macro_rules! impl_append {
     ($($a:ident)*) => {
-        #[allow(non_snake_case)]
-        impl<$($a: 'static,)* X: 'static> AppendParams<(X,)> for ($($a,)*) {
+        impl<$($a: Clone + 'static,)* X: Clone + 'static> AppendParams<(X,)> for ($($a,)*) {
             type Out = ($($a,)* X,);
-            fn append_params(self, (x,): (X,)) -> Self::Out {
-                let ($($a,)*) = self;
-                ($($a,)* x,)
-            }
         }
     };
 }
@@ -295,7 +313,7 @@ impl_append!(A B C);
 impl_append!(A B C D);
 impl_append!(A B C D E);
 
-/// Displays where a subscription sits as a NATS subject, e.g. `user.*.>`.
+/// Displays where a subscription sits as a NATS subject, e.g. `user.id.*.>`.
 pub(crate) struct Pattern<'a>(pub(crate) &'a [Key]);
 
 impl std::fmt::Display for Pattern<'_> {

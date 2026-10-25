@@ -1,10 +1,13 @@
 use super::*;
-use crate::at;
+use keywords::prelude::*;
+use opaque::prelude::*;
+use reentrant::prelude::*;
+use topics::git::PushQueue;
+use topics::prelude::*;
 use futures::stream::FusedStream;
 use futures::{FutureExt, StreamExt};
 use std::pin::pin;
-use topics::git::{LookupQueue, PushQueue, Queue as GitQueue};
-use topics::user::id::Queue as AdminQueue;
+use std::sync::Arc;
 use uuid::Uuid;
 
 #[derive(Debug, PartialEq)]
@@ -80,9 +83,9 @@ fn drain<T, P>(sub: &mut Subscription<T, P>) -> Vec<Msg<T, P>> {
 #[tokio::test]
 async fn navigate_the_tree() {
     let bus = Channel::<topics::Topic>::new();
-    let git = at!(bus, git);
-    let pushes = at!(git, push);
-    let deep = at!(bus, random.arrow.more);
+    let git = bus.git();
+    let pushes = git.push();
+    let deep = bus.random().arrow().more();
 
     let mut all_sub = bus.subscribe().await;
     let mut git_sub = git.subscribe().await;
@@ -90,11 +93,9 @@ async fn navigate_the_tree() {
     let mut deep_sub = deep.subscribe().await;
 
     pushes.publish(GitPushMsg("main".into())).await;
-    at!(git, pull).publish(GitPullMsg).await;
+    git.pull().publish(GitPullMsg).await;
     deep.publish(VeryNestedMsg).await;
-    // publishing a whole level value works too
-    git.publish(topics::git::Topic::Push(GitPushMsg("dev".into())))
-        .await;
+    pushes.publish(GitPushMsg("dev".into())).await;
 
     assert_eq!(drain(&mut all_sub).len(), 4);
     assert_eq!(drain(&mut git_sub).len(), 3);
@@ -111,15 +112,15 @@ async fn navigate_the_tree() {
 #[tokio::test]
 async fn same_names_in_different_branches() {
     let bus = Channel::<topics::Topic>::new();
-    let mut git_new = at!(bus, git.new()).subscribe().await;
-    let mut user_new = at!(bus, user.new).subscribe().await;
-    let mut repo_deletes = at!(bus, repo.id().delete).subscribe().await;
+    let mut git_new = bus.git().new(Wild).subscribe().await;
+    let mut user_new = bus.user().new().subscribe().await;
+    let mut repo_deletes = bus.repo().id(Wild).delete().subscribe().await;
 
     let id = Uuid::now_v7();
-    at!(bus, user.new).publish(UserNewMsg).await;
-    at!(bus, git.new(id)).publish(GitNewMsg).await;
-    at!(bus, user.id(id).delete).publish(UserDeleteMsg).await;
-    at!(bus, repo.id(7).delete).publish(RepoDeleteMsg).await;
+    bus.user().new().publish(UserNewMsg).await;
+    bus.git().new(id).publish(GitNewMsg).await;
+    bus.user().id(id).delete().publish(UserDeleteMsg).await;
+    bus.repo().id(7).delete().publish(RepoDeleteMsg).await;
 
     assert_eq!(drain(&mut user_new)[0].subject(), "user.new");
     assert_eq!(drain(&mut git_new)[0].params(), (id,));
@@ -132,20 +133,20 @@ async fn same_names_in_different_branches() {
 #[tokio::test]
 async fn fixed_and_wildcard_params() {
     let bus = Channel::<topics::Topic>::new();
-    let users = at!(bus, user);
+    let users = bus.user();
     let alice = Uuid::now_v7();
     let bob = Uuid::now_v7();
 
-    let alice_ch = at!(users, id(alice)); // user.<alice>
-    let any_user = at!(users, id()); // user.*
+    let alice_ch = users.id(alice); // user.<alice>
+    let any_user = users.id(Wild); // user.*
 
     let mut alice_all = alice_ch.subscribe().await; // user.<alice>.>
-    let mut any_delete = at!(any_user, delete).subscribe().await; // user.*.delete
+    let mut any_delete = any_user.delete().subscribe().await; // user.*.delete
 
-    at!(alice_ch, delete).publish(UserDeleteMsg).await;
-    at!(alice_ch, update).publish(UserUpdateMsg).await;
-    let bob_ch = at!(users, id(bob));
-    at!(bob_ch, delete).publish(UserDeleteMsg).await;
+    alice_ch.delete().publish(UserDeleteMsg).await;
+    alice_ch.update().publish(UserUpdateMsg).await;
+    let bob_ch = users.id(bob);
+    bob_ch.delete().publish(UserDeleteMsg).await;
 
     assert_eq!(drain(&mut alice_all).len(), 2);
 
@@ -157,8 +158,8 @@ async fn fixed_and_wildcard_params() {
 
 /// A component only sees its own part of the tree.
 async fn other_service(other: Channel<other::Topic>) -> Vec<String> {
-    let mut sub = at!(other, text()).subscribe().await;
-    at!(other, text("hi".to_string()))
+    let mut sub = other.text(Wild).subscribe().await;
+    other.text("hi".to_string())
         .publish(StringEvent)
         .await;
     drain(&mut sub).iter().map(|m| m.params().0).collect()
@@ -172,7 +173,7 @@ async fn sub_channel_is_a_new_root() {
     // mounted inside topics
     let bus = Channel::<topics::Topic>::new();
     let mut all = bus.subscribe().await;
-    assert_eq!(other_service(at!(bus, other)).await, ["hi"]);
+    assert_eq!(other_service(bus.other()).await, ["hi"]);
     assert_eq!(drain(&mut all)[0].subject(), "other.text.hi");
 }
 
@@ -180,7 +181,7 @@ async fn sub_channel_is_a_new_root() {
 async fn subjects_escape_parameter_values() {
     let bus = Channel::<topics::Topic>::new();
     let text = "a.b c%*>é".to_string();
-    let ch = at!(bus, other.text(text.clone()));
+    let ch = bus.other().text(text.clone());
     let mut sub = ch.subscribe().await;
     ch.publish(StringEvent).await;
 
@@ -194,8 +195,8 @@ async fn subjects_escape_parameter_values() {
 #[tokio::test]
 async fn same_type_in_several_places() {
     let bus = Channel::<topics::Topic>::new();
-    let git_u32 = at!(bus, git.count(1));
-    let other_u32 = at!(bus, other.num(1));
+    let git_u32 = bus.git().count(1);
+    let other_u32 = bus.other().num(1);
 
     let mut git_sub = git_u32.subscribe().await;
     git_u32.publish(U32Event).await;
@@ -281,23 +282,14 @@ async fn a_shared_message_is_owned_by_its_last_holder() {
 }
 
 #[tokio::test]
-async fn owning_through_params_and_levels() {
+async fn owning_through_params() {
     let bus = Channel::<topics::Topic>::new();
     let id = Uuid::now_v7();
-    let mut deletes = at!(bus, user.id().delete).subscribe().await;
-    at!(bus, user.id(id).delete).publish(UserDeleteMsg).await;
+    let mut deletes = bus.user().id(Wild).delete().subscribe().await;
+    bus.user().id(id).delete().publish(UserDeleteMsg).await;
     let msg = deletes.next().await.unwrap();
     assert_eq!(msg.params(), (id,));
     assert!(matches!(msg.try_into_inner(), Ok(UserDeleteMsg)));
-    drop(deletes);
-
-    let mut users = at!(bus, user).subscribe().await;
-    at!(bus, user.id(id).update).publish(UserUpdateMsg).await;
-    let msg = users.next().await.unwrap();
-    assert!(matches!(
-        msg.try_into_inner(),
-        Ok(topics::user::Topic::Id(got, topics::user::id::Topic::Update(_))) if got == id
-    ));
 }
 
 #[tokio::test]
@@ -533,9 +525,9 @@ async fn large_queue_group_takes_turns() {
 #[tokio::test]
 async fn subscriptions_end_once_every_channel_is_dropped() {
     let bus = Channel::<topics::Topic>::new();
-    let pushes = at!(bus, git.push);
+    let pushes = bus.git().push();
     let mut sub = pushes.subscribe().await;
-    let mut git = at!(bus, git).subscribe().await;
+    let mut git = bus.git().subscribe().await;
     pushes.publish(GitPushMsg("a".into())).await;
 
     drop(bus);
@@ -586,7 +578,7 @@ async fn responders_answer_buffered_requests_after_close() -> anyhow::Result<()>
 #[test]
 fn dropped_filter_can_unsubscribe_on_close() {
     without_deadlock(|| {
-        let echo = at!(Channel::<reentrant::Topic>::new(), echo);
+        let echo = (Channel::<reentrant::Topic>::new()).echo();
         let inner = echo.subscribe().into_future().now_or_never().unwrap();
         let _outer = (echo.subscribe())
             .filter(move |_, _| {
@@ -601,12 +593,12 @@ fn dropped_filter_can_unsubscribe_on_close() {
     });
 }
 
-fn push_channel() -> Channel<GitPushMsg, (), topics::git::PushQueue> {
-    at!(Channel::<topics::Topic>::new(), git.push)
+fn push_channel() -> Channel<topics::git::PushLeaf> {
+    (Channel::<topics::Topic>::new()).git().push()
 }
 
-fn fetch_channel() -> Channel<GitFetchMsg, (), topics::git::FetchScope> {
-    at!(Channel::<topics::Topic>::new(), git.fetch)
+fn fetch_channel() -> Channel<topics::git::FetchLeaf> {
+    (Channel::<topics::Topic>::new()).git().fetch()
 }
 
 #[tokio::test]
@@ -668,41 +660,13 @@ async fn wait_applies_backpressure_without_delaying_others() {
     assert_eq!(slow.next().await.unwrap().0, "1");
 }
 
-#[tokio::test]
-async fn try_publish_drops_on_full_wait_buffer() {
-    let pushes = push_channel();
-    let mut slow = pushes.subscribe().buffer(1).on_full(Overflow::Wait).await;
-    let mut fast = pushes.subscribe().await;
-
-    assert_eq!(pushes.try_publish(GitPushMsg("0".into())), 2);
-    assert_eq!(pushes.try_publish(GitPushMsg("1".into())), 1);
-    assert_eq!(slow.dropped(), 1);
-    assert_eq!(drain(&mut fast).len(), 2);
-    assert_eq!(slow.next().await.unwrap().0, "0");
-    assert!(drain(&mut slow).is_empty());
-}
-
-#[tokio::test]
-async fn try_publish_drops_on_full_waiting_queue_group() {
-    let pushes = push_channel();
-    let wait = || {
-        (pushes.subscribe().queue(PushQueue::Workers).buffer(1)).on_full(Overflow::Wait)
-    };
-    let w1 = wait().await;
-    let w2 = wait().await;
-    assert_eq!(pushes.try_publish(GitPushMsg("a".into())), 1);
-    assert_eq!(pushes.try_publish(GitPushMsg("b".into())), 1);
-
-    assert_eq!(pushes.try_publish(GitPushMsg("c".into())), 0);
-    assert_eq!(w1.dropped() + w2.dropped(), 1);
-}
-
 #[test]
-fn try_publish_from_drop_without_runtime() {
-    struct Goodbye(Channel<GitPushMsg, (), topics::git::PushQueue>);
+fn publish_from_drop_without_runtime() {
+    struct Goodbye(Channel<topics::git::PushLeaf>);
     impl Drop for Goodbye {
         fn drop(&mut self) {
-            self.0.try_publish(GitPushMsg("bye".into()));
+            // completes on the first poll: no buffer waits
+            self.0.publish(GitPushMsg("bye".into())).now_or_never();
         }
     }
     let pushes = push_channel();
@@ -766,10 +730,10 @@ async fn request_dropped_by_runtime_timeout() {
 #[test]
 fn handles_are_send_and_sync() {
     fn assert_send_sync<T: Send + Sync>() {}
-    assert_send_sync::<Channel<GitPushMsg>>();
+    assert_send_sync::<Channel<topics::git::PushLeaf>>();
     assert_send_sync::<Channel<topics::user::id::Topic, (Uuid,)>>();
-    assert_send_sync::<Subscription<GitPushMsg, ()>>();
-    assert_send_sync::<Msg<GitPushMsg, ()>>();
+    assert_send_sync::<Subscription<topics::git::PushLeaf, ()>>();
+    assert_send_sync::<Msg<topics::git::PushLeaf, ()>>();
 
     fn assert_send<T: Send>(_: T) {}
     let pushes = push_channel();
@@ -777,23 +741,23 @@ fn handles_are_send_and_sync() {
     assert_send(fetch_channel().request(GitFetchMsg("a".into())));
     assert_send(fetch_channel().scatter(GitFetchMsg("a".into())));
     assert_send_sync::<Replies<FetchAck>>();
-    assert_send_sync::<Responder<GitFetchMsg, FetchAck, ()>>();
-    assert_send_sync::<Incoming<GitFetchMsg, FetchAck, ()>>();
+    assert_send_sync::<Responder<topics::git::FetchLeaf, ()>>();
+    assert_send_sync::<Incoming<topics::git::FetchLeaf, ()>>();
 }
 
 #[tokio::test]
 async fn full_path_equals_step_by_step() {
     let bus = Channel::<topics::Topic>::new();
     let alice = Uuid::now_v7();
-    let mut full = at!(bus, user.id().delete).subscribe().await;
+    let mut full = bus.user().id(Wild).delete().subscribe().await;
     // the same path one level at a time, with the `(_)` spelling of a wildcard
-    let users = at!(bus, user);
-    let any_user = at!(users, id(_));
-    let mut steps = at!(any_user, delete).subscribe().await;
+    let users = bus.user();
+    let any_user = users.id(Wild);
+    let mut steps = any_user.delete().subscribe().await;
 
-    at!(bus, user.id(alice).delete).publish(UserDeleteMsg).await;
+    bus.user().id(alice).delete().publish(UserDeleteMsg).await;
     // a different leaf under the same id: matched by neither
-    at!(bus, user.id(alice).update).publish(UserUpdateMsg).await;
+    bus.user().id(alice).update().publish(UserUpdateMsg).await;
 
     let full = drain(&mut full);
     let steps = drain(&mut steps);
@@ -808,22 +772,22 @@ async fn queue_group_spans_trie_nodes_in_subscription_order() {
     let bus = Channel::<topics::Topic>::new();
     let alice = Uuid::now_v7();
     // same topic, but members sit on different nodes of the interest trie
-    let mut w1 = at!(bus, user.id())
+    let mut w1 = bus.user().id(Wild)
         .subscribe()
-        .queue(AdminQueue::Workers)
+        .queue(topics::user::id::Queue::Workers)
         .await;
-    let mut w2 = at!(bus, user.id(alice))
+    let mut w2 = bus.user().id(alice)
         .subscribe()
-        .queue(AdminQueue::Workers)
+        .queue(topics::user::id::Queue::Workers)
         .await;
 
     // nobody waits yet, so members take turns
-    at!(bus, user.id(alice).update).publish(UserUpdateMsg).await;
-    at!(bus, user.id(alice).delete).publish(UserDeleteMsg).await;
+    bus.user().id(alice).update().publish(UserUpdateMsg).await;
+    bus.user().id(alice).delete().publish(UserDeleteMsg).await;
     let w1 = drain(&mut w1);
     let w2 = drain(&mut w2);
-    assert!(matches!(*w1[0], topics::user::id::Topic::Update(_)));
-    assert!(matches!(*w2[0], topics::user::id::Topic::Delete(_)));
+    assert!(matches!(w1[0].view(), topics::user::id::TopicRef::Update(_)));
+    assert!(matches!(w2[0].view(), topics::user::id::TopicRef::Delete(_)));
 }
 
 #[tokio::test]
@@ -845,9 +809,9 @@ async fn queue_groups_are_told_apart_by_value() {
 #[tokio::test]
 async fn queue_groups_are_told_apart_by_type() {
     let bus = Channel::<topics::Topic>::new();
-    let pushes = at!(bus, git.push);
-    // both variants are named `workers`; the group on git also gets git.push
-    let mut on_git = at!(bus, git).subscribe().queue(GitQueue::Workers).await;
+    let pushes = bus.git().push();
+    // both groups are named `Workers`; the group on git also gets git.push
+    let mut on_git = bus.git().subscribe().queue(topics::git::Queue::Workers).await;
     let mut on_push = pushes.subscribe().queue(PushQueue::Workers).await;
 
     assert_eq!(pushes.publish(GitPushMsg("a".into())).await, 2);
@@ -990,7 +954,7 @@ async fn waiting_publishers_resume_once_the_buffer_drains_to_half() {
 #[tokio::test]
 async fn subscribers_are_not_responders() -> anyhow::Result<()> {
     let bus = Channel::<topics::Topic>::new();
-    let fetches = at!(bus, git.fetch);
+    let fetches = bus.git().fetch();
     // a logger on `>` that keeps what it reads
     let mut all = bus.subscribe().await;
     assert!(matches!(
@@ -1027,14 +991,14 @@ async fn subscribers_are_not_responders() -> anyhow::Result<()> {
 #[tokio::test]
 async fn a_level_subscriber_sees_the_payload() -> anyhow::Result<()> {
     let bus = Channel::<topics::Topic>::new();
-    let mut git = at!(bus, git).subscribe().await;
-    let mut responder = at!(bus, git.fetch).respond().await;
-    let replies = at!(bus, git.fetch)
+    let mut git = bus.git().subscribe().await;
+    let mut responder = bus.git().fetch().respond().await;
+    let replies = bus.git().fetch()
         .scatter(GitFetchMsg("main".into()))
         .await?;
 
     let msg = git.next().await.unwrap();
-    let topics::git::Topic::Fetch(payload) = &*msg else {
+    let topics::git::TopicRef::Fetch(payload) = msg.view() else {
         panic!("not a fetch: {msg:?}")
     };
     assert_eq!(payload.0, "main");
@@ -1047,15 +1011,15 @@ async fn a_level_subscriber_sees_the_payload() -> anyhow::Result<()> {
 async fn a_responder_queue_group_answers_once() -> anyhow::Result<()> {
     let bus = Channel::<topics::Topic>::new();
     // one group over two trie nodes: `git.lookup.*` and `git.lookup.1`
-    let mut any = at!(bus, git.lookup())
+    let mut any = bus.git().lookup(Wild)
         .respond()
-        .queue(LookupQueue::Workers)
+        .queue(topics::git::LookupQueue::Workers)
         .await;
-    let mut one = at!(bus, git.lookup(1))
+    let mut one = bus.git().lookup(1)
         .respond()
-        .queue(LookupQueue::Workers)
+        .queue(topics::git::LookupQueue::Workers)
         .await;
-    let replies = at!(bus, git.lookup(1))
+    let replies = bus.git().lookup(1)
         .scatter(GitFetchMsg("a".into()))
         .await?;
     assert_eq!(replies.remaining(), 1);
@@ -1075,9 +1039,9 @@ async fn a_responder_queue_group_answers_once() -> anyhow::Result<()> {
 }
 
 /// Every request already in the buffer of a responder.
-fn drain_incoming<M, R: Send + 'static, P>(
-    responder: &mut Responder<M, R, P>,
-) -> Vec<Incoming<M, R, P>> {
+fn drain_incoming<L: Request, P: 'static>(
+    responder: &mut Responder<L, P>,
+) -> Vec<Incoming<L, P>> {
     let mut out = Vec::new();
     while let Some(Some(incoming)) = responder.next().now_or_never() {
         out.push(incoming);
@@ -1107,9 +1071,9 @@ async fn a_request_dropped_by_a_full_responder_gets_no_reply() -> anyhow::Result
 #[tokio::test]
 async fn subscribers_and_responders_join_separate_groups() {
     let bus = Channel::<topics::Topic>::new();
-    let lookups = at!(bus, git.lookup(1));
-    let mut sub = lookups.subscribe().queue(LookupQueue::Workers).await;
-    let mut responder = lookups.respond().queue(LookupQueue::Workers).await;
+    let lookups = bus.git().lookup(1);
+    let mut sub = lookups.subscribe().queue(topics::git::LookupQueue::Workers).await;
+    let mut responder = lookups.respond().queue(topics::git::LookupQueue::Workers).await;
     assert_eq!(bus.bus.group_count(), 2);
 
     let request = tokio::spawn({
@@ -1169,10 +1133,10 @@ async fn unsubscribing_prunes_the_interest_trie() {
     let alice = Uuid::now_v7();
     let subs = (
         bus.subscribe().await,
-        at!(bus, user.id(alice).delete).subscribe().await,
-        at!(bus, user.id().update).subscribe().await,
-        at!(bus, other.text()).subscribe().await,
-        at!(bus, git).subscribe().queue(GitQueue::Workers).await,
+        bus.user().id(alice).delete().subscribe().await,
+        bus.user().id(Wild).update().subscribe().await,
+        bus.other().text(Wild).subscribe().await,
+        bus.git().subscribe().queue(topics::git::Queue::Workers).await,
     );
     assert!(!bus.bus.interest.load().children.is_empty());
 
@@ -1202,11 +1166,11 @@ crate::topics! {
 #[tokio::test]
 async fn fixed_params_match_by_equality_not_display() {
     let bus = Channel::<opaque::Topic>::new();
-    let mut one = at!(bus, item(Opaque(1))).subscribe().await;
-    let mut any = at!(bus, item()).subscribe().await; // no matcher needed
+    let mut one = bus.item(Opaque(1)).subscribe().await;
+    let mut any = bus.item(Wild).subscribe().await; // no matcher needed
 
-    at!(bus, item(Opaque(1))).publish(U32Event).await;
-    at!(bus, item(Opaque(2))).publish(U32Event).await;
+    bus.item(Opaque(1)).publish(U32Event).await;
+    bus.item(Opaque(2)).publish(U32Event).await;
 
     assert_eq!(drain(&mut one).len(), 1);
     let ids: Vec<_> = drain(&mut any).iter().map(|m| m.params()).collect();
@@ -1216,11 +1180,7 @@ async fn fixed_params_match_by_equality_not_display() {
 crate::topics! {
     /// Docs before `mod` document the module, other attributes go on `Topic`.
     #[allow(dead_code)]
-    keywords [
-        #![derive(Debug)]
-        /// A documented group.
-        Docs
-    ] {
+    keywords {
         /// A documented level.
         r#type {
             /// A documented leaf.
@@ -1236,12 +1196,11 @@ async fn raw_identifiers_are_keyword_segments() {
     let bus = Channel::<keywords::Topic>::new();
     let mut sub = bus.subscribe().await;
 
-    at!(bus, r#type.r#match).publish(U32Event).await;
-    at!(bus, a.b(1).r#loop).publish(U32Event).await;
+    bus.r#type().r#match().publish(U32Event).await;
+    bus.a().b(1).r#loop().publish(U32Event).await;
 
     let subjects: Vec<_> = drain(&mut sub).iter().map(|m| m.subject()).collect();
     assert_eq!(subjects, ["type.match", "a.b.1.loop"]);
-    assert_eq!(format!("{:?}", keywords::Queue::Docs), "Docs");
 }
 
 /// Many publishers on a tiny buffer, across threads: every handoff between
@@ -1315,12 +1274,12 @@ async fn concurrent_publishers_account_for_drops() {
 async fn long_param_values_route_like_short_ones() {
     let bus = Channel::<other::Topic>::new();
     let long = "x".repeat(200); // too long to format on the stack
-    let mut short_sub = at!(bus, text("a".to_string())).subscribe().await;
-    let mut long_sub = at!(bus, text(long.clone())).subscribe().await;
+    let mut short_sub = bus.text("a".to_string()).subscribe().await;
+    let mut long_sub = bus.text(long.clone()).subscribe().await;
 
-    at!(bus, text(long.clone())).publish(StringEvent).await;
-    at!(bus, text("a".to_string())).publish(StringEvent).await;
-    at!(bus, text(format!("{long}y")))
+    bus.text(long.clone()).publish(StringEvent).await;
+    bus.text("a".to_string()).publish(StringEvent).await;
+    bus.text(format!("{long}y"))
         .publish(StringEvent)
         .await;
 
@@ -1333,17 +1292,17 @@ async fn queue_group_skips_members_whose_filter_rejects() {
     let bus = Channel::<topics::Topic>::new();
     let alice = Uuid::now_v7();
     // on different trie nodes, so the group is merged across the subject
-    let mut picky = at!(bus, user.id())
+    let mut picky = bus.user().id(Wild)
         .subscribe()
         .filter(|_, _| false)
-        .queue(AdminQueue::Workers)
+        .queue(topics::user::id::Queue::Workers)
         .await;
-    let mut w = at!(bus, user.id(alice))
+    let mut w = bus.user().id(alice)
         .subscribe()
-        .queue(AdminQueue::Workers)
+        .queue(topics::user::id::Queue::Workers)
         .await;
 
-    let deletes = at!(bus, user.id(alice).delete);
+    let deletes = bus.user().id(alice).delete();
     for _ in 0..3 {
         assert_eq!(deletes.publish(UserDeleteMsg).await, 1);
     }
@@ -1366,15 +1325,15 @@ async fn queue_groups_are_forgotten_with_their_last_member() {
 #[tokio::test]
 async fn mounted_trees_have_their_own_groups() {
     let bus = Channel::<topics::Topic>::new();
-    let mut w1 = at!(bus, other.num()).subscribe().queue(other::NumQueue::Workers).await;
-    let mut w2 = at!(bus, other.num()).subscribe().queue(other::NumQueue::Workers).await;
-    let mut w3 = at!(bus, again.num()).subscribe().queue(other::NumQueue::Workers).await;
+    let mut w1 = bus.other().num(Wild).subscribe().queue(other::NumQueue::Workers).await;
+    let mut w2 = bus.other().num(Wild).subscribe().queue(other::NumQueue::Workers).await;
+    let mut w3 = bus.again().num(Wild).subscribe().queue(other::NumQueue::Workers).await;
     assert_eq!(bus.bus.group_count(), 2);
 
     // publishing on `again` doesn't move the turn of `other`
-    at!(bus, other.num(1)).publish(U32Event).await;
-    at!(bus, again.num(1)).publish(U32Event).await;
-    at!(bus, other.num(1)).publish(U32Event).await;
+    bus.other().num(1).publish(U32Event).await;
+    bus.again().num(1).publish(U32Event).await;
+    bus.other().num(1).publish(U32Event).await;
     let counts = [drain(&mut w1), drain(&mut w2), drain(&mut w3)].map(|m| m.len());
     assert_eq!(counts, [1, 1, 1]);
 }
@@ -1385,28 +1344,28 @@ async fn queue_groups_can_be_declared_on_any_level() {
     let mut subs = [
         drain_on(bus.subscribe().queue(topics::Queue::Workers).await),
         drain_on(
-            at!(bus, git.count(7))
+            bus.git().count(7)
                 .subscribe()
                 .queue(topics::git::CountQueue::Workers)
                 .await,
         ),
         drain_on(
-            at!(bus, repo.id())
+            bus.repo().id(Wild)
                 .subscribe()
                 .queue(topics::repo::id::Queue::Workers)
                 .await,
         ),
         drain_on(
-            at!(bus, random.arrow)
+            bus.random().arrow()
                 .subscribe()
                 .queue(topics::random::arrow::Queue::Workers)
                 .await,
         ),
     ];
 
-    at!(bus, git.count(7)).publish(U32Event).await;
-    at!(bus, repo.id(1).delete).publish(RepoDeleteMsg).await;
-    at!(bus, random.arrow.more).publish(VeryNestedMsg).await;
+    bus.git().count(7).publish(U32Event).await;
+    bus.repo().id(1).delete().publish(RepoDeleteMsg).await;
+    bus.random().arrow().more().publish(VeryNestedMsg).await;
 
     let counts: Vec<usize> = subs.iter_mut().map(|drain| drain()).collect();
     // the root group gets all three
@@ -1420,7 +1379,7 @@ fn drain_on<T: 'static, P: 'static>(mut sub: Subscription<T, P>) -> Box<dyn FnMu
 }
 
 /// Publishes to its channel when dropped, to catch user code run under our locks.
-pub struct Echo(Option<Channel<Echo>>);
+pub struct Echo(Option<Channel<reentrant::EchoLeaf>>);
 
 impl Drop for Echo {
     fn drop(&mut self) {
@@ -1452,7 +1411,7 @@ fn without_deadlock(f: impl FnOnce() + Send + 'static) {
 #[test]
 fn evicted_message_can_publish_on_drop() {
     without_deadlock(|| {
-        let echo = at!(Channel::<reentrant::Topic>::new(), echo);
+        let echo = (Channel::<reentrant::Topic>::new()).echo();
         let mut sub = (echo.subscribe().buffer(1).on_full(Overflow::DropOldest))
             .into_future()
             .now_or_never()
@@ -1468,7 +1427,7 @@ fn evicted_message_can_publish_on_drop() {
 #[test]
 fn dropped_filter_can_unsubscribe() {
     without_deadlock(|| {
-        let echo = at!(Channel::<reentrant::Topic>::new(), echo);
+        let echo = (Channel::<reentrant::Topic>::new()).echo();
         let inner = echo.subscribe().into_future().now_or_never().unwrap();
         let outer = (echo.subscribe())
             .filter(move |_, _| {
@@ -1482,4 +1441,173 @@ fn dropped_filter_can_unsubscribe() {
         drop(outer);
         assert!(echo.bus.interest.load().is_empty());
     });
+}
+
+#[tokio::test]
+async fn handlers_run_on_the_publisher_thread() {
+    let pushes = push_channel();
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let handler = pushes.subscribe().handler({
+        let seen = seen.clone();
+        move |msg| seen.lock().unwrap().push((msg.0.clone(), std::thread::current().id()))
+    });
+    assert_eq!(pushes.publish(GitPushMsg("a".into())).await, 1);
+    assert_eq!(pushes.publish_many(["b", "c"].map(|s| GitPushMsg(s.into()))).await, 2);
+    let here = std::thread::current().id();
+    assert_eq!(
+        *seen.lock().unwrap(),
+        [("a".into(), here), ("b".into(), here), ("c".into(), here)]
+    );
+
+    drop(handler);
+    assert_eq!(pushes.publish(GitPushMsg("d".into())).await, 0);
+    assert_eq!(seen.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn a_panicking_handler_drops_the_message() {
+    let pushes = push_channel();
+    let handler = pushes.subscribe().handler(|msg| assert_ne!(msg.0, "boom"));
+    assert_eq!(pushes.publish(GitPushMsg("boom".into())).await, 0);
+    assert_eq!(pushes.publish(GitPushMsg("fine".into())).await, 1);
+    assert_eq!(handler.dropped(), 1);
+}
+
+#[tokio::test]
+async fn handlers_take_turns_in_queue_groups() {
+    let pushes = push_channel();
+    let counts: [Arc<std::sync::atomic::AtomicUsize>; 2] = Default::default();
+    let _handlers = counts.clone().map(|count| {
+        (pushes.subscribe().queue(PushQueue::Workers))
+            .handler(move |_| {
+                count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            })
+    });
+    for i in 0..10 {
+        assert_eq!(pushes.publish(GitPushMsg(i.to_string())).await, 1);
+    }
+    let counts = counts.map(|count| count.load(std::sync::atomic::Ordering::Relaxed));
+    assert_eq!(counts, [5, 5]);
+}
+
+#[tokio::test]
+async fn recv_many_takes_what_is_buffered() {
+    let pushes = push_channel();
+    let mut sub = pushes.subscribe().await;
+    pushes.publish_many((0..5).map(|i| GitPushMsg(i.to_string()))).await;
+
+    let mut buf = Vec::new();
+    assert_eq!(sub.recv_many(&mut buf, 3).await, 3);
+    assert_eq!(sub.recv_many(&mut buf, 10).await, 2);
+    let got: Vec<_> = buf.iter().map(|msg| msg.0.clone()).collect();
+    assert_eq!(got, ["0", "1", "2", "3", "4"]);
+
+    // waits for the next message
+    {
+        let mut next = pin!(sub.recv_many(&mut buf, 10));
+        assert!(next.as_mut().now_or_never().is_none());
+        pushes.publish(GitPushMsg("5".into())).await;
+        assert_eq!(next.await, 1);
+    }
+
+    drop(pushes);
+    assert_eq!(sub.recv_many(&mut buf, 10).await, 0, "ended");
+}
+
+#[tokio::test]
+async fn recv_many_releases_waiting_publishers() {
+    let pushes = push_channel();
+    let mut sub = pushes.subscribe().buffer(2).on_full(Overflow::Wait).await;
+    let publisher = tokio::spawn({
+        let pushes = pushes.clone();
+        async move { pushes.publish_many((0..6).map(|i| GitPushMsg(i.to_string()))).await }
+    });
+    let mut buf = Vec::new();
+    while buf.len() < 6 {
+        sub.recv_many(&mut buf, 10).await;
+    }
+    assert_eq!(publisher.await.unwrap(), 6);
+    let got: Vec<_> = buf.iter().map(|msg| msg.0.clone()).collect();
+    assert_eq!(got, ["0", "1", "2", "3", "4", "5"]);
+}
+
+#[tokio::test]
+async fn publish_many_applies_filters_overflow_and_groups() {
+    let pushes = push_channel();
+    let mut short = pushes.subscribe().buffer(2).await;
+    let mut odd = (pushes.subscribe())
+        .filter(|_, msg| msg.0.parse::<u32>().unwrap() % 2 == 1)
+        .await;
+    let mut w1 = pushes.subscribe().queue(PushQueue::Workers).await;
+    let mut w2 = pushes.subscribe().queue(PushQueue::Workers).await;
+
+    let delivered = pushes.publish_many((0..4).map(|i| GitPushMsg(i.to_string()))).await;
+    // 2 kept by `short`, 2 odd ones, 4 shared by the group
+    assert_eq!(delivered, 8);
+    assert_eq!(short.dropped(), 2);
+    let texts = |msgs: Vec<Msg<_, ()>>| -> Vec<String> {
+        msgs.iter().map(|msg: &Msg<topics::git::PushLeaf, ()>| msg.0.clone()).collect()
+    };
+    assert_eq!(texts(drain(&mut short)), ["0", "1"]);
+    assert_eq!(texts(drain(&mut odd)), ["1", "3"]);
+    assert_eq!(drain(&mut w1).len() + drain(&mut w2).len(), 4);
+}
+
+/// One member of a queue group, `Overflow::Wait`, many publishers: every
+/// message reaches it. The `queue_group/1` throughput bench hung on this.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_publishers_to_a_waiting_queue_group() {
+    const PUBS: usize = 4;
+    const EACH: usize = 2_500;
+    for (members, buffer) in [(1, 1024), (1, 2), (2, 2)] {
+        let pushes = push_channel();
+        let mut subs: Vec<_> = Vec::new();
+        for _ in 0..members {
+            subs.push(
+                (pushes.subscribe().queue(PushQueue::Workers))
+                    .buffer(buffer)
+                    .on_full(Overflow::Wait)
+                    .await,
+            );
+        }
+        let publishers: Vec<_> = (0..PUBS)
+            .map(|_| {
+                let pushes = pushes.clone();
+                tokio::spawn(async move {
+                    for i in 0..EACH {
+                        assert_eq!(pushes.publish(GitPushMsg(i.to_string())).await, 1);
+                    }
+                })
+            })
+            .collect();
+        let left = Arc::new(std::sync::atomic::AtomicUsize::new(PUBS * EACH));
+        let receivers: Vec<_> = (subs.into_iter())
+            .map(|mut sub| {
+                let left = left.clone();
+                tokio::spawn(async move {
+                    while left.load(std::sync::atomic::Ordering::Acquire) > 0 {
+                        let next = tokio::time::timeout(std::time::Duration::from_millis(100), sub.next());
+                        if next.await.is_ok() {
+                            left.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                        }
+                    }
+                    sub
+                })
+            })
+            .collect();
+        let all = async {
+            for publisher in publishers {
+                publisher.await.unwrap();
+            }
+            for receiver in receivers {
+                receiver.await.unwrap();
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(20), all)
+            .await
+            .unwrap_or_else(|_| {
+                let left = left.load(std::sync::atomic::Ordering::Relaxed);
+                panic!("stuck with {members} members, buffer {buffer}: {left} left")
+            });
+    }
 }

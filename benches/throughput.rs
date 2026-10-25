@@ -12,7 +12,8 @@ mod common;
 use common::{Message, start, topics};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use futures::StreamExt;
-use nattes::{Channel, Overflow, Subscription, at};
+use nattes::{Channel, Overflow, Subscription};
+use topics::prelude::*;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -120,7 +121,7 @@ fn fan_out(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(subs), &subs, |b, &subs| {
             b.to_async(&rt).iter_custom(|iters| async move {
                 let bus = Channel::<topics::Topic>::new();
-                let load = at!(bus, load);
+                let load = bus.load();
                 timed(
                     iters,
                     || {
@@ -153,7 +154,7 @@ fn fan_in(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(pubs), &pubs, |b, &pubs| {
             b.to_async(&rt).iter_custom(|iters| async move {
                 let bus = Channel::<topics::Topic>::new();
-                let load = at!(bus, load);
+                let load = bus.load();
                 timed(
                     iters,
                     || {
@@ -183,7 +184,7 @@ fn queue_group(c: &mut Criterion) {
             |b, &workers| {
                 b.to_async(&rt).iter_custom(|iters| async move {
                     let bus = Channel::<topics::Topic>::new();
-                    let load = at!(bus, load);
+                    let load = bus.load();
                     timed(
                         iters,
                         || {
@@ -226,7 +227,7 @@ fn routing(c: &mut Criterion) {
                         let mut tasks = Subscribers::new();
                         for id in 0..subs {
                             let sub = start(
-                                at!(bus, user.id(id).delete)
+                                bus.user().id(id).delete()
                                     .subscribe()
                                     .on_full(Overflow::Wait),
                             );
@@ -242,7 +243,7 @@ fn routing(c: &mut Criterion) {
                                 // publisher p sends to ids p, p+4, …: each id gets MSGS / subs
                                 for i in (p..MSGS).step_by(4) {
                                     let id = i % subs;
-                                    at!(bus, user.id(id).delete).publish(Message(i)).await;
+                                    bus.user().id(id).delete().publish(Message(i)).await;
                                 }
                             });
                         }
@@ -259,7 +260,7 @@ fn routing(c: &mut Criterion) {
 /// `total` messages split across `pubs` concurrent tasks.
 async fn publish_from(
     pubs: u64,
-    load: &nattes::Channel<Message, (), topics::LoadQueue>,
+    load: &nattes::Channel<topics::LoadLeaf>,
     total: u64,
 ) {
     let mut tasks = JoinSet::new();
@@ -274,5 +275,91 @@ async fn publish_from(
     tasks.join_all().await;
 }
 
-criterion_group!(benches, fan_out, fan_in, queue_group, routing);
+/// 1 publisher, N handlers on the same topic: delivery on the publisher's
+/// thread, no buffer and no wake-up. Compare with `fan_out`.
+fn fan_out_handlers(c: &mut Criterion) {
+    let rt = runtime();
+    let mut group = c.benchmark_group("fan_out_handlers");
+    for subs in [1, 4, 16, 64] {
+        group.throughput(Throughput::Elements(MSGS * subs));
+        group.bench_with_input(BenchmarkId::from_parameter(subs), &subs, |b, &subs| {
+            b.to_async(&rt).iter_custom(|iters| async move {
+                let bus = Channel::<topics::Topic>::new();
+                let load = bus.load();
+                let received = Arc::new(AtomicU64::new(0));
+                let _handlers: Vec<_> = (0..subs)
+                    .map(|_| {
+                        let received = received.clone();
+                        load.subscribe().handler(move |_| {
+                            received.fetch_add(1, Ordering::Relaxed);
+                        })
+                    })
+                    .collect();
+                let start = Instant::now();
+                for _ in 0..iters {
+                    for i in 0..MSGS {
+                        load.publish(Message(i)).await;
+                    }
+                }
+                let elapsed = start.elapsed();
+                assert_eq!(received.load(Ordering::Relaxed), iters * MSGS * subs);
+                elapsed
+            });
+        });
+    }
+    group.finish();
+}
+
+/// 1 publisher with `publish_many`, N subscribers with `recv_many`, in batches
+/// of 64. Compare with `fan_out`.
+fn fan_out_batched(c: &mut Criterion) {
+    const BATCH: u64 = 64;
+    let rt = runtime();
+    let mut group = c.benchmark_group("fan_out_batched");
+    for subs in [1, 4, 16, 64] {
+        group.throughput(Throughput::Elements(MSGS * subs));
+        group.bench_with_input(BenchmarkId::from_parameter(subs), &subs, |b, &subs| {
+            b.to_async(&rt).iter_custom(|iters| async move {
+                let bus = Channel::<topics::Topic>::new();
+                let load = bus.load();
+                timed(
+                    iters,
+                    || {
+                        let mut tasks = Subscribers::new();
+                        for _ in 0..subs {
+                            let mut sub = start(load.subscribe().on_full(Overflow::Wait));
+                            tasks.spawn(async move {
+                                let mut buf = Vec::with_capacity(BATCH as usize);
+                                let mut left = MSGS as usize;
+                                while left > 0 {
+                                    left -= sub.recv_many(&mut buf, BATCH as usize).await;
+                                    buf.clear();
+                                }
+                                Box::new(sub) as Box<dyn Send>
+                            });
+                        }
+                        tasks
+                    },
+                    || async {
+                        for start in (0..MSGS).step_by(BATCH as usize) {
+                            load.publish_many((start..(start + BATCH).min(MSGS)).map(Message)).await;
+                        }
+                    },
+                )
+                .await
+            });
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    fan_out,
+    fan_out_handlers,
+    fan_out_batched,
+    fan_in,
+    queue_group,
+    routing
+);
 criterion_main!(benches);
