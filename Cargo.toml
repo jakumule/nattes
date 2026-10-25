@@ -28,7 +28,6 @@ keywords = ["message-queue", "nats"]
 [dependencies]
 nattes-macros = { path = "macros", version = "0.2.1" }
 
-tokio = { version = "1", features = ["sync", "time"] }
 futures = "0.3"
 arc-swap = "1"
 smallvec = "1"
@@ -41,7 +40,7 @@ tracing = { version = "0.1", default-features = false, features = ["std"], optio
 tracing = ["dep:tracing"]
 
 [dev-dependencies]
-tokio = { version = "1.42.0", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1.42.0", features = ["rt-multi-thread", "macros", "sync", "time"] }
 anyhow = "1.0.94"
 uuid = { version = "1.11.0", features = ["v7"] }
 criterion = { version = "0.8.2", features = ["async_tokio"] }

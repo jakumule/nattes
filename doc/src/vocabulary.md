@@ -85,7 +85,7 @@ topics! {
 | Term | Meaning | Don't say |
 |---|---|---|
 | **publisher** | Who publishes: calls `publish` (or `try_publish`) on a channel. | sender |
-| **requester** | Who sends a request: calls `request`, `request_timeout` or `scatter`. | sender |
+| **requester** | Who sends a request: calls `request` or `scatter`. | sender |
 | **responder** | A subscription made with `respond()` on a request leaf, and its handle `Responder`, a `Stream` of incoming requests. Only responders count for and answer requests. | receiver |
 | **incoming request** | What a responder receives: `Incoming`, which derefs to the payload and carries the responder's own **reply token**, used once by `respond(reply)`. `try_into_inner` splits it into the payload and the token, a `ReplyToken`. | — |
 

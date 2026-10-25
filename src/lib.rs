@@ -285,8 +285,7 @@
 //! buffers: nothing is persisted, acknowledged or redelivered. "Delivered" means
 //! pushed into a subscription's buffer, not handled. This holds for
 //! [`publish`](Channel::publish), [`try_publish`](Channel::try_publish),
-//! [`request`](Channel::request), [`request_timeout`](Channel::request_timeout)
-//! and [`scatter`](Channel::scatter):
+//! [`request`](Channel::request) and [`scatter`](Channel::scatter):
 //!
 //! - Nothing is sent until the returned future is polled; `try_publish` sends
 //!   when called.

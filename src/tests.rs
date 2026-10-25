@@ -736,16 +736,15 @@ async fn panicking_filter_does_not_break_the_bus() {
 }
 
 #[tokio::test]
-async fn request_timeout() {
+async fn request_dropped_by_runtime_timeout() {
     let fetches = fetch_channel();
-    let _silent = fetches.respond().await;
-    let result = fetches
-        .request_timeout(
-            GitFetchMsg("main".into()),
-            std::time::Duration::from_millis(20),
-        )
-        .await;
-    assert!(matches!(result, Err(BusError::Timeout)));
+    let mut silent = fetches.respond().await;
+    let request = fetches.request(GitFetchMsg("main".into()));
+    let result = tokio::time::timeout(std::time::Duration::from_millis(20), request).await;
+    assert!(result.is_err());
+    // The requester gave up: nobody waits for the reply anymore
+    let req = silent.next().await.unwrap();
+    assert!(!req.is_pending());
 }
 
 #[test]

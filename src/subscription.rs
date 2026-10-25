@@ -55,8 +55,9 @@ impl<T: 'static, P: 'static, S, K> SubscriptionBuilder<T, P, S, K> {
         }
     }
 
-    /// Only messages for which `f(params, msg)` is true. A panicking filter
-    /// counts as "no match".
+    /// Only messages for which `f(params, msg)` is true. It runs inside
+    /// `publish`, on the publisher's thread, so keep it cheap. A panicking
+    /// filter counts as "no match" (unless built with `panic = "abort"`).
     pub fn filter(mut self, f: impl Fn(&P, &T) -> bool + Send + Sync + 'static) -> Self {
         self.filters.push(Box::new(f));
         self

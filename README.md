@@ -30,8 +30,8 @@ while let Some(msg) = deletes.next().await {
   it's standalone or mounted inside a bigger tree.
 - **Async-friendly.** Every handle and future is `Send + Sync`, and a slow
   subscriber never blocks publishers unless you ask for backpressure. Subscriptions
-  are `futures::Stream`s that unsubscribe when dropped. It runs on any executor;
-  only `request_timeout` needs tokio's timer.
+  are `futures::Stream`s that unsubscribe when dropped. It runs on any executor
+  and depends on none: timeouts come from your runtime's timer.
 - **Editor-friendly.** rust-analyzer completes `at!` paths, hovering a segment
   shows the topic's docs and subject, and going to the definition of a `Topic`
   variant or queue group lands on its line in `topics!`.
@@ -334,8 +334,11 @@ while let Some(msg) = sub.next().await {
 - **Routing.** Subscriptions are indexed by pattern in an interest trie, like
   the NATS sublist, so `publish` only looks at subscribers on its subject's path
   (with wildcards). Its cost doesn't grow with subscribers on unrelated subjects.
-- **Filters.** Filters run outside the bus's internal lock. A filter that panics
-  counts as "no match" and doesn't affect other subscribers or publishers.
+- **Filters.** Filters run inside `publish`, on the publisher's thread (outside
+  the bus's internal lock), so a slow filter slows every publish on its subject.
+  Keep them cheap and do heavy work after receiving the message. A filter that
+  panics counts as "no match" and doesn't affect other subscribers or publishers
+  (except with `panic = "abort"`, see [Requirements](#requirements)).
 - **Streams.** A subscription is a `FusedStream`, so every `StreamExt` adapter
   applies and it goes straight into `futures::select!` without `.fuse()`.
 - **Closing.** Every channel of a bus, sub-channels included, keeps it open.
@@ -422,9 +425,9 @@ tokio::spawn(async move {
 
 // requester
 let ack: PushAck = pushes.request(GitPushMsg { branch: "main".into() }).await?;
-let ack = pushes
-    .request_timeout(GitPushMsg { branch: "main".into() }, Duration::from_secs(1))
-    .await?;
+// bounded by your runtime's timer
+let request = pushes.request(GitPushMsg { branch: "main".into() });
+let ack = tokio::time::timeout(Duration::from_secs(1), request).await??;
 ```
 
 Only responders, made with `respond()`, answer requests. `respond()` returns
@@ -448,10 +451,10 @@ The first reply wins. Possible errors:
 - `BusError::NoResponders`: no responder matches the request.
 - `BusError::NoReply`: every responder dropped the request without answering,
   including when a full buffer dropped it.
-- `BusError::Timeout`: `request_timeout` ran out of time.
 
-`request` on its own waits for as long as some responder still holds the request, so
-prefer `request_timeout` unless you know a responder will answer.
+`request` waits for as long as some responder still holds the request, so wrap
+it in your runtime's timeout unless you know a responder will answer. The
+timeout covers both delivery and the reply.
 
 ### Scatter-gather
 
@@ -459,7 +462,8 @@ prefer `request_timeout` unless you know a responder will answer.
 responder (a queue group counts as one responder). The stream ends once each of
 them answered or dropped the request; `replies.remaining()` tells how many are
 still expected. `Replies` is a `FusedStream`, so `StreamExt` adapters cover the
-rest, e.g. a deadline with `take_until`:
+rest, e.g. a deadline with `take_until` (delivery, the `scatter(..)` future
+itself, takes a timeout like `request`):
 
 ```rust
 let mut replies = pushes.scatter(GitPushMsg { branch: "main".into() }).await?;
@@ -519,14 +523,13 @@ Per method:
 | `publish` | How many subscriptions the message was delivered to. Not on request leaves. | Room in full `Overflow::Wait` buffers. |
 | `try_publish` | Same as `publish`, but full `Overflow::Wait` buffers drop the message. Not async. | Nothing. |
 | `request` | The first reply. `NoResponders` if no responder matches it, `NoReply` once every responder dropped it without answering. | Delivery, then a reply, with no time limit. |
-| `request_timeout` | Same as `request`, or `Timeout`. | Delivery and the reply, both within the timeout. |
 | `scatter` | A stream of replies, at most one per responder, or `NoResponders`. | Delivery. The stream ends once every responder answered or dropped the request. |
 
 A request goes to every matching subscriber and responder, and only the
 first reply counts. To have exactly one handler, respond through a queue group.
-A request that is lost from a responder's buffer counts as dropped without a reply. After a
-`Timeout`, the request may still sit in buffers and be handled, but its reply is
-discarded: `respond` returns `false`.
+A request that is lost from a responder's buffer counts as dropped without a reply. Once
+the requester gives up (drops the future, e.g. on a timeout), the request may still
+sit in buffers and be handled, but its reply is discarded: `respond` returns `false`.
 
 ## Sub-channels as roots
 
@@ -661,8 +664,6 @@ The same holds for `try_publish`.
   'static`.
 - `topics!` must be used at module level, because its modules find your types
   through `use super::*`.
-- `request_timeout` needs a tokio runtime with the timer enabled. Everything else
-  runs on any executor.
 - Containing panicking filters relies on unwinding, so it doesn't work with
   `panic = "abort"`.
 

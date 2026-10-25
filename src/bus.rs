@@ -15,11 +15,10 @@ use smallvec::SmallVec;
 use std::any::Any;
 use std::collections::{HashMap, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::pin::pin;
+use std::future::poll_fn;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::task::{Context, Poll};
-use tokio::sync::Notify;
+use std::task::{Context, Poll, Waker};
 
 /// What a subscription does with a new message when its buffer is full.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -68,8 +67,6 @@ pub(crate) struct Buffer {
     /// Set while the subscriber waits for a message on an empty buffer: pushes
     /// skip the wake otherwise, and queue groups prefer idle members.
     parked: AtomicBool,
-    /// Wakes `Overflow::Wait` publishers when room frees up or the subscriber leaves.
-    space: Notify,
 }
 
 #[derive(Default)]
@@ -79,6 +76,20 @@ struct BufferState {
     /// A publisher waits for room. It is woken once the buffer drains to half,
     /// so waiters refill it in a burst instead of one slot at a time.
     wanted: bool,
+    /// `Overflow::Wait` publishers to wake when room frees up or the
+    /// subscriber leaves.
+    waiting: Vec<Waker>,
+    /// How many times `waiting` was woken: a publisher retries only after a
+    /// wake, not on every poll, so the burst isn't refilled one slot at a time.
+    wakes: u64,
+}
+
+impl BufferState {
+    /// The publishers to wake, after unlocking.
+    fn take_waiting(&mut self) -> Vec<Waker> {
+        self.wakes += 1;
+        std::mem::take(&mut self.waiting)
+    }
 }
 
 enum Push {
@@ -99,7 +110,6 @@ impl Buffer {
             dropped: AtomicU64::new(0),
             waker: AtomicWaker::new(),
             parked: AtomicBool::new(false),
-            space: Notify::new(),
         }
     }
 
@@ -154,61 +164,90 @@ impl Buffer {
     }
 
     /// Wait for room; `false` if the subscriber went away first.
-    async fn push_wait(&self, mut event: Event) -> bool {
-        loop {
-            let mut notified = pin!(self.space.notified());
-            notified.as_mut().enable();
-            match self.try_push::<true>(event) {
-                Push::Delivered | Push::Evicted => return true,
-                Push::Dropped | Push::Closed => return false,
-                Push::Full(back) => event = back,
+    async fn push_wait(&self, event: Event) -> bool {
+        let mut event = Some(event);
+        let mut seen = None;
+        poll_fn(|cx| {
+            // Before pushing, so a pop in between isn't missed
+            if !self.wait_for_space(cx, &mut seen) {
+                return Poll::Pending;
             }
-            notified.await;
-        }
+            match self.try_push::<true>(event.take().expect("not polled after completion")) {
+                Push::Delivered | Push::Evicted => Poll::Ready(true),
+                Push::Dropped | Push::Closed => Poll::Ready(false),
+                Push::Full(back) => {
+                    event = Some(back);
+                    Poll::Pending
+                }
+            }
+        })
+        .await
     }
 
     /// Wait for room in any of `buffers` (full members of a queue group) and
     /// push to the first with room, in order; `false` if they all went away.
     async fn push_wait_any(buffers: &[Arc<Self>], event: Event) -> bool {
-        let mut live: Vec<&Self> = buffers.iter().map(|buffer| &**buffer).collect();
-        loop {
-            let mut notified: Vec<_> = (live.iter())
-                .map(|buffer| Box::pin(buffer.space.notified()))
-                .collect();
-            for notified in &mut notified {
-                notified.as_mut().enable();
+        let mut live: Vec<(&Self, Option<u64>)> =
+            buffers.iter().map(|buffer| (&**buffer, None)).collect();
+        poll_fn(|cx| {
+            // Every buffer registers, so any of them wakes this
+            let mut woken = false;
+            for (buffer, seen) in &mut live {
+                woken |= buffer.wait_for_space(cx, seen);
+            }
+            if !woken {
+                return Poll::Pending;
             }
             // A clone, so a closed buffer doesn't take the event the others wait for
             let mut i = 0;
             while i < live.len() {
-                match live[i].try_push::<true>(event.clone()) {
-                    Push::Delivered | Push::Evicted => return true,
+                match live[i].0.try_push::<true>(event.clone()) {
+                    Push::Delivered | Push::Evicted => return Poll::Ready(true),
                     Push::Full(_) => i += 1,
                     Push::Dropped | Push::Closed => {
                         live.remove(i);
-                        drop(notified.remove(i));
                     }
                 }
             }
             if live.is_empty() {
-                return false;
+                Poll::Ready(false)
+            } else {
+                Poll::Pending
             }
-            futures::future::select_all(notified).await;
+        })
+        .await
+    }
+
+    /// Wake the task of `cx` once room frees up or the subscriber leaves.
+    /// Returns whether that happened since the call that set `seen` (always on
+    /// the first call, `seen` being `None`): only then is pushing worth a try.
+    /// The waker of a publisher that gave up only causes a spurious wake.
+    fn wait_for_space(&self, cx: &Context<'_>, seen: &mut Option<u64>) -> bool {
+        let mut state = lock(&self.state);
+        if !state.waiting.iter().any(|waker| waker.will_wake(cx.waker())) {
+            state.waiting.push(cx.waker().clone());
         }
+        let woken = *seen != Some(state.wakes);
+        *seen = Some(state.wakes);
+        woken
     }
 
     fn pop(&self) -> Option<Event> {
         let mut state = lock(&self.state);
         let event = state.events.pop_front();
-        let refill = state.wanted && state.events.len() <= self.capacity / 2;
-        if refill {
-            state.wanted = false;
-        }
-        drop(state);
-        if refill {
-            self.space.notify_waiters();
+        if state.wanted && state.events.len() <= self.capacity / 2 {
+            Self::refill(state);
         }
         event
+    }
+
+    /// `pop` freed enough room: wake the waiting publishers.
+    #[cold]
+    fn refill(mut state: MutexGuard<'_, BufferState>) {
+        state.wanted = false;
+        let waiting = state.take_waiting();
+        drop(state);
+        waiting.into_iter().for_each(Waker::wake);
     }
 
     /// Next event, or `None` once the bus is closed and the buffer drained.
@@ -246,8 +285,11 @@ impl Buffer {
     /// The bus is closed: take no more events, but keep the buffered ones for
     /// the subscriber to read before its stream ends.
     fn end(&self) {
-        lock(&self.state).closed = true;
-        self.space.notify_waiters();
+        let mut state = lock(&self.state);
+        state.closed = true;
+        let waiting = state.take_waiting();
+        drop(state);
+        waiting.into_iter().for_each(Waker::wake);
         self.parked.store(false, Ordering::Relaxed);
         self.waker.wake();
     }
@@ -257,8 +299,9 @@ impl Buffer {
         let mut state = lock(&self.state);
         state.closed = true;
         let events = std::mem::take(&mut state.events);
+        let waiting = state.take_waiting();
         drop(state);
-        self.space.notify_waiters();
+        waiting.into_iter().for_each(Waker::wake);
         // Drop pending requests now so requesters see `NoReply`
         drop(events);
     }

@@ -10,7 +10,8 @@ use crate::bus::{Event, lock};
 use crate::channel::Route;
 use crate::tree::{Step, Subject};
 use crate::{Channel, Level, subject};
-use futures::Stream;
+use futures::channel::{mpsc, oneshot};
+use futures::{Stream, StreamExt};
 use futures::stream::FusedStream;
 use std::any::Any;
 use std::fmt;
@@ -18,9 +19,7 @@ use std::ops::Deref;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, ready};
-use std::time::Duration;
 use thiserror::Error;
-use tokio::sync::{mpsc, oneshot};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum BusError {
@@ -28,8 +27,6 @@ pub enum BusError {
     NoResponders,
     #[error("Every responder dropped the request without replying")]
     NoReply,
-    #[error("No reply before the timeout")]
-    Timeout,
 }
 
 /// The scope of a request leaf, `name: Msg => Reply` in
@@ -94,8 +91,12 @@ where
     /// discarded. Fails with [`BusError::NoResponders`] if no responder matches
     /// it, and with [`BusError::NoReply`] once every responder dropped it
     /// without answering, including when it was lost from a full buffer or a
-    /// dropped responder. Waits as long as a responder holds the
-    /// request: prefer [`request_timeout`](Self::request_timeout).
+    /// dropped responder.
+    ///
+    /// Waits as long as a responder holds the request: bound it with your
+    /// runtime's timer, e.g. `tokio::time::timeout(d, chan.request(msg))`,
+    /// which covers both delivery and the reply. Once the future is dropped,
+    /// the request may still be handled, but its reply is discarded.
     pub async fn request(&self, payload: M) -> Result<S::Reply, BusError> {
         let (tx, rx) = oneshot::channel();
         let token = Reply::One(Arc::new(Mutex::new(Some(tx))));
@@ -106,20 +107,6 @@ where
         rx.await.map_err(|_| BusError::NoReply)
     }
 
-    /// [`request`](Self::request) giving up after `timeout`, which covers both
-    /// delivery and the reply. After a [`BusError::Timeout`] the request may
-    /// still be handled, but its reply is discarded.
-    /// Needs a tokio runtime with the timer enabled.
-    pub async fn request_timeout(
-        &self,
-        payload: M,
-        timeout: Duration,
-    ) -> Result<S::Reply, BusError> {
-        tokio::time::timeout(timeout, self.request(payload))
-            .await
-            .map_err(|_| BusError::Timeout)?
-    }
-
     /// Send `payload` to every responder and stream their replies, one per
     /// responder (a queue group counts as one responder).
     ///
@@ -128,8 +115,12 @@ where
     /// The stream ends once every responder answered or dropped the request,
     /// including when it was lost from a full buffer or a dropped responder.
     /// Fails with [`BusError::NoResponders`] if no responder matches it.
+    ///
+    /// Bound delivery with your runtime's timer like for
+    /// [`request`](Self::request), and the replies with
+    /// [`StreamExt::take_until`](futures::StreamExt::take_until).
     pub async fn scatter(&self, payload: M) -> Result<Replies<S::Reply>, BusError> {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::unbounded();
         let remaining = self.deliver_request(payload, Reply::Many(tx)).await;
         if remaining == 0 {
             return Err(BusError::NoResponders);
@@ -178,7 +169,7 @@ impl<R> Stream for Replies<R> {
         let Some(rx) = self.rx.as_mut() else {
             return Poll::Ready(None);
         };
-        let reply = ready!(rx.poll_recv(cx));
+        let reply = ready!(rx.poll_next_unpin(cx));
         if reply.is_some() {
             self.remaining -= 1;
         }
@@ -230,7 +221,7 @@ impl<R> ReplyToken<R> {
     /// [`request`](Channel::request), nobody replied yet.
     pub fn is_pending(&self) -> bool {
         match &self.0 {
-            Reply::One(tx) => lock(tx).as_ref().is_some_and(|tx| !tx.is_closed()),
+            Reply::One(tx) => lock(tx).as_ref().is_some_and(|tx| !tx.is_canceled()),
             Reply::Many(tx) => !tx.is_closed(),
         }
     }
@@ -244,7 +235,7 @@ impl<R> ReplyToken<R> {
                 let tx = lock(&tx).take();
                 tx.is_some_and(|tx| tx.send(reply).is_ok())
             }
-            Reply::Many(tx) => tx.send(reply).is_ok(),
+            Reply::Many(tx) => tx.unbounded_send(reply).is_ok(),
         }
     }
 }

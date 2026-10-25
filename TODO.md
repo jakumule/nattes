@@ -3,11 +3,6 @@
 
 Found in a design review, in priority order.
 
-- [ ] **Filters run on the publisher's thread**, inside `publish`: a slow
-  filter slows every publisher, and with `panic = "abort"` a panicking filter
-  aborts instead of counting as no match. Document ("keep filters cheap").
-- [ ] **`scatter` has no timeout**, and `request_timeout` ties the crate to the
-  tokio timer, against being executor-agnostic.
 - [ ] **Ambiguous subjects**: a parameter whose `Display` contains `.` gives
   `user.a.b.delete`. Only logs and `subject()`; escape or document.
 - [ ] **Document that messages must be `Sync`** (shared by every subscriber),

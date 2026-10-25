@@ -245,7 +245,7 @@ impl<T: 'static, P: 'static, S> Channel<T, P, S> {
 #[diagnostic::on_unimplemented(
     message = "can't publish on a request leaf",
     label = "takes requests only",
-    note = "send with `request`, `request_timeout` or `scatter`"
+    note = "send with `request` or `scatter`"
 )]
 pub trait Publish<T> {}
 
