@@ -300,7 +300,7 @@ pub use group::{InScope, QueueGroup};
 #[doc(hidden)]
 pub use nav::{Append, AppendParams, ParamStep, Plain, Prism};
 pub use nav::{IntoChannel, Is, Navigable, Param, Wild};
-pub use request::{Answer, BusError, Incoming, Replies};
+pub use request::{Answer, BusError, Incoming, Replies, ReplyToken};
 pub use subscription::{Msg, Respond, Responder, Subscribe, Subscription, SubscriptionBuilder};
 #[doc(hidden)]
 pub use tree::Step;

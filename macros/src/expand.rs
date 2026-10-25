@@ -161,6 +161,11 @@ impl Cx<'_> {
                             #[allow(unreachable_patterns)]
                             _ => None,
                         },
+                        |a: Topic| match a {
+                            Topic::#var(x) => Some(x),
+                            #[allow(unreachable_patterns)]
+                            _ => None,
+                        },
                         Topic::#var,
                     )
                 },
@@ -175,6 +180,11 @@ impl Cx<'_> {
                         #lit,
                         select,
                         |a: &Topic| match a {
+                            Topic::#var(v, x) => Some((v, x)),
+                            #[allow(unreachable_patterns)]
+                            _ => None,
+                        },
+                        |a: Topic| match a {
                             Topic::#var(v, x) => Some((v, x)),
                             #[allow(unreachable_patterns)]
                             _ => None,

@@ -3,10 +3,6 @@
 
 Found in a design review, in priority order.
 
-- [ ] **A subscriber can't own a message.** `Msg` and `Incoming` only deref to
-  `&T`, and the event is shared, so non-`Clone` messages can't be moved out
-  even with one receiver (queue group). Fix: `try_into_inner` through
-  `Arc::try_unwrap` and a by-value `Prism` projection.
 - [ ] **(Un)subscribe is O(n) in subscriptions on one trie node.**
   `Bus::subscribe` calls `Arc::make_mut` on `load_full()` while the `ArcSwap`
   still holds the trie, so every trie node on the path is cloned, including

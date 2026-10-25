@@ -268,6 +268,24 @@ impl<T, P> Msg<T, P> {
         subject(&*self.event)
     }
 
+    /// Take the message out, which needs no `Clone`. Fails, giving `self`
+    /// back, unless this `Msg` holds the last reference to the event: other
+    /// subscriptions that received it have dropped their `Msg`, no clone of
+    /// this one is alive, and `publish` returned (while it waits on an
+    /// [`Overflow::Wait`] buffer it still holds the event). A message with one
+    /// subscriber, or picked for one member of a queue group, is in that case
+    /// once `publish` returns.
+    ///
+    /// Read [`params`](Self::params) first if needed.
+    pub fn try_into_inner(self) -> Result<T, Self> {
+        self.route
+            .project_owned(self.event)
+            .map_err(|event| Self {
+                event,
+                route: self.route,
+            })
+    }
+
     fn view(&self) -> (P, &T) {
         self.route
             .project(&*self.event as &dyn Any)

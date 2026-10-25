@@ -275,6 +275,12 @@ while let Some(msg) = sub.next().await {
   picked first. If none is waiting, members with room in their buffer take turns
   (round robin). Only when every member's buffer is full does the overflow policy
   of the member whose turn it is apply. See [Queue groups](#queue-groups).
+- **Owning a message.** A message is shared by every subscription it was
+  delivered to, so `msg` only derefs to `&T`. `msg.try_into_inner()` moves the
+  `T` out, with no `Clone` needed, once this `msg` is the last holder: no other
+  subscription still holds it, no clone of `msg` exists, and `publish` has
+  returned. That is always the case with a single subscriber or a queue group
+  member. Otherwise it gives `msg` back as the `Err`.
 - **Slow subscribers.** Each subscription has its own buffer. When it's full, the
   `.on_full(...)` policy applies:
 
@@ -404,6 +410,8 @@ responder gets its own reply token: `req.respond(reply)` takes `req` by value,
 so a responder answers each request at most once, and dropping `req` without
 answering counts as no reply from this responder. `req.is_pending()` tells
 whether anyone still waits for a reply, to skip work nobody needs.
+`req.try_into_inner()` takes the payload out, like `Msg::try_into_inner`, together
+with a `ReplyToken` that answers with `respond(reply)` in the same way.
 
 Subscribers of the leaf, or of anything above it (`bus.subscribe()` on `>`),
 see the requests as plain messages, but they don't count as responders and

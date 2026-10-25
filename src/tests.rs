@@ -231,6 +231,96 @@ async fn filter() {
 }
 
 #[tokio::test]
+async fn a_single_receiver_owns_the_message() {
+    let pushes = push_channel();
+    let mut sub = pushes.subscribe().await;
+    pushes.publish(GitPushMsg("main".into())).await;
+    let msg = sub.next().await.unwrap();
+    assert_eq!(msg.try_into_inner().unwrap(), GitPushMsg("main".into()));
+
+    // and so does the member a queue group picked
+    let mut w1 = pushes.subscribe().queue(PushQueue::Workers).await;
+    let mut w2 = pushes.subscribe().queue(PushQueue::Workers).await;
+    drop(sub);
+    pushes.publish(GitPushMsg("dev".into())).await;
+    let msg = drain(&mut w1).pop().or(drain(&mut w2).pop()).unwrap();
+    assert_eq!(msg.try_into_inner().unwrap(), GitPushMsg("dev".into()));
+}
+
+#[tokio::test]
+async fn a_shared_message_is_owned_by_its_last_holder() {
+    let pushes = push_channel();
+    let mut a = pushes.subscribe().await;
+    let mut b = pushes.subscribe().await;
+    pushes.publish(GitPushMsg("main".into())).await;
+
+    let msg_a = a.next().await.unwrap();
+    let msg_b = b.next().await.unwrap();
+    let msg_a = msg_a.try_into_inner().unwrap_err();
+    let copy = msg_b.clone();
+    drop(msg_a);
+    let msg_b = msg_b.try_into_inner().unwrap_err();
+    drop(copy);
+    assert_eq!(msg_b.try_into_inner().unwrap(), GitPushMsg("main".into()));
+}
+
+#[tokio::test]
+async fn owning_through_params_and_levels() {
+    let bus = Channel::<topics::Topic>::new();
+    let id = Uuid::now_v7();
+    let mut deletes = at!(bus, user.id().delete).subscribe().await;
+    at!(bus, user.id(id).delete).publish(UserDeleteMsg).await;
+    let msg = deletes.next().await.unwrap();
+    assert_eq!(msg.params(), (id,));
+    assert!(matches!(msg.try_into_inner(), Ok(UserDeleteMsg)));
+    drop(deletes);
+
+    let mut users = at!(bus, user).subscribe().await;
+    at!(bus, user.id(id).update).publish(UserUpdateMsg).await;
+    let msg = users.next().await.unwrap();
+    assert!(matches!(
+        msg.try_into_inner(),
+        Ok(topics::user::Topic::Id(got, topics::user::id::Topic::Update(_))) if got == id
+    ));
+}
+
+#[tokio::test]
+async fn a_responder_owns_the_payload_and_keeps_the_token() -> anyhow::Result<()> {
+    let fetches = fetch_channel();
+    let mut responder = fetches.respond().await;
+    let request = tokio::spawn({
+        let fetches = fetches.clone();
+        async move { fetches.request(GitFetchMsg("main".into())).await }
+    });
+    let (payload, token) = responder.next().await.unwrap().try_into_inner().unwrap();
+    assert!(token.is_pending());
+    assert!(token.respond(FetchAck(payload.0.len())));
+    assert_eq!(request.await??, FetchAck(4));
+
+    // a dropped token is no reply
+    let request = tokio::spawn({
+        let fetches = fetches.clone();
+        async move { fetches.request(GitFetchMsg("main".into())).await }
+    });
+    let (_, token) = responder.next().await.unwrap().try_into_inner().unwrap();
+    drop(token);
+    assert!(matches!(request.await?, Err(BusError::NoReply)));
+
+    // while a subscriber holds the request, the responder can still answer
+    let mut sub = fetches.subscribe().await;
+    let request = tokio::spawn({
+        let fetches = fetches.clone();
+        async move { fetches.request(GitFetchMsg("dev".into())).await }
+    });
+    let incoming = responder.next().await.unwrap();
+    let _seen = sub.next().await.unwrap();
+    let incoming = incoming.try_into_inner().unwrap_err();
+    assert!(incoming.respond(FetchAck(3)));
+    assert_eq!(request.await??, FetchAck(3));
+    Ok(())
+}
+
+#[tokio::test]
 async fn request_reply() -> anyhow::Result<()> {
     let fetches = fetch_channel();
     assert!(matches!(

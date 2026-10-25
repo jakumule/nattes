@@ -17,6 +17,9 @@ pub(crate) trait Route<T, P>: Send + Sync {
     /// The `T` inside a root event, with the wildcard values: matches
     /// subscriptions and backs [`Msg`](crate::Msg).
     fn project<'a>(&self, root: &'a dyn Any) -> Option<(P, &'a T)>;
+    /// The `T` moved out of a root event that nobody else holds; gives the
+    /// event back otherwise. Backs `try_into_inner`.
+    fn project_owned(&self, event: Event) -> Result<T, Event>;
     /// The root event holding `t`, for `publish`. `None` below a wildcard.
     fn inject(&self, t: T) -> Option<Event>;
     /// Where subscriptions sit in the interest trie. Built on subscribe only.
@@ -29,6 +32,11 @@ struct Root<R>(PhantomData<fn() -> R>);
 impl<R: Level> Route<R, ()> for Root<R> {
     fn project<'a>(&self, root: &'a dyn Any) -> Option<((), &'a R)> {
         root.downcast_ref::<R>().map(|r| ((), r))
+    }
+    fn project_owned(&self, event: Event) -> Result<R, Event> {
+        let any: Arc<dyn Any + Send + Sync> = event;
+        let r = any.downcast::<R>().expect("events are of the root type");
+        Arc::try_unwrap(r).map_err(|r| r as Event)
     }
     fn inject(&self, r: R) -> Option<Event> {
         Some(Arc::new(r))
@@ -52,6 +60,10 @@ where
         let (p, a) = self.parent.project(root)?;
         let (q, b) = self.step.project(a)?;
         Some((p.append_params(q), b))
+    }
+    fn project_owned(&self, event: Event) -> Result<S::B, Event> {
+        let a = self.parent.project_owned(event)?;
+        Ok((self.step.project_owned(a)).expect("delivered only if it matched"))
     }
     fn inject(&self, b: S::B) -> Option<Event> {
         self.parent.inject(self.step.inject(b)?)

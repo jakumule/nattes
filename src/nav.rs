@@ -24,6 +24,8 @@ pub trait Prism<A>: Send + Sync + 'static {
     /// The `B` inside an `A`, or `None` if `A` is another variant (or another
     /// value for a fixed parameter).
     fn project<'a>(&self, a: &'a A) -> Option<(Self::Q, &'a Self::B)>;
+    /// `project` by value, without the params: the `B` moved out of an `A`.
+    fn project_owned(&self, a: A) -> Option<Self::B>;
     /// Wrap a `B` into its `A` variant; `None` on a wildcard step.
     fn inject(&self, b: Self::B) -> Option<A>;
     /// Key of this step in the interest trie.
@@ -35,6 +37,7 @@ pub trait Prism<A>: Send + Sync + 'static {
 pub struct Plain<A, B> {
     name: &'static str,
     project: for<'a> fn(&'a A) -> Option<&'a B>,
+    project_owned: fn(A) -> Option<B>,
     inject: fn(B) -> A,
 }
 
@@ -42,11 +45,13 @@ impl<A, B> Plain<A, B> {
     pub fn new(
         name: &'static str,
         project: for<'a> fn(&'a A) -> Option<&'a B>,
+        project_owned: fn(A) -> Option<B>,
         inject: fn(B) -> A,
     ) -> Self {
         Self {
             name,
             project,
+            project_owned,
             inject,
         }
     }
@@ -57,6 +62,9 @@ impl<A: 'static, B: 'static> Prism<A> for Plain<A, B> {
     type Q = ();
     fn project<'a>(&self, a: &'a A) -> Option<((), &'a B)> {
         (self.project)(a).map(|b| ((), b))
+    }
+    fn project_owned(&self, a: A) -> Option<B> {
+        (self.project_owned)(a)
     }
     fn inject(&self, b: B) -> Option<A> {
         Some((self.inject)(b))
@@ -75,6 +83,7 @@ pub struct ParamStep<A, V, B, S> {
     name: &'static str,
     select: S,
     project: for<'a> fn(&'a A) -> Option<(&'a V, &'a B)>,
+    project_owned: fn(A) -> Option<(V, B)>,
     inject: fn(V, B) -> A,
 }
 
@@ -83,12 +92,14 @@ impl<A, V, B, S> ParamStep<A, V, B, S> {
         name: &'static str,
         select: S,
         project: for<'a> fn(&'a A) -> Option<(&'a V, &'a B)>,
+        project_owned: fn(A) -> Option<(V, B)>,
         inject: fn(V, B) -> A,
     ) -> Self {
         Self {
             name,
             select,
             project,
+            project_owned,
             inject,
         }
     }
@@ -106,6 +117,11 @@ where
     fn project<'a>(&self, a: &'a A) -> Option<(S::Q, &'a B)> {
         let (v, b) = (self.project)(a)?;
         Some((self.select.select(v)?, b))
+    }
+    fn project_owned(&self, a: A) -> Option<B> {
+        let (v, b) = (self.project_owned)(a)?;
+        self.select.select(&v)?;
+        Some(b)
     }
     fn inject(&self, b: B) -> Option<A> {
         Some((self.inject)(self.select.value()?, b))

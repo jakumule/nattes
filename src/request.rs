@@ -215,8 +215,46 @@ impl<R> fmt::Debug for Replies<R> {
 /// counts as no reply from this responder.
 pub struct Incoming<M, R, P> {
     event: Event,
-    reply: Reply<R>,
+    reply: ReplyToken<R>,
     route: Arc<dyn Route<M, P>>,
+}
+
+/// A responder's reply token, out of an [`Incoming`] by
+/// [`try_into_inner`](Incoming::try_into_inner): answers the request once
+/// with [`respond`](Self::respond). Dropping it unanswered counts as no reply
+/// from this responder.
+pub struct ReplyToken<R>(Reply<R>);
+
+impl<R> ReplyToken<R> {
+    /// Whether a reply is still possible: the requester is waiting and, for a
+    /// [`request`](Channel::request), nobody replied yet.
+    pub fn is_pending(&self) -> bool {
+        match &self.0 {
+            Reply::One(tx) => lock(tx).as_ref().is_some_and(|tx| !tx.is_closed()),
+            Reply::Many(tx) => !tx.is_closed(),
+        }
+    }
+
+    /// Answer the request. Returns `false` if the requester is gone or, for a
+    /// [`request`](Channel::request), another responder already replied.
+    pub fn respond(self, reply: R) -> bool {
+        match self.0 {
+            Reply::One(tx) => {
+                // Release the lock first: a failed send drops `reply`, which is user code
+                let tx = lock(&tx).take();
+                tx.is_some_and(|tx| tx.send(reply).is_ok())
+            }
+            Reply::Many(tx) => tx.send(reply).is_ok(),
+        }
+    }
+}
+
+impl<R> fmt::Debug for ReplyToken<R> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ReplyToken")
+            .field("pending", &self.is_pending())
+            .finish()
+    }
 }
 
 impl<M, R: Send + 'static, P> Incoming<M, R, P> {
@@ -228,7 +266,7 @@ impl<M, R: Send + 'static, P> Incoming<M, R, P> {
             .expect("each responder gets its own `Answering`");
         Self {
             event: answering.event,
-            reply: answering.reply,
+            reply: ReplyToken(answering.reply),
             route,
         }
     }
@@ -248,22 +286,29 @@ impl<M, R, P> Incoming<M, R, P> {
     /// Whether a reply is still possible: the requester is waiting and, for a
     /// [`request`](Channel::request), nobody replied yet.
     pub fn is_pending(&self) -> bool {
-        match &self.reply {
-            Reply::One(tx) => lock(tx).as_ref().is_some_and(|tx| !tx.is_closed()),
-            Reply::Many(tx) => !tx.is_closed(),
-        }
+        self.reply.is_pending()
     }
 
     /// Answer the request. Returns `false` if the requester is gone or, for a
     /// [`request`](Channel::request), another responder already replied.
     pub fn respond(self, reply: R) -> bool {
-        match self.reply {
-            Reply::One(tx) => {
-                // Release the lock first: a failed send drops `reply`, which is user code
-                let tx = lock(&tx).take();
-                tx.is_some_and(|tx| tx.send(reply).is_ok())
-            }
-            Reply::Many(tx) => tx.send(reply).is_ok(),
+        self.reply.respond(reply)
+    }
+
+    /// Take the payload out, which needs no `Clone`, with the reply token to
+    /// answer it. Fails, giving `self` back, while subscribers that received
+    /// the request still hold it (see [`Msg::try_into_inner`](crate::Msg::try_into_inner)),
+    /// or while the requester is still delivering it.
+    ///
+    /// Read [`params`](Self::params) first if needed.
+    pub fn try_into_inner(self) -> Result<(M, ReplyToken<R>), Self> {
+        match self.route.project_owned(self.event) {
+            Ok(payload) => Ok((payload, self.reply)),
+            Err(event) => Err(Self {
+                event,
+                reply: self.reply,
+                route: self.route,
+            }),
         }
     }
 

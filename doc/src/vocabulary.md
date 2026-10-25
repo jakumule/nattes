@@ -87,7 +87,7 @@ topics! {
 | **publisher** | Who publishes: calls `publish` on a channel. | sender |
 | **requester** | Who sends a request: calls `request`, `request_timeout` or `scatter`. | sender |
 | **responder** | A subscription made with `respond()` on a request leaf, and its handle `Responder`, a `Stream` of incoming requests. Only responders count for and answer requests. | receiver |
-| **incoming request** | What a responder receives: `Incoming`, which derefs to the payload and carries the responder's own **reply token**, used once by `respond(reply)`. | — |
+| **incoming request** | What a responder receives: `Incoming`, which derefs to the payload and carries the responder's own **reply token**, used once by `respond(reply)`. `try_into_inner` splits it into the payload and the token, a `ReplyToken`. | — |
 
 ## Internals
 
@@ -111,6 +111,6 @@ The internal types, by term:
 | event | `Event` (`Arc<dyn Level>`) |
 | level | `Level` (the trait every `Topic` enum implements) |
 | route | `Route`, `Root`, `Hop` |
-| responder, in the bus | `Answering<R>` (the event of one responder: the request's event and its reply token), `Reply` (the token) |
+| responder, in the bus | `Answering<R>` (the event of one responder: the request's event and its reply token), `Reply` (the token, public as `ReplyToken`) |
 | step | `Prism` (`Plain`, `ParamStep`), `Step`, `Steps` |
 | scope | `S`, `InScope<S>`, `Answer<M>`, `Publish<T>` |
