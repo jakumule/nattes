@@ -2,6 +2,7 @@
 
 use crate::Channel;
 use crate::ParamValue;
+use crate::tree::Escaped;
 use std::borrow::Borrow;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -304,7 +305,7 @@ impl std::fmt::Display for Pattern<'_> {
             match &key.param {
                 KeyParam::None => {}
                 KeyParam::Wild => f.write_str(".*")?,
-                KeyParam::Is(value) => write!(f, ".{}", value.0)?,
+                KeyParam::Is(value) => write!(f, ".{}", Escaped(&*value.0))?,
             }
             f.write_str(".")?;
         }

@@ -176,6 +176,21 @@ async fn sub_channel_is_a_new_root() {
 }
 
 #[tokio::test]
+async fn subjects_escape_parameter_values() {
+    let bus = Channel::<topics::Topic>::new();
+    let text = "a.b c%*>é".to_string();
+    let ch = at!(bus, other.text(text.clone()));
+    let mut sub = ch.subscribe().await;
+    ch.publish(StringEvent).await;
+
+    assert_eq!(
+        drain(&mut sub)[0].subject(),
+        "other.text.a%2Eb%20c%25%2A%3Eé"
+    );
+    assert_eq!(format!("{ch:?}"), "Channel(other.text.a%2Eb%20c%25%2A%3Eé.>)");
+}
+
+#[tokio::test]
 async fn same_type_in_several_places() {
     let bus = Channel::<topics::Topic>::new();
     let git_u32 = at!(bus, git.count(1));

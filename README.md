@@ -348,7 +348,9 @@ while let Some(msg) = sub.next().await {
   filter holding a channel keeps the bus open, like an `mpsc` sender.
 - **Unsubscribing.** Drop the subscription. Publishers waiting on it are released.
 - **Subjects.** `msg.subject()` gives a NATS-style subject for logging, built from
-  names and parameter values, e.g. `user.id.42.delete`.
+  names and parameter values, e.g. `user.id.42.delete`. `%`, `.`, `*`, `>` and
+  whitespace in parameter values are escaped as `%XX` (`user.id.a%2Eb.delete`), so
+  each value stays one segment.
 
 ## Queue groups
 
@@ -659,7 +661,7 @@ The same holds for `try_publish`.
 - Messages must be `Send + Sync + 'static`.
 - Parameter types must implement `Clone + Eq + Hash + Display`. Messages are routed
   by comparing parameter values with `Eq`, and `Display` is only used for
-  `subject()`. Floats aren't `Eq`, so they can't be parameters.
+  `subject()`, escaped as above. Floats aren't `Eq`, so they can't be parameters.
 - Values in queue group variants must implement `Clone + Eq + Hash + Send + Sync +
   'static`.
 - `topics!` must be used at module level, because its modules find your types

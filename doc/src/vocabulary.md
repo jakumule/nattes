@@ -32,7 +32,7 @@ topics! {
 | **chain** | `a.b.c`, a shorthand for `a { b { c } }`: `random.arrow.more: DeepMsg`. | — |
 | **mount** | `name = module`: the root of another tree, as a level of this one. `other = other`. | — |
 | **name** | A topic's identifier as written in `topics!`: `push`, `r#type`. It gives the segment, the module and method names, and, in camel case, the `Topic` variant. | — |
-| **segment** | One part of a subject or pattern, separated by dots: a name or a parameter value. `user.id.42.delete` has four. | — |
+| **segment** | One part of a subject or pattern, separated by dots: a name or a parameter value. `user.id.42.delete` has four. `%`, `.`, `*`, `>` and whitespace in a parameter value are escaped as `%XX`, so it stays one segment. | — |
 | **parameter** | The typed slot on a topic: `id(Uuid)`. | param (in prose) |
 | **fixed** | A parameter given a value in a path: `id(alice)`, selected with `Is`. | — |
 | **wildcard** | A parameter left open in a path: `id()` or `id(_)`, selected with `Wild`, shown as `*`. | any, `Any` |

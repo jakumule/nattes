@@ -66,6 +66,9 @@ impl Hash for dyn ParamValue {
 }
 
 /// NATS-style subject of an event, e.g. `user.<uuid>.delete`.
+///
+/// `%`, `.`, `*`, `>` and whitespace in parameter values are escaped as `%XX`
+/// (`user.id.a%2Eb.delete`), so each value stays one segment.
 pub fn subject(event: &dyn Level) -> String {
     Subject(event).to_string()
 }
@@ -85,10 +88,39 @@ impl Display for Subject<'_> {
             first = false;
             f.write_str(step.name)?;
             if let Some(param) = step.param {
-                write!(f, ".{param}")?;
+                write!(f, ".{}", Escaped(param))?;
             }
             next = step.next;
         }
         Ok(())
+    }
+}
+
+/// Displays a parameter value as one segment: `%`, `.`, `*`, `>` and
+/// whitespace become `%XX`, the hex of their UTF-8 bytes.
+pub(crate) struct Escaped<'a>(pub(crate) &'a dyn ParamValue);
+
+impl Display for Escaped<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        struct Escape<'a, 'b>(&'a mut fmt::Formatter<'b>);
+
+        impl fmt::Write for Escape<'_, '_> {
+            fn write_str(&mut self, s: &str) -> fmt::Result {
+                let mut rest = s;
+                while let Some((at, c)) = rest
+                    .char_indices()
+                    .find(|&(_, c)| matches!(c, '%' | '.' | '*' | '>') || c.is_whitespace())
+                {
+                    self.0.write_str(&rest[..at])?;
+                    for byte in c.encode_utf8(&mut [0; 4]).bytes() {
+                        write!(self.0, "%{byte:02X}")?;
+                    }
+                    rest = &rest[at + c.len_utf8()..];
+                }
+                self.0.write_str(rest)
+            }
+        }
+
+        fmt::Write::write_fmt(&mut Escape(f), format_args!("{}", self.0))
     }
 }
