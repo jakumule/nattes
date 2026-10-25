@@ -104,7 +104,7 @@ The internal types, by term:
 | bus | `Bus` (`bus.rs`), held by channels through a `Handle` (`channel.rs`) that closes it on drop |
 | buffer | `Buffer` |
 | subscription, in the trie | `Sub` |
-| queue group, in the trie | `Members`, sharing a `RoundRobin` position, keyed by `GroupKey` |
+| queue group, in the trie | `Members`, sharing a `RoundRobin` position, keyed by `GroupId` (the `GroupKey` and the names of the topic's path) |
 | interest trie | `Interest`, children in `Edges { plain, wild, fixed }` |
 | key | `Key`, `KeyParam`, `ParamKey` |
 | matcher | `Matcher` |

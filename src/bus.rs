@@ -700,10 +700,20 @@ fn pick<'e>(
 
 #[derive(Default)]
 struct State {
-    /// Queue groups by value and whether they are responders, with their
-    /// member count: a group is forgotten with its last member.
-    groups: HashMap<(GroupKey, bool), (Arc<RoundRobin>, usize)>,
+    /// Queue groups by value, topic and whether they are responders, with
+    /// their member count: a group is forgotten with its last member.
+    groups: HashMap<GroupId, (Arc<RoundRobin>, usize)>,
     next_id: u64,
+}
+
+/// A queue group's value, the names of its topic's path and whether its
+/// members are responders. The names tell the mounts of a tree apart, and
+/// leave out parameters, so a group spans `user.id(alice)` and `user.id()`.
+type GroupId = (GroupKey, Box<[&'static str]>, bool);
+
+fn group_id(key: &GroupKey, path: &[Key], responder: bool) -> GroupId {
+    let names = path.iter().map(|key| key.name).collect();
+    (key.clone(), names, responder)
 }
 
 /// An event to deliver once there is room: in its subscriber's full buffer,
@@ -917,7 +927,8 @@ impl Bus {
         let id = state.next_id;
         state.next_id += 1;
         let turn = group_key.map(|key| {
-            let (turn, members) = state.groups.entry((key.clone(), responder)).or_default();
+            let id = group_id(key, path, responder);
+            let (turn, members) = state.groups.entry(id).or_default();
             *members += 1;
             turn.clone()
         });
@@ -956,7 +967,7 @@ impl Bus {
         let mut state = lock(&self.state);
         let mut forgotten = None;
         if let Some(key) = group {
-            let key = (key.clone(), responder);
+            let key = group_id(key, path, responder);
             if let Some((_, members)) = state.groups.get_mut(&key) {
                 *members -= 1;
                 if *members == 0 {

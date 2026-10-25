@@ -392,7 +392,9 @@ pushes.publish(GitPushMsg { branch: "main".into() }).await;
 - **Parameters don't change the topic.** A group declared on `user.id` can be
   joined on `user.id(alice)` and on `user.id()`; members on both form one group.
 - **Mounted trees keep their groups.** Groups declared inside `other` are joined
-  on `other`'s topics, wherever it's mounted.
+  on `other`'s topics, wherever it's mounted. Each mount has its own groups:
+  with `a = other` and `b = other`, members on `a.x` and on `b.x` don't share
+  turns, even in the same group value.
 - **Attributes** go inside the brackets, as inner attributes:
   `[#![derive(Debug)] Indexer(u32), Audit]`. The enum already
   derives `Clone`, `PartialEq`, `Eq` and `Hash`. Variants can have attributes

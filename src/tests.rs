@@ -37,7 +37,7 @@ crate::topics! {
     #[derive(Debug)]
     #[allow(dead_code)]
     other {
-        num(u32): U32Event,
+        num(u32) [Workers]: U32Event,
         text(String): StringEvent,
     }
 }
@@ -64,6 +64,7 @@ crate::topics! {
         repo.id(u64) [Workers].delete: RepoDeleteMsg,
         random.arrow [Workers].more: VeryNestedMsg,
         other = other,
+        again = other,
     }
 }
 
@@ -1360,6 +1361,22 @@ async fn queue_groups_are_forgotten_with_their_last_member() {
     assert_eq!(pushes.bus.group_count(), 1);
     drop(w2);
     assert_eq!(pushes.bus.group_count(), 0);
+}
+
+#[tokio::test]
+async fn mounted_trees_have_their_own_groups() {
+    let bus = Channel::<topics::Topic>::new();
+    let mut w1 = at!(bus, other.num()).subscribe().queue(other::NumQueue::Workers).await;
+    let mut w2 = at!(bus, other.num()).subscribe().queue(other::NumQueue::Workers).await;
+    let mut w3 = at!(bus, again.num()).subscribe().queue(other::NumQueue::Workers).await;
+    assert_eq!(bus.bus.group_count(), 2);
+
+    // publishing on `again` doesn't move the turn of `other`
+    at!(bus, other.num(1)).publish(U32Event).await;
+    at!(bus, again.num(1)).publish(U32Event).await;
+    at!(bus, other.num(1)).publish(U32Event).await;
+    let counts = [drain(&mut w1), drain(&mut w2), drain(&mut w3)].map(|m| m.len());
+    assert_eq!(counts, [1, 1, 1]);
 }
 
 #[tokio::test]
