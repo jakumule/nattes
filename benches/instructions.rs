@@ -174,6 +174,29 @@ fn unsubscribe((bus, subs, sub): (Bus, Vec<Sub>, Sub)) -> (Bus, Vec<Sub>) {
     (bus, subs)
 }
 
+// Subscribe once to `load`, which has `n` subscriptions.
+#[library_benchmark]
+#[benches::existing(args = [0, 1000, 10000], setup = fan_out_setup)]
+fn subscribe_same_channel((load, subs): (Load, Vec<Sub>)) -> (Load, Vec<Sub>, Sub) {
+    let sub = buffered(load.subscribe());
+    (load, subs, sub)
+}
+
+/// `load` with `n` other subscriptions, and one to drop.
+fn unsubscribe_same_channel_setup(n: u64) -> (Load, Vec<Sub>, Sub) {
+    let (load, subs) = fan_out_setup(n);
+    let sub = buffered(load.subscribe());
+    (load, subs, sub)
+}
+
+// Unsubscribe once from `load`, which keeps `n` other subscriptions.
+#[library_benchmark]
+#[benches::existing(args = [0, 1000, 10000], setup = unsubscribe_same_channel_setup)]
+fn unsubscribe_same_channel((load, subs, sub): (Load, Vec<Sub>, Sub)) -> (Load, Vec<Sub>) {
+    drop(black_box(sub));
+    (load, subs)
+}
+
 /// A received `user.<id>.delete` message.
 fn subject_setup() -> (Sub<(u64,)>, Msg<Message, (u64,)>) {
     let bus = Channel::<topics::Topic>::new();
@@ -251,7 +274,15 @@ library_benchmark_group!(
 
 library_benchmark_group!(name = receiving, benchmarks = [receive, subject]);
 
-library_benchmark_group!(name = subscriptions, benchmarks = [subscribe, unsubscribe]);
+library_benchmark_group!(
+    name = subscriptions,
+    benchmarks = [
+        subscribe,
+        unsubscribe,
+        subscribe_same_channel,
+        unsubscribe_same_channel
+    ]
+);
 
 library_benchmark_group!(name = requests, benchmarks = [request_scatter, answer]);
 

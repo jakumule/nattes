@@ -473,6 +473,48 @@ async fn drop_unsubscribes() {
 }
 
 #[tokio::test]
+async fn many_subscriptions_on_one_channel() {
+    let pushes = push_channel();
+    let mut subs = Vec::new();
+    for _ in 0..300 {
+        subs.push(pushes.subscribe().await);
+    }
+    // Leaves gaps of every size, and whole runs of subscriptions gone
+    let mut kept: Vec<_> = (subs.into_iter().enumerate())
+        .filter(|(i, _)| i % 7 == 0 || (100..140).contains(i))
+        .map(|(_, sub)| sub)
+        .collect();
+    assert_eq!(pushes.publish(GitPushMsg("a".into())).await, kept.len());
+    for sub in &mut kept {
+        assert_eq!(drain(sub).len(), 1);
+    }
+    kept.truncate(kept.len() / 2);
+    assert_eq!(pushes.publish(GitPushMsg("b".into())).await, kept.len());
+    drop(kept);
+    assert_eq!(pushes.publish(GitPushMsg("c".into())).await, 0);
+}
+
+#[tokio::test]
+async fn large_queue_group_takes_turns() {
+    let pushes = push_channel();
+    let mut members = Vec::new();
+    for _ in 0..200 {
+        members.push(pushes.subscribe().queue(PushQueue::Workers).await);
+    }
+    let mut members: Vec<_> = (members.into_iter().enumerate())
+        .filter(|(i, _)| i % 3 != 0 && !(50..120).contains(i))
+        .map(|(_, member)| member)
+        .collect();
+    // A round robin turn gives each member one message
+    for i in 0..members.len() {
+        assert_eq!(pushes.publish(GitPushMsg(i.to_string())).await, 1);
+    }
+    for member in &mut members {
+        assert_eq!(drain(member).len(), 1);
+    }
+}
+
+#[tokio::test]
 async fn subscriptions_end_once_every_channel_is_dropped() {
     let bus = Channel::<topics::Topic>::new();
     let pushes = at!(bus, git.push);

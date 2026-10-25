@@ -259,7 +259,7 @@ struct RoundRobin {
 #[derive(Clone)]
 pub(crate) struct Members {
     turn: Arc<RoundRobin>,
-    subs: Vec<Arc<Sub>>,
+    subs: Subs,
     /// Made with `respond()`: responders and subscribers joining the same
     /// group form two groups.
     responder: bool,
@@ -271,12 +271,12 @@ pub(crate) struct Members {
 #[derive(Clone, Default)]
 pub(crate) struct Interest {
     /// Subscriptions outside any queue group.
-    pub(crate) subs: Vec<Arc<Sub>>,
+    pub(crate) subs: Subs,
     /// Queue group members, kept here so publishing doesn't regroup them.
     pub(crate) groups: Vec<Members>,
     /// Responders (made with `respond()`) outside any queue group, apart so
     /// that publishing doesn't even look at them: they only get requests.
-    pub(crate) responders: Vec<Arc<Sub>>,
+    pub(crate) responders: Subs,
     /// Queue groups of responders. Responders and subscribers joining the same
     /// group form two groups.
     pub(crate) responder_groups: Vec<Members>,
@@ -357,7 +357,7 @@ impl Interest {
                         Some(members) => members.subs.push(sub),
                         None => groups.push(Members {
                             turn,
-                            subs: vec![sub],
+                            subs: Subs::one(sub),
                             responder,
                         }),
                     }
@@ -397,11 +397,9 @@ impl Interest {
                 } else {
                     (&mut node.subs, &mut node.groups)
                 };
-                subs.retain(|e| e.id != id);
-                for members in &mut *groups {
-                    members.subs.retain(|e| e.id != id);
+                if !subs.remove(id) && groups.iter_mut().any(|m| m.subs.remove(id)) {
+                    groups.retain(|m| !m.subs.is_empty());
                 }
-                groups.retain(|m| !m.subs.is_empty());
             }
             Some((key, rest)) => {
                 let Some(i) = node.children.iter().position(|(n, _)| *n == key.name) else {
@@ -425,9 +423,9 @@ impl Interest {
     /// Calls `f` with every subscription in the trie.
     fn for_each_sub(&self, f: &mut impl FnMut(&Sub)) {
         let members = self.groups.iter().chain(&self.responder_groups);
-        (self.subs.iter().chain(&self.responders))
-            .chain(members.flat_map(|m| &m.subs))
-            .for_each(|sub| f(sub));
+        (self.subs.iter().chain(self.responders.iter()))
+            .chain(members.flat_map(|m| m.subs.iter()))
+            .for_each(&mut *f);
         for (_, edges) in &self.children {
             let fixed = edges.fixed.values();
             for child in edges.plain.iter().chain(&edges.wild).chain(fixed) {
@@ -465,6 +463,90 @@ impl Interest {
                 }
             }
         }
+    }
+}
+
+/// Subscriptions of a trie node, in id (subscription) order. Copy on write
+/// clones the trie nodes on a path, and a plain `Vec` copied every
+/// subscription of the channel with it: the chunks here are shared, so a
+/// clone costs one count per `CHUNK` subscriptions and a change copies one
+/// chunk. Publishing iterates plain slices: with `imbl::Vector`, building its
+/// focus and indexing it cost publishing up to 50%.
+#[derive(Clone, Default)]
+pub(crate) struct Subs {
+    /// Never empty, at most `CHUNK` long, and two neighbors never fit in one.
+    chunks: Vec<Arc<Vec<Arc<Sub>>>>,
+}
+
+/// Most subscriptions in one chunk of `Subs`.
+const CHUNK: usize = 64;
+
+impl Subs {
+    fn one(sub: Arc<Sub>) -> Self {
+        Self {
+            chunks: vec![Arc::new(vec![sub])],
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.chunks.is_empty()
+    }
+
+    /// Appends `sub`: ids grow, so this keeps id order.
+    fn push(&mut self, sub: Arc<Sub>) {
+        match self.chunks.last_mut() {
+            Some(last) if last.len() < CHUNK => Arc::make_mut(last).push(sub),
+            _ => self.chunks.push(Arc::new(vec![sub])),
+        }
+    }
+
+    /// Removes subscription `id`; `false` if it isn't here.
+    fn remove(&mut self, id: u64) -> bool {
+        let c = (self.chunks).partition_point(|chunk| chunk.last().is_some_and(|sub| sub.id < id));
+        let Some(chunk) = self.chunks.get_mut(c) else {
+            return false;
+        };
+        let Ok(i) = chunk.binary_search_by_key(&id, |sub| sub.id) else {
+            return false;
+        };
+        let chunk = Arc::make_mut(chunk);
+        chunk.remove(i);
+        if chunk.is_empty() {
+            self.chunks.remove(c);
+        } else {
+            self.merge(c);
+        }
+        if c > 0 {
+            self.merge(c - 1);
+        }
+        true
+    }
+
+    /// Merges chunk `c` with the next one if both fit in one.
+    fn merge(&mut self, c: usize) {
+        if let [chunk, next, ..] = &self.chunks[c..]
+            && chunk.len() + next.len() <= CHUNK
+        {
+            let next = self.chunks.remove(c + 1);
+            Arc::make_mut(&mut self.chunks[c]).extend(next.iter().cloned());
+        }
+    }
+
+    /// Calls `f` with each subscription. Not an iterator: nested loops over
+    /// slices are what inlines into publishing.
+    #[inline]
+    fn each(&self, mut f: impl FnMut(&Sub)) {
+        for chunk in &self.chunks {
+            for sub in chunk.iter() {
+                f(sub);
+            }
+        }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &Sub> {
+        self.chunks
+            .iter()
+            .flat_map(|chunk| chunk.iter().map(|sub| &**sub))
     }
 }
 
@@ -625,20 +707,20 @@ impl Bus {
         let any = &**event as &dyn Any;
         let mut groups: SmallVec<[&Members; 4]> = SmallVec::new();
         interest.visit(Some(&**event), &mut |node| {
-            for sub in &node.subs {
+            node.subs.each(|sub| {
                 if sub.accepts(any) {
                     push(sub, false);
                 }
-            }
+            });
             if !node.groups.is_empty() {
                 groups.extend(&node.groups);
             }
             if REQUEST {
-                for sub in &node.responders {
+                node.responders.each(|sub| {
                     if sub.accepts(any) {
                         push(sub, true);
                     }
-                }
+                });
                 groups.extend(&node.responder_groups);
             }
         });
@@ -654,15 +736,22 @@ impl Bus {
             // Only requests reach responder groups
             let responders = REQUEST && members.responder;
             let pushed = || if responders { respond() } else { event.clone() };
-            let member = if groups[i + 1..].iter().any(same) {
-                let mut all: Vec<&Sub> = (groups[i..].iter().filter(|m| same(m)))
-                    .flat_map(|m| m.subs.iter().map(|e| &**e))
-                    .collect();
-                all.sort_unstable_by_key(|sub| sub.id);
-                pick(&members.turn, all.len(), |i| all[i], event, pushed)
-            } else {
-                let subs = &members.subs;
-                pick(&members.turn, subs.len(), |i| &subs[i], event, pushed)
+            let merged = groups[i + 1..].iter().any(same);
+            let member = match members.subs.chunks.as_slice() {
+                [subs] if !merged => {
+                    let subs: &[Arc<Sub>] = subs;
+                    pick(&members.turn, subs.len(), |i| &subs[i], event, pushed)
+                }
+                // Over several trie nodes, or more than one chunk on this one
+                _ => {
+                    let mut all: Vec<&Sub> = (groups[i..].iter().filter(|m| same(m)))
+                        .flat_map(|m| m.subs.iter())
+                        .collect();
+                    if merged {
+                        all.sort_unstable_by_key(|sub| sub.id);
+                    }
+                    pick(&members.turn, all.len(), |i| all[i], event, pushed)
+                }
             };
             let counts = responders || !REQUEST;
             match member {

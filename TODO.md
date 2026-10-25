@@ -3,13 +3,6 @@
 
 Found in a design review, in priority order.
 
-- [ ] **(Un)subscribe is O(n) in subscriptions on one trie node.**
-  `Bus::subscribe` calls `Arc::make_mut` on `load_full()` while the `ArcSwap`
-  still holds the trie, so every trie node on the path is cloned, including
-  its whole `subs: Vec`. N subscriptions on one channel cost O(N²); the imbl
-  map only fixed many parameter values. Fix: a persistent collection for
-  `subs`/`groups`; add an `instructions` bench with 10k subscriptions on one
-  channel.
 - [ ] **`Overflow::Wait` pitfalls.** Undocumented self-deadlock: a task
   publishing to a subject it subscribes to with `Wait` and a full buffer. In a
   queue group where every member is full, `pick` applies the first accepting
