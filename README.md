@@ -658,7 +658,12 @@ The same holds for `try_publish`.
 
 ## Requirements
 
-- Messages must be `Send + Sync + 'static`.
+- Messages must be `Send + Sync + 'static`. One published message is shared by
+  every subscriber that receives it, so it must be `Sync`: this rules out fields
+  like `Cell`, `RefCell` or `std::sync::mpsc::Receiver`. Wrap such a field in a
+  `Mutex`, or send something shareable instead (an `Arc`, a `futures::channel`
+  sender, …). `Msg::try_into_inner` gives the message back by value once no other
+  subscriber holds it.
 - Parameter types must implement `Clone + Eq + Hash + Display`. Messages are routed
   by comparing parameter values with `Eq`, and `Display` is only used for
   `subject()`, escaped as above. Floats aren't `Eq`, so they can't be parameters.

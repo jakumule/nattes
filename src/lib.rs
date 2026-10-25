@@ -279,6 +279,15 @@
 //! # fn main() {}
 //! ```
 //!
+//! # Messages are shared
+//!
+//! Messages must be `Send + Sync + 'static`. One published message is shared by
+//! every subscriber that receives it, so it must be `Sync`: this rules out
+//! fields like `Cell`, `RefCell` or [`std::sync::mpsc::Receiver`]. Wrap such a
+//! field in a `Mutex`, or send something shareable instead (an `Arc`, a
+//! `futures::channel` sender, …). [`Msg::try_into_inner`] gives the message
+//! back by value once no other subscriber holds it.
+//!
 //! # Delivery guarantees
 //!
 //! Delivery is **at most once**, in memory. A message only lives in subscriber
