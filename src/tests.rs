@@ -811,6 +811,66 @@ async fn queue_group_passes_over_full_members() {
 }
 
 #[tokio::test]
+async fn full_queue_group_waits_if_any_member_waits() {
+    let pushes = push_channel();
+    let mut w1 = pushes.subscribe().queue(PushQueue::Workers).buffer(1).await;
+    let mut w2 = (pushes.subscribe().queue(PushQueue::Workers).buffer(1))
+        .on_full(Overflow::Wait)
+        .await;
+    pushes.publish(GitPushMsg("a".into())).await; // w1
+    pushes.publish(GitPushMsg("b".into())).await; // w2
+
+    // both full: w1's turn, but w2 waits, so the group waits instead of dropping
+    let mut blocked = pin!(pushes.publish(GitPushMsg("c".into())));
+    assert!(blocked.as_mut().now_or_never().is_none());
+    assert_eq!((w1.dropped(), w2.dropped()), (0, 0));
+
+    assert_eq!(w2.next().await.unwrap().0, "b");
+    assert_eq!(blocked.await, 1);
+    assert_eq!(drain(&mut w1).len(), 1);
+    assert_eq!(w2.next().await.unwrap().0, "c");
+}
+
+#[tokio::test]
+async fn waiting_queue_group_delivers_to_the_first_member_with_room() {
+    let pushes = push_channel();
+    let wait = || {
+        (pushes.subscribe().queue(PushQueue::Workers).buffer(1)).on_full(Overflow::Wait)
+    };
+    let mut w1 = wait().await;
+    let mut w2 = wait().await;
+    pushes.publish(GitPushMsg("a".into())).await; // w1
+    pushes.publish(GitPushMsg("b".into())).await; // w2
+
+    // both full and w1's turn: room in w2 first releases the publisher
+    let mut blocked = pin!(pushes.publish(GitPushMsg("c".into())));
+    assert!(blocked.as_mut().now_or_never().is_none());
+    assert_eq!(w2.next().await.unwrap().0, "b");
+    assert_eq!(blocked.now_or_never(), Some(1));
+    assert_eq!(w2.next().await.unwrap().0, "c");
+    assert_eq!(drain(&mut w1).len(), 1);
+}
+
+#[tokio::test]
+async fn waiting_queue_group_is_released_when_its_members_leave() {
+    let pushes = push_channel();
+    let wait = || {
+        (pushes.subscribe().queue(PushQueue::Workers).buffer(1)).on_full(Overflow::Wait)
+    };
+    let w1 = wait().await;
+    let w2 = wait().await;
+    pushes.publish(GitPushMsg("a".into())).await;
+    pushes.publish(GitPushMsg("b".into())).await;
+
+    let mut blocked = pin!(pushes.publish(GitPushMsg("c".into())));
+    assert!(blocked.as_mut().now_or_never().is_none());
+    drop(w1);
+    assert!(blocked.as_mut().now_or_never().is_none(), "w2 is still full");
+    drop(w2);
+    assert_eq!(blocked.await, 0);
+}
+
+#[tokio::test]
 async fn cancelled_publish_skips_the_subscribers_it_waited_for() {
     let pushes = push_channel();
     let mut fast = pushes.subscribe().await;

@@ -30,6 +30,14 @@ pub enum Overflow {
     /// Drop the oldest buffered message to make room.
     DropOldest,
     /// Make `publish` wait until there is room (backpressure).
+    ///
+    /// The publisher waits after delivering to everyone else, but its next
+    /// messages wait behind this one: a slow subscriber holds back what the
+    /// publisher sends to every subscriber (head-of-line blocking). A task that
+    /// publishes to a subject it subscribes to with `Wait` deadlocks once its
+    /// buffer is full, since only it can make room. A queue group whose members
+    /// are all full waits if any of them has `Wait`, and delivers to the first
+    /// of those to have room.
     Wait,
 }
 
@@ -153,6 +161,36 @@ impl Buffer {
                 Push::Full(back) => event = back,
             }
             notified.await;
+        }
+    }
+
+    /// Wait for room in any of `buffers` (full members of a queue group) and
+    /// push to the first with room, in order; `false` if they all went away.
+    async fn push_wait_any(buffers: &[Arc<Self>], event: Event) -> bool {
+        let mut live: Vec<&Self> = buffers.iter().map(|buffer| &**buffer).collect();
+        loop {
+            let mut notified: Vec<_> = (live.iter())
+                .map(|buffer| Box::pin(buffer.space.notified()))
+                .collect();
+            for notified in &mut notified {
+                notified.as_mut().enable();
+            }
+            // A clone, so a closed buffer doesn't take the event the others wait for
+            let mut i = 0;
+            while i < live.len() {
+                match live[i].try_push::<true>(event.clone()) {
+                    Push::Delivered | Push::Evicted => return true,
+                    Push::Full(_) => i += 1,
+                    Push::Dropped | Push::Closed => {
+                        live.remove(i);
+                        drop(notified.remove(i));
+                    }
+                }
+            }
+            if live.is_empty() {
+                return false;
+            }
+            futures::future::select_all(notified).await;
         }
     }
 
@@ -557,16 +595,21 @@ pub(crate) type ForResponder<'a> = &'a (dyn Fn() -> Event + Sync);
 enum Picked<'e> {
     /// Already delivered to a busy member with room.
     Delivered,
-    /// Push to this one: it's idle, or every member that accepts is full and
-    /// its overflow policy applies.
+    /// Push to this one: it's idle, or every member that accepts is full, none
+    /// with `Overflow::Wait`, and its overflow policy applies.
     Member(&'e Sub),
+    /// Every member that accepts is full: wait for room in any of these, the
+    /// ones with `Overflow::Wait`, in round robin order.
+    Wait(SmallVec<[&'e Sub; 2]>),
     /// No member accepts the event.
     None,
 }
 
 /// One member of a queue group, from the round robin position (subscription
-/// order): the first idle one that accepts, else the first with room, else the
-/// first that accepts. `member(i)` for `i < len` lists the members found on
+/// order): the first idle one that accepts, else the first with room. When all
+/// that accept are full, the group waits if any of them has `Overflow::Wait`,
+/// so mixed policies don't depend on the turn, else the first one's policy
+/// applies. `member(i)` for `i < len` lists the members found on
 /// the subject. `pushed` builds what to push to a member.
 fn pick<'e>(
     turn: &RoundRobin,
@@ -587,6 +630,7 @@ fn pick<'e>(
     }
     // Checking for room and delivering take the same lock
     let mut full = None;
+    let mut wait = SmallVec::new();
     for i in 0..len {
         let sub = at(i);
         if !sub.buffer.is_idle() && sub.accepts(any) {
@@ -594,10 +638,16 @@ fn pick<'e>(
                 Push::Delivered => return Picked::Delivered,
                 Push::Full(_) => {
                     full.get_or_insert(sub);
+                    if sub.buffer.overflow == Overflow::Wait {
+                        wait.push(sub);
+                    }
                 }
                 Push::Evicted | Push::Dropped | Push::Closed => {}
             }
         }
+    }
+    if !wait.is_empty() {
+        return Picked::Wait(wait);
     }
     full.map_or(Picked::None, Picked::Member)
 }
@@ -608,6 +658,15 @@ struct State {
     /// member count: a group is forgotten with its last member.
     groups: HashMap<(GroupKey, bool), (Arc<RoundRobin>, usize)>,
     next_id: u64,
+}
+
+/// An event to deliver once there is room: in its subscriber's full buffer,
+/// or in the first of a queue group's full `Overflow::Wait` members with room.
+struct Waiting {
+    buffers: SmallVec<[Arc<Buffer>; 1]>,
+    event: Event,
+    /// Whether it counts in what `deliver` returns.
+    counts: bool,
 }
 
 #[derive(Default)]
@@ -641,10 +700,15 @@ impl Bus {
 
     /// Wait for room in each full `Overflow::Wait` buffer. Kept out of
     /// `deliver`, so publishing that doesn't wait doesn't build this future.
-    async fn deliver_waiting(waiting: Vec<(Arc<Buffer>, Event, bool)>) -> usize {
+    async fn deliver_waiting(waiting: Vec<Waiting>) -> usize {
         let mut delivered = 0;
-        for (buffer, event, counts) in waiting {
-            if buffer.push_wait(event).await && counts {
+        for Waiting { buffers, event, counts } in waiting {
+            // Boxed: its state would grow every publishing future
+            let pushed = match &buffers[..] {
+                [buffer] => buffer.push_wait(event).await,
+                _ => Box::pin(Buffer::push_wait_any(&buffers, event)).await,
+            };
+            if pushed && counts {
                 delivered += 1;
             }
         }
@@ -653,7 +717,7 @@ impl Bus {
 
     /// Delivers `event` everywhere there is room first, so a waiting subscriber
     /// doesn't delay the others. Returns how many got it, and the full
-    /// `Overflow::Wait` buffers left to wait on, with whether they count.
+    /// `Overflow::Wait` buffers left to wait on.
     ///
     /// For a `REQUEST`, responders get an event built by `respond` and only
     /// they count, even when their buffer drops it. Otherwise responders are
@@ -666,13 +730,13 @@ impl Bus {
         &self,
         event: &Event,
         respond: ForResponder,
-    ) -> (usize, Vec<(Arc<Buffer>, Event, bool)>) {
+    ) -> (usize, Vec<Waiting>) {
         let interest = self.interest.load();
         let mut delivered = 0;
         let mut waiting = Vec::new();
         // A responder gets its own event, and counts only for a request; a
         // subscriber gets `event`, and counts only when publishing
-        let mut push = |sub: &Sub, responder: bool| {
+        let mut push = |waiting: &mut Vec<Waiting>, sub: &Sub, responder: bool| {
             let (pushed, counts) = if REQUEST && responder {
                 (respond(), true)
             } else {
@@ -688,7 +752,11 @@ impl Bus {
                     );
                     delivered += usize::from(counts);
                 }
-                Push::Full(pushed) => waiting.push((sub.buffer.clone(), pushed, counts)),
+                Push::Full(pushed) => waiting.push(Waiting {
+                    buffers: SmallVec::from_buf([sub.buffer.clone()]),
+                    event: pushed,
+                    counts,
+                }),
                 Push::Dropped => {
                     debug!(
                         subscription = sub.id,
@@ -709,7 +777,7 @@ impl Bus {
         interest.visit(Some(&**event), &mut |node| {
             node.subs.each(|sub| {
                 if sub.accepts(any) {
-                    push(sub, false);
+                    push(&mut waiting, sub, false);
                 }
             });
             if !node.groups.is_empty() {
@@ -718,7 +786,7 @@ impl Bus {
             if REQUEST {
                 node.responders.each(|sub| {
                     if sub.accepts(any) {
-                        push(sub, true);
+                        push(&mut waiting, sub, true);
                     }
                 });
                 groups.extend(&node.responder_groups);
@@ -756,7 +824,12 @@ impl Bus {
             let counts = responders || !REQUEST;
             match member {
                 Picked::Delivered => group_delivered += usize::from(counts),
-                Picked::Member(member) => push(member, responders),
+                Picked::Member(member) => push(&mut waiting, member, responders),
+                Picked::Wait(subs) => waiting.push(Waiting {
+                    buffers: subs.iter().map(|sub| sub.buffer.clone()).collect(),
+                    event: pushed(),
+                    counts,
+                }),
                 Picked::None => {}
             }
         }

@@ -270,8 +270,8 @@
 //!   requests, with their own reply token.
 //! - A message is lost for a subscriber when:
 //!   - its buffer is full with [`Overflow::DropNewest`] or [`Overflow::DropOldest`].
-//!     In a queue group, only when every member's buffer is full: the message
-//!     goes to a member with room first;
+//!     In a queue group, only when every member's buffer is full and none of
+//!     them has [`Overflow::Wait`]: the message goes to a member with room first;
 //!   - one of its filters rejects the message or panics;
 //!   - it drops the [`Subscription`] or [`Responder`] before reading the
 //!     message;

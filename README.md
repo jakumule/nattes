@@ -273,8 +273,10 @@ while let Some(msg) = sub.next().await {
 - **Queue groups.** Subscribers with the same `.queue(group)` on the same bus share
   the messages: each one goes to a single member. A member waiting in `next()` is
   picked first. If none is waiting, members with room in their buffer take turns
-  (round robin). Only when every member's buffer is full does the overflow policy
-  of the member whose turn it is apply. See [Queue groups](#queue-groups).
+  (round robin). When every member's buffer is full, the group waits if any
+  member has `Overflow::Wait`, and the message goes to the first of them to have
+  room. Otherwise the overflow policy of the member whose turn it is applies. See
+  [Queue groups](#queue-groups).
 - **Owning a message.** A message is shared by every subscription it was
   delivered to, so `msg` only derefs to `&T`. `msg.try_into_inner()` moves the
   `T` out, with no `Clone` needed, once this `msg` is the last holder: no other
@@ -291,6 +293,16 @@ while let Some(msg) = sub.next().await {
   | `Wait` | `publish` waits for room, then resumes once the buffer has drained to half. Use it for work queues that must not lose messages. |
 
   `sub.dropped()` counts the messages lost so far.
+
+  `Wait` has two pitfalls:
+
+  - **Head-of-line blocking.** The other subscribers get the message before
+    `publish` waits, but the publisher's next messages wait behind it: one slow
+    `Wait` subscriber holds back what that publisher sends to everyone. Publish
+    to `Wait` subscribers from a task of their own, or use a drop policy.
+  - **Self-deadlock.** A task that publishes to a subject it subscribes to with
+    `Wait` never returns from `publish` once its own buffer is full, since only
+    that task can make room.
 - **Batches.** `StreamExt::ready_chunks(max)` waits for a message, then returns it
   with the others already buffered (up to `max`), oldest first. What arrives while
   you handle a batch stacks up for the next one, e.g. to answer pending requests
@@ -473,7 +485,8 @@ These hold for every way of sending:
 - **When it is lost.** A message is lost for a subscriber when:
   - its buffer is full with `DropNewest` (the new message) or `DropOldest` (the
     oldest one in the buffer). In a queue group, this only happens when every
-    member's buffer is full: the message goes to a member with room first;
+    member's buffer is full and none of them has `Overflow::Wait`: the message
+    goes to a member with room first;
   - one of its filters rejects the message or panics;
   - it drops the subscription before reading the message: buffered messages
     are discarded;

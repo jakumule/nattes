@@ -3,12 +3,6 @@
 
 Found in a design review, in priority order.
 
-- [ ] **`Overflow::Wait` pitfalls.** Undocumented self-deadlock: a task
-  publishing to a subject it subscribes to with `Wait` and a full buffer. In a
-  queue group where every member is full, `pick` applies the first accepting
-  member's policy, so mixed policies drop or wait depending on the round
-  robin, and the publisher waits on that member even if another drains first.
-  Document head-of-line blocking next to the overflow table in the README.
 - [ ] **No sync publish.** `publish` is `async` though only `Wait` buffers ever
   await. Add `try_publish` (doesn't wait; drops or reports full `Wait`
   buffers) for `Drop`, callbacks and non-async code.
