@@ -67,7 +67,7 @@ topics! {
 | **subscription** | The registration made by awaiting `subscribe()`, and its handle `Subscription`, a `Stream` of messages. Dropping it unsubscribes. A responder is a subscription too, made with `respond()`. | — |
 | **subscriber** | The code that reads a subscription. | consumer, receiver |
 | **buffer** | A subscription's bounded storage for messages it hasn't read yet: `.buffer(256)`. | queue (for buffers) |
-| **deliver** | Push an event into a buffer. `publish` returns how many deliveries were made. | queued (as the outcome) |
+| **deliver** | Push an event into a buffer. `publish` and `try_publish` return how many deliveries were made. | queued (as the outcome) |
 | **filter** | A user predicate on params and message: `.filter(\|(id,), _\| *id != admin)`. | — |
 | **overflow policy** | What a full buffer does with a new message: `Overflow`, set with `.on_full(…)`. | — |
 
@@ -84,7 +84,7 @@ topics! {
 
 | Term | Meaning | Don't say |
 |---|---|---|
-| **publisher** | Who publishes: calls `publish` on a channel. | sender |
+| **publisher** | Who publishes: calls `publish` (or `try_publish`) on a channel. | sender |
 | **requester** | Who sends a request: calls `request`, `request_timeout` or `scatter`. | sender |
 | **responder** | A subscription made with `respond()` on a request leaf, and its handle `Responder`, a `Stream` of incoming requests. Only responders count for and answer requests. | receiver |
 | **incoming request** | What a responder receives: `Incoming`, which derefs to the payload and carries the responder's own **reply token**, used once by `respond(reply)`. `try_into_inner` splits it into the payload and the token, a `ReplyToken`. | — |

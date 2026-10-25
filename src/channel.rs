@@ -269,6 +269,18 @@ impl<T: 'static, S> Channel<T, (), S> {
         self.bus.deliver(event).await
     }
 
+    /// [`publish`](Self::publish) without waiting, for `Drop`, callbacks and
+    /// code that isn't async. Returns how many subscriptions it was delivered to.
+    ///
+    /// A full [`Overflow::Wait`](crate::Overflow::Wait) buffer drops the
+    /// message, as with `DropNewest`, and counts it in `dropped()`.
+    pub fn try_publish(&self, msg: T) -> usize
+    where
+        S: Publish<T>,
+    {
+        self.bus.deliver_now(self.to_event(msg))
+    }
+
     /// Wrap `msg` into the root event to deliver.
     pub(crate) fn to_event(&self, msg: T) -> Event {
         // Only wildcard steps can't inject, and they add to `P`

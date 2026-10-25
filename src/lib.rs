@@ -51,6 +51,18 @@
 //! # fn main() {}
 //! ```
 //!
+//! not even without waiting:
+//!
+//! ```compile_fail,E0599
+//! # use nattes::{at, topics, Channel};
+//! # pub struct DeleteMsg;
+//! # topics! { topics { user { id(u32) { delete: DeleteMsg } } } }
+//! # fn main() {
+//! let bus = Channel::<topics::Topic>::new();
+//! at!(bus, user.id().delete).try_publish(DeleteMsg);
+//! # }
+//! ```
+//!
 //! and each path must start where the channel is:
 //!
 //! ```compile_fail,E0599
@@ -220,6 +232,19 @@
 //! # fn main() {}
 //! ```
 //!
+//! nor `try_publish`:
+//!
+//! ```compile_fail,E0277
+//! # use nattes::{at, topics, Channel};
+//! # pub struct FetchMsg;
+//! # pub struct FetchAck;
+//! # topics! { topics { git { fetch: FetchMsg => FetchAck } } }
+//! # fn main() {
+//! let bus = Channel::<topics::Topic>::new();
+//! at!(bus, git.fetch).try_publish(FetchMsg);
+//! # }
+//! ```
+//!
 //! A responder answers a request once:
 //!
 //! ```compile_fail,E0382
@@ -259,19 +284,22 @@
 //! Delivery is **at most once**, in memory. A message only lives in subscriber
 //! buffers: nothing is persisted, acknowledged or redelivered. "Delivered" means
 //! pushed into a subscription's buffer, not handled. This holds for
-//! [`publish`](Channel::publish), [`request`](Channel::request),
-//! [`request_timeout`](Channel::request_timeout) and [`scatter`](Channel::scatter):
+//! [`publish`](Channel::publish), [`try_publish`](Channel::try_publish),
+//! [`request`](Channel::request), [`request_timeout`](Channel::request_timeout)
+//! and [`scatter`](Channel::scatter):
 //!
-//! - Nothing is sent until the returned future is polled.
+//! - Nothing is sent until the returned future is polled; `try_publish` sends
+//!   when called.
 //! - The message goes to every subscription that matches the subject and whose
 //!   filters accept it, and to one member per queue group. A subscription counts
 //!   once its [`SubscriptionBuilder`] has been awaited. Earlier messages are
 //!   not replayed. Responders ([`Responder`]) are subscriptions that only get
 //!   requests, with their own reply token.
 //! - A message is lost for a subscriber when:
-//!   - its buffer is full with [`Overflow::DropNewest`] or [`Overflow::DropOldest`].
-//!     In a queue group, only when every member's buffer is full and none of
-//!     them has [`Overflow::Wait`]: the message goes to a member with room first;
+//!   - its buffer is full with [`Overflow::DropNewest`] or [`Overflow::DropOldest`],
+//!     or with [`Overflow::Wait`] on `try_publish`. In a queue group, only when
+//!     every member's buffer is full and none of them has [`Overflow::Wait`] (or
+//!     on `try_publish`): the message goes to a member with room first;
 //!   - one of its filters rejects the message or panics;
 //!   - it drops the [`Subscription`] or [`Responder`] before reading the
 //!     message;

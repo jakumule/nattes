@@ -653,6 +653,54 @@ async fn wait_applies_backpressure_without_delaying_others() {
 }
 
 #[tokio::test]
+async fn try_publish_drops_on_full_wait_buffer() {
+    let pushes = push_channel();
+    let mut slow = pushes.subscribe().buffer(1).on_full(Overflow::Wait).await;
+    let mut fast = pushes.subscribe().await;
+
+    assert_eq!(pushes.try_publish(GitPushMsg("0".into())), 2);
+    assert_eq!(pushes.try_publish(GitPushMsg("1".into())), 1);
+    assert_eq!(slow.dropped(), 1);
+    assert_eq!(drain(&mut fast).len(), 2);
+    assert_eq!(slow.next().await.unwrap().0, "0");
+    assert!(drain(&mut slow).is_empty());
+}
+
+#[tokio::test]
+async fn try_publish_drops_on_full_waiting_queue_group() {
+    let pushes = push_channel();
+    let wait = || {
+        (pushes.subscribe().queue(PushQueue::Workers).buffer(1)).on_full(Overflow::Wait)
+    };
+    let w1 = wait().await;
+    let w2 = wait().await;
+    assert_eq!(pushes.try_publish(GitPushMsg("a".into())), 1);
+    assert_eq!(pushes.try_publish(GitPushMsg("b".into())), 1);
+
+    assert_eq!(pushes.try_publish(GitPushMsg("c".into())), 0);
+    assert_eq!(w1.dropped() + w2.dropped(), 1);
+}
+
+#[test]
+fn try_publish_from_drop_without_runtime() {
+    struct Goodbye(Channel<GitPushMsg, (), topics::git::PushQueue>);
+    impl Drop for Goodbye {
+        fn drop(&mut self) {
+            self.0.try_publish(GitPushMsg("bye".into()));
+        }
+    }
+    let pushes = push_channel();
+    let mut sub = futures::executor::block_on(pushes.subscribe().into_future());
+    std::thread::spawn(move || drop(Goodbye(pushes)))
+        .join()
+        .unwrap();
+    // The bus closed with the last channel, but the buffer is read first
+    let got: Vec<_> = futures::executor::block_on(sub.by_ref().collect::<Vec<_>>());
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].0, "bye");
+}
+
+#[tokio::test]
 async fn waiting_publisher_is_released_when_subscriber_leaves() {
     let pushes = push_channel();
     let slow = pushes.subscribe().buffer(1).on_full(Overflow::Wait).await;

@@ -38,6 +38,9 @@ pub enum Overflow {
     /// buffer is full, since only it can make room. A queue group whose members
     /// are all full waits if any of them has `Wait`, and delivers to the first
     /// of those to have room.
+    ///
+    /// `try_publish` never waits: it drops the new message instead, like
+    /// `DropNewest`.
     Wait,
 }
 
@@ -685,6 +688,22 @@ impl Bus {
             return delivered;
         }
         delivered + Self::deliver_waiting(waiting).await
+    }
+
+    /// `deliver` without waiting: a full `Overflow::Wait` buffer drops the
+    /// event, as with `DropNewest`. In a queue group, the first such member
+    /// counts it.
+    pub(crate) fn deliver_now(&self, event: Event) -> usize {
+        let none = || unreachable!("publishing reaches no responder");
+        let (delivered, waiting) = self.try_deliver::<false>(&event, &none);
+        for Waiting { buffers, .. } in &waiting {
+            buffers[0].dropped.fetch_add(1, Ordering::Relaxed);
+            debug!(
+                subject = %Subject(&*event),
+                "buffer full, dropped the message instead of waiting"
+            );
+        }
+        delivered
     }
 
     /// Deliver a request: `shared` to subscribers, and an event built by

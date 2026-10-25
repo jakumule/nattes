@@ -247,6 +247,18 @@ is full. Even then, every other subscriber has already received the message by t
 time it waits. See [Delivery guarantees](#delivery-guarantees) for when a message
 can be lost and in which order it arrives.
 
+`try_publish` is the same without `async`, for `Drop`, callbacks and code that isn't
+async. It never waits: a full `Overflow::Wait` buffer drops the message, as with
+`DropNewest`, and counts it in `sub.dropped()`.
+
+```rust
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.logouts.try_publish(LogoutMsg { id: self.id });
+    }
+}
+```
+
 ## Subscribing
 
 `subscribe()` returns a builder; `.await` it to start receiving. The subscription is
@@ -290,7 +302,7 @@ while let Some(msg) = sub.next().await {
   |---|---|
   | `DropNewest` (default) | The new message is dropped, like NATS does for slow consumers. |
   | `DropOldest` | The oldest buffered message makes room, so you always see the latest. |
-  | `Wait` | `publish` waits for room, then resumes once the buffer has drained to half. Use it for work queues that must not lose messages. |
+  | `Wait` | `publish` waits for room, then resumes once the buffer has drained to half. Use it for work queues that must not lose messages. `try_publish` drops the new message instead. |
 
   `sub.dropped()` counts the messages lost so far.
 
@@ -477,16 +489,17 @@ pushed into a subscription's buffer, not handled.
 These hold for every way of sending:
 
 - **Nothing is sent until you await.** `publish`, `request` and `scatter` are lazy
-  futures.
+  futures. `try_publish` sends when called.
 - **Who gets it.** Every subscription that matches the subject and whose filters
   accept the message, but only one member per queue group. A subscription
   counts once its builder has been awaited. Messages sent before that are not
   replayed.
 - **When it is lost.** A message is lost for a subscriber when:
   - its buffer is full with `DropNewest` (the new message) or `DropOldest` (the
-    oldest one in the buffer). In a queue group, this only happens when every
-    member's buffer is full and none of them has `Overflow::Wait`: the message
-    goes to a member with room first;
+    oldest one in the buffer), or with `Wait` on `try_publish`. In a queue
+    group, this only happens when every member's buffer is full and none of
+    them has `Overflow::Wait` (or on `try_publish`): the message goes to a
+    member with room first;
   - one of its filters rejects the message or panics;
   - it drops the subscription before reading the message: buffered messages
     are discarded;
@@ -504,6 +517,7 @@ Per method:
 | Method | Returns | Waits for |
 |---|---|---|
 | `publish` | How many subscriptions the message was delivered to. Not on request leaves. | Room in full `Overflow::Wait` buffers. |
+| `try_publish` | Same as `publish`, but full `Overflow::Wait` buffers drop the message. Not async. | Nothing. |
 | `request` | The first reply. `NoResponders` if no responder matches it, `NoReply` once every responder dropped it without answering. | Delivery, then a reply, with no time limit. |
 | `request_timeout` | Same as `request`, or `Timeout`. | Delivery and the reply, both within the timeout. |
 | `scatter` | A stream of replies, at most one per responder, or `NoResponders`. | Delivery. The stream ends once every responder answered or dropped the request. |
@@ -634,6 +648,8 @@ msg.respond(ack);
 fetches.publish(GitFetchMsg { branch: "main".into() });
 // error: can't publish on a request leaf
 ```
+
+The same holds for `try_publish`.
 
 ## Requirements
 

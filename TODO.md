@@ -3,9 +3,6 @@
 
 Found in a design review, in priority order.
 
-- [ ] **No sync publish.** `publish` is `async` though only `Wait` buffers ever
-  await. Add `try_publish` (doesn't wait; drops or reports full `Wait`
-  buffers) for `Drop`, callbacks and non-async code.
 - [ ] **Filters run on the publisher's thread**, inside `publish`: a slow
   filter slows every publisher, and with `panic = "abort"` a panicking filter
   aborts instead of counting as no match. Document ("keep filters cheap").
