@@ -28,21 +28,23 @@ keywords = ["message-queue", "nats"]
 [dependencies]
 nattes-macros = { path = "macros", version = "0.3.1" }
 
-futures = "0.3"
+futures-core = { version = "0.3", default-features = false, features = ["std"] }
+futures-sink = { version = "0.3", default-features = false, optional = true }
+futures-channel = { version = "0.3", default-features = false, features = ["std"] }
+futures-util = { version = "0.3", default-features = false }
 bytes = { version = "1", optional = true }
 arc-swap = "1"
 smallvec = "1"
-thiserror = "2"
-imbl = "7.0.2"
 tracing = { version = "0.1", default-features = false, features = ["std"], optional = true }
 
 [features]
 # Log subscriptions, publishes and lost messages with `tracing`
 tracing = ["dep:tracing"]
 # Bridges: extend a bus over a byte transport (`Bridge`, `Codec`, `Wire`)
-bridge = ["dep:bytes", "nattes-macros/bridge"]
+bridge = ["dep:bytes", "dep:futures-sink", "futures-util/sink", "nattes-macros/bridge"]
 
 [dev-dependencies]
+futures = "0.3"
 tokio = { version = "1.42.0", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 anyhow = "1.0.94"

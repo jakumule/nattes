@@ -23,8 +23,11 @@ use crate::wire::{self, Wire, WireError};
 use crate::{Channel, Overflow};
 use arc_swap::ArcSwap;
 use bytes::Bytes;
-use futures::future::{Either, select};
-use futures::{Sink, SinkExt, Stream, StreamExt};
+use futures_channel::mpsc;
+use futures_core::Stream;
+use futures_sink::Sink;
+use futures_util::future::{Either, select};
+use futures_util::{SinkExt, StreamExt};
 use std::collections::HashMap;
 use std::error::Error;
 use std::future::poll_fn;
@@ -32,7 +35,7 @@ use std::pin::pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::Poll;
-use thiserror::Error;
+use std::fmt;
 
 /// Version of the frame format. Both sides must have the same.
 pub const FRAME_VERSION: u8 = 1;
@@ -46,15 +49,26 @@ const MSG: u8 = 3;
 const BATCH: usize = 256;
 
 /// Why a [`Bridge`] stopped.
-#[derive(Debug, Error)]
+#[derive(Debug)]
 pub enum BridgeError {
-    #[error("the other side speaks frame format {theirs}, this one {ours}")]
     Version { ours: u8, theirs: u8 },
-    #[error("malformed frame: {0}")]
     Protocol(&'static str),
-    #[error("transport: {0}")]
     Transport(Box<dyn Error + Send + Sync>),
 }
+
+impl fmt::Display for BridgeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            BridgeError::Version { ours, theirs } => {
+                write!(f, "the other side speaks frame format {theirs}, this one {ours}")
+            }
+            BridgeError::Protocol(why) => write!(f, "malformed frame: {why}"),
+            BridgeError::Transport(error) => write!(f, "transport: {error}"),
+        }
+    }
+}
+
+impl Error for BridgeError {}
 
 /// The channel `T` of a bus, extended over a byte transport to the same
 /// channel of another bus: a subscription on either side gets the messages
@@ -159,7 +173,7 @@ impl<T: Topic + Wire<C>, C: Send + Sync + 'static> Bridge<T, C> {
     async fn write<Si>(
         &self,
         mut sink: Si,
-        mut changes: futures::channel::mpsc::UnboundedReceiver<Change>,
+        mut changes: mpsc::UnboundedReceiver<Change>,
         buffer: &Buffer,
         base: &[Key],
     ) -> Result<(), BridgeError>

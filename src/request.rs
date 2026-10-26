@@ -12,9 +12,9 @@ use crate::event::{envelope, take, Envelope, Event};
 use crate::nav::{Params, Seg, Shape};
 use crate::subscription::view;
 use crate::tree::{Request, Subject, Topic, __payload};
-use futures::channel::{mpsc, oneshot};
-use futures::stream::FusedStream;
-use futures::{Stream, StreamExt};
+use futures_channel::{mpsc, oneshot};
+use futures_core::{FusedStream, Stream};
+use futures_util::StreamExt;
 use std::any::Any;
 use std::fmt;
 use std::marker::PhantomData;
@@ -22,15 +22,23 @@ use std::ops::Deref;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, ready};
-use thiserror::Error;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BusError {
-    #[error("No responder is listening on this topic")]
     NoResponders,
-    #[error("Every responder dropped the request without replying")]
     NoReply,
 }
+
+impl fmt::Display for BusError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            BusError::NoResponders => "No responder is listening on this topic",
+            BusError::NoReply => "Every responder dropped the request without replying",
+        })
+    }
+}
+
+impl std::error::Error for BusError {}
 
 /// A responder's reply token. The requester waits until a reply comes or
 /// every token is gone.
@@ -113,7 +121,7 @@ impl<L: Request> Channel<L> {
     ///
     /// Bound delivery with your runtime's timer like for
     /// [`request`](Self::request), and the replies with
-    /// [`StreamExt::take_until`](futures::StreamExt::take_until).
+    /// [`StreamExt::take_until`](futures_util::StreamExt::take_until).
     pub async fn scatter(&self, payload: L::Msg) -> Result<Replies<L::Reply>, BusError> {
         let (tx, rx) = mpsc::unbounded();
         let remaining = self.deliver_request(payload, Reply::Many(tx)).await;

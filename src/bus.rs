@@ -6,13 +6,14 @@ use crate::group::GroupKey;
 use crate::log::{debug, trace, warning};
 #[cfg(feature = "tracing")]
 use crate::nav::Pattern;
+use crate::hamt::HashTrie;
 use crate::nav::{Key, KeyParam, ParamKey, Seg};
 #[cfg(feature = "tracing")]
 use crate::tree::Subject;
 use arc_swap::ArcSwap;
 #[cfg(feature = "bridge")]
-use futures::channel::mpsc;
-use futures::task::AtomicWaker;
+use futures_channel::mpsc;
+use futures_util::task::AtomicWaker;
 use smallvec::SmallVec;
 use std::collections::{HashMap, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -520,7 +521,7 @@ pub(crate) struct Interest {
 pub(crate) struct Edges {
     plain: Option<Arc<Interest>>,
     wild: Option<Arc<Interest>>,
-    fixed: imbl::HashMap<ParamKey, Arc<Interest>>,
+    fixed: HashTrie<ParamKey, Arc<Interest>>,
 }
 
 impl Edges {
@@ -528,7 +529,7 @@ impl Edges {
         match param {
             KeyParam::None => self.plain.get_or_insert_with(Default::default),
             KeyParam::Wild => self.wild.get_or_insert_with(Default::default),
-            KeyParam::Is(value) => self.fixed.entry(value.clone()).or_default(),
+            KeyParam::Is(value) => self.fixed.entry_or_default(value.clone()),
         }
     }
 
@@ -656,10 +657,10 @@ impl Interest {
             .chain(members.flat_map(|m| m.subs.iter()))
             .for_each(&mut *f);
         for (_, edges) in &self.children {
-            let fixed = edges.fixed.values();
-            for child in edges.plain.iter().chain(&edges.wild).chain(fixed) {
+            for child in edges.plain.iter().chain(&edges.wild) {
                 child.for_each_sub(f);
             }
+            edges.fixed.for_each(&mut |child| child.for_each_sub(f));
         }
     }
 

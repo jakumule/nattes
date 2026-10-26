@@ -373,6 +373,7 @@ mod bus;
 mod channel;
 mod event;
 mod group;
+mod hamt;
 mod log;
 mod macros;
 mod nav;
