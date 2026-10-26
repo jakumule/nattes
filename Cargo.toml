@@ -8,7 +8,7 @@ repository.workspace = true
 description.workspace = true
 categories.workspace = true
 keywords.workspace = true
-
+exclude = [".github/", ".gitignore", "benches/", "doc/", "CLAUDE.md", "TODO.md", "flake.nix", "flake.lock"]
 
 [workspace]
 members = ["macros"]
