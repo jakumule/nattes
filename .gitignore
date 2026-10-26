@@ -39,6 +39,7 @@ Cargo.lock
 
 # direnv
 .direnv
+.devenv
 
 # nix build output
 result
