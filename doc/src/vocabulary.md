@@ -75,6 +75,7 @@ topics! {
 | **batch** | Several messages moved under one lock: `publish_many`, `recv_many`. | chunk |
 | **filter** | A user predicate on params and view: `.filter(\|(id,), _\| *id != admin)`. | — |
 | **overflow policy** | What a full buffer does with a new message: `Overflow`, set with `.on_full(…)`. | — |
+| **delivery defaults** | The buffer size and overflow policy a topic's subscriptions start with, declared in the tree with `#[buffer(n)]` and `#[on_full(…)]` and inherited by the topics below: `Topic::BUFFER`, `Topic::ON_FULL`. | default policy, QoS |
 
 ## Queue groups
 

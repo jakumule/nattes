@@ -11,7 +11,7 @@ use quote::{format_ident, quote};
 use syn::ext::IdentExt;
 use syn::{AttrStyle, Attribute, Ident, LitInt, LitStr};
 
-use crate::parse::{Entry, GroupEnum, Input, Kind, segment_id};
+use crate::parse::{Delivery, Entry, GroupEnum, Input, Kind, segment_id};
 
 /// Whether to implement `Wire<C>` for bridges: set by nattes's `bridge` feature.
 const BRIDGE: bool = cfg!(feature = "bridge");
@@ -22,7 +22,7 @@ pub fn expand(input: &Input) -> TokenStream {
         attrs: &input.attrs,
         prelude: Vec::new(),
     };
-    cx.module(&input.root, "", &[])
+    cx.module(&input.root, &Delivery::default(), "", &[])
 }
 
 struct Cx<'a> {
@@ -47,17 +47,26 @@ struct Child {
 }
 
 impl Cx<'_> {
-    /// The module of the level `entry`, on `subject`, at `path` from the root's
+    /// The module of the level `entry`, below a level with the delivery
+    /// defaults `outer`, on `subject`, at `path` from the root's
     /// module (empty for the root itself).
-    fn module(&mut self, entry: &Entry, subject: &str, path: &[&Ident]) -> TokenStream {
+    fn module(
+        &mut self,
+        entry: &Entry,
+        outer: &Delivery,
+        subject: &str,
+        path: &[&Ident],
+    ) -> TokenStream {
         let Kind::Level(children) = &entry.kind else {
             unreachable!("only levels have a module")
         };
         let k = self.krate;
         let (docs, name, attrs) = (&entry.docs, &entry.name, self.attrs);
+        let delivery = entry.delivery.or(outer);
+        let defaults = self.defaults(&delivery);
         let mut parts = Vec::new();
         for child in children {
-            parts.push(self.child(child, subject, path));
+            parts.push(self.child(child, &delivery, subject, path));
         }
         let ref_variants = parts.iter().map(|c| &c.ref_variant);
         let view_arms = parts.iter().map(|c| &c.view_arm);
@@ -168,6 +177,8 @@ impl Cx<'_> {
                 impl #k::Topic for Topic {
                     type View<'a> = TopicRef<'a>;
 
+                    #defaults
+
                     #[allow(unused_variables)]
                     fn view<'a>(
                         below: &'a [#k::Seg],
@@ -206,8 +217,9 @@ impl Cx<'_> {
         }
     }
 
-    /// What `entry` adds to its parent, on `parent`, the level at `path`.
-    fn child(&mut self, entry: &Entry, parent: &str, path: &[&Ident]) -> Child {
+    /// What `entry` adds to its parent, on `parent`, the level at `path` with
+    /// the delivery defaults `outer`.
+    fn child(&mut self, entry: &Entry, outer: &Delivery, parent: &str, path: &[&Ident]) -> Child {
         let k = self.krate;
         let name = &entry.name;
         let seg = name.unraw().to_string();
@@ -238,7 +250,7 @@ impl Cx<'_> {
                     quote!(#name::Topic),
                     quote!(#name::TopicRef<'a>),
                     quote!(<#name::Topic as #k::Topic>::view(rest, payload)),
-                    self.module(entry, &subject, &sub),
+                    self.module(entry, outer, &subject, &sub),
                 )
             }
             Kind::Mount(module) => {
@@ -263,6 +275,7 @@ impl Cx<'_> {
             Kind::Leaf { msg, reply } => {
                 let leaf = format_ident!("{}Leaf", var);
                 let leaf_doc = format!("The leaf type of `{subject}`: the `T` of its channels.");
+                let defaults = self.defaults(&entry.delivery.or(outer));
                 let groups = entry.groups.as_ref().map(|groups| {
                     let queue = format_ident!("{}Queue", var);
                     self.group_enum(&queue, &leaf, groups, &format!("`{subject}`"))
@@ -312,6 +325,8 @@ impl Cx<'_> {
 
                         impl #k::Topic for #leaf {
                             type View<'a> = &'a #msg;
+
+                            #defaults
 
                             fn view<'a>(
                                 _: &'a [#k::Seg],
@@ -390,6 +405,21 @@ impl Cx<'_> {
                 item,
             },
         }
+    }
+
+    /// The consts of `Topic` for the delivery defaults set on a topic or
+    /// above it; the trait's own defaults apply to the others.
+    fn defaults(&self, delivery: &Delivery) -> TokenStream {
+        let k = self.krate;
+        let buffer = delivery
+            .buffer
+            .as_ref()
+            .map(|size| quote!(const BUFFER: usize = #size;));
+        let on_full = delivery
+            .on_full
+            .as_ref()
+            .map(|overflow| quote!(const ON_FULL: #k::Overflow = #k::Overflow::#overflow;));
+        quote!(#buffer #on_full)
     }
 
     /// The group enum `name` of the topic `about`, whose channels have the

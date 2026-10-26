@@ -64,7 +64,7 @@ nattes = { git = "https://github.com/JacquesHumule/nattes", features = ["tracing
 |---------|-----------------------------------------------------------------------|
 | `debug` | `subscribe` / `unsubscribe`, with the id, pattern (`user.id.*.>`) and queue group |
 | `trace` | `publish`, with the subject and how many subscriptions got the message |
-| `warn`  | a message dropped because a subscription's buffer is full, a filter or handler that panicked, a message a bridge couldn't encode or decode |
+| `warn`  | a message dropped because a subscription's buffer is full (one record per subscription and `publish_many`, with the count), a filter or handler that panicked, a message a bridge couldn't encode or decode |
 
 A bridge runs in a `debug` span named `bridge`, with the bridged channel
 (`channel = user.>`), and logs at `debug` when it starts and stops (with the
@@ -201,6 +201,7 @@ method of `Channel` (`subscribe`, `publish`, `publish_many`, `respond`, `request
 | `name(Type) [A, B(T)] …` | queue groups (see [Queue groups](#queue-groups)), after the name and parameter of a level, leaf, link of a chain or the root | unchanged |
 | `name.…` | chain: a level with a single child, no braces | same as `name { … }` |
 | `name = path::to::module` | mount the tree of another `topics!` | `Name(path::to::module::TopicRef<'a>)` |
+| `#[on_full(Wait)]`, `#[buffer(64)]` before a topic | delivery defaults (see [Delivery defaults](#delivery-defaults)) | unchanged |
 
 Each level also gets a `Steps` trait with one method per child, implemented on
 its channels. `topics::prelude` brings every `Steps` trait of the tree into scope,
@@ -211,12 +212,48 @@ method, and its module or leaf type, so your editor shows them when you hover
 `push` in `bus.git().push()`. On a chain `a.b.c: Msg` they document `c`.
 Both also state the subject, such as `git.push` or `user.id.*.delete`. Doc
 comments before the root's name document its module, while other attributes
-there are applied to every `TopicRef` enum. A wrong topic is reported
+there, except [delivery defaults](#delivery-defaults), are applied to every
+`TopicRef` enum. A wrong topic is reported
 on its own and left out, so the rest of the tree keeps working while you type.
 
 Each generated module does `use super::*`, so message and parameter types are
 resolved as in the code around `topics!`. For that reason, `topics!` must be used
 at module level, not inside a function.
+
+### Delivery defaults
+
+`#[on_full(…)]` and `#[buffer(n)]` before a topic set what its subscriptions
+start with, instead of `Overflow::DropNewest` and 1024 (see
+[Subscribing](#subscribing)). Declare `Wait` on work topics, and nobody
+subscribes to them with a lossy policy by mistake:
+
+```rust
+topics! {
+    app {
+        #[on_full(Wait)]
+        jobs {
+            #[buffer(64)]
+            resize: Resize,             // Wait, 64
+            thumbnail: Thumb,           // Wait, 1024
+            #[on_full(DropOldest)]
+            progress: Progress,         // DropOldest, 1024
+        },
+        metrics: Metric,                // DropNewest, 1024
+    }
+}
+```
+
+- **Inherited.** A default applies to the topic and every topic below it that
+  doesn't set its own. On the root, it applies to the whole tree; on a chain
+  `a.b.c`, to `c`.
+- **The topic you subscribe on.** `bus.jobs().resize().subscribe()` and
+  `bus.jobs().subscribe()` start with `Wait`; `bus.subscribe()` starts with the
+  root's defaults, even though it also gets the messages of `jobs`.
+- **Only defaults.** `.on_full(…)` and `.buffer(n)` on a subscription, a
+  responder or a [bridge](#bridges) still win. Handlers don't buffer, so neither
+  applies to them.
+- **Mounts.** Every mount of a tree shares its types, so a mounted tree keeps the
+  defaults declared in its own `topics!`, and a mount can't set any.
 
 ## Navigating the tree
 
@@ -297,8 +334,8 @@ let mut sub = any_user
     .subscribe()
     .filter(move |(id,), _view| *id != admin_id) // optional: filter on params and message
     .queue(id::Queue::Oncall)                    // optional: share messages with other members
-    .buffer(256)                                 // optional: buffer size (default 1024)
-    .on_full(Overflow::DropOldest)               // optional: what to do when it's full
+    .buffer(256)                                 // optional: buffer size (default 1024, or the topic's)
+    .on_full(Overflow::DropOldest)               // optional: what to do when it's full (default DropNewest, or the topic's)
     .await;
 
 while let Some(msg) = sub.next().await {
@@ -330,7 +367,10 @@ while let Some(msg) = sub.next().await {
   | `DropOldest` | The oldest buffered message makes room, so you always see the latest. |
   | `Wait` | `publish` waits for room, then resumes once the buffer has drained to half. Use it for work queues that must not lose messages. |
 
-  `sub.dropped()` counts the messages lost so far.
+  The tree can change the default per topic with `#[on_full(…)]` and
+  `#[buffer(n)]` (see [Delivery defaults](#delivery-defaults)).
+  `sub.dropped()` counts the messages lost so far, and with the `tracing`
+  feature each loss is logged at `warn`.
 
   `Wait` has two pitfalls:
 
@@ -546,8 +586,9 @@ Bridge::new(bus.clone(), Bincode).run(sink, stream).await?;
 - **Limits.** Delivery stays at most once. Only messages cross: requests reach
   the other side's subscribers but not its responders.
 - **Backpressure.** The messages for the other side wait in a buffer of their
-  own, `.buffer(n)` (default 1024) with `.on_full(…)` like a subscription:
-  `Overflow::Wait` makes local publishers wait for the transport.
+  own, `.buffer(n)` with `.on_full(…)` like a subscription, defaulting to the
+  bridged topic's [delivery defaults](#delivery-defaults): `Overflow::Wait`
+  makes local publishers wait for the transport.
 
 ## Delivery guarantees
 
@@ -694,6 +735,12 @@ topics! { topics { git { push: GitPushMsg, push: GitPushMsg } } }
 // a name that is a method of `Channel`
 topics! { topics { subscribe: Msg } }
 // error: `subscribe` can't be a topic name: channels have a method `subscribe`
+
+// a delivery default that isn't an `Overflow` variant, or an empty buffer
+topics! { app { #[on_full(Wiat)] jobs { run: Job } } }
+// error: no variant, associated function, or constant named `Wiat` found for enum `Overflow`
+topics! { app { #[buffer(0)] jobs { run: Job } } }
+// error: buffer size must be at least 1
 
 // a parameter type that can't be compared exactly
 topics! { sensors { reading(f64): Reading } }

@@ -49,8 +49,8 @@ impl<T: Topic, P, K> SubscriptionBuilder<T, P, K> {
             channel,
             filters: Vec::new(),
             group: None,
-            buffer: crate::DEFAULT_BUFFER,
-            overflow: Overflow::default(),
+            buffer: T::BUFFER,
+            overflow: T::ON_FULL,
             mode: PhantomData,
         }
     }
@@ -87,14 +87,17 @@ impl<T: Topic, P, K> SubscriptionBuilder<T, P, K> {
     }
 
     /// How many messages to buffer before applying [`on_full`](Self::on_full)
-    /// (default [`DEFAULT_BUFFER`](crate::DEFAULT_BUFFER)).
+    /// (default [`Topic::BUFFER`]: [`DEFAULT_BUFFER`](crate::DEFAULT_BUFFER)
+    /// unless the tree sets `#[buffer(n)]` on this topic or above).
     pub fn buffer(mut self, size: usize) -> Self {
         assert!(size > 0, "buffer size must be at least 1");
         self.buffer = size;
         self
     }
 
-    /// What to do when the buffer is full (default [`Overflow::DropNewest`]).
+    /// What to do when the buffer is full (default [`Topic::ON_FULL`]:
+    /// [`Overflow::DropNewest`] unless the tree sets `#[on_full(…)]` on this
+    /// topic or above).
     pub fn on_full(mut self, overflow: Overflow) -> Self {
         self.overflow = overflow;
         self
@@ -214,8 +217,7 @@ impl Active {
 
 impl Drop for Active {
     fn drop(&mut self) {
-        self.bus
-            .unsubscribe(
+        self.bus.unsubscribe(
             &self.keys,
             self.id,
             self.group.as_ref(),
@@ -438,4 +440,3 @@ where
             .finish()
     }
 }
-

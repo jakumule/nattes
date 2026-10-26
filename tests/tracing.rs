@@ -73,6 +73,7 @@ fn logs_subscriptions_publishes_drops_and_close() {
             let deletes = bus.user().id(7).delete();
             deletes.publish(DeleteMsg).await;
             deletes.publish(DeleteMsg).await;
+            deletes.publish_many([DeleteMsg, DeleteMsg]).await;
             drop(sub);
             drop(group);
         })
@@ -85,6 +86,8 @@ fn logs_subscriptions_publishes_drops_and_close() {
             "publish subject=user.id.7.delete delivered=1 waiting=0",
             "buffer full, dropped the message subscription=0 subject=user.id.7.delete",
             "publish subject=user.id.7.delete delivered=0 waiting=0",
+            "buffer full, dropped messages subscription=0 subject=user.id.7.delete dropped=2",
+            "publish subject=user.id.7.delete messages=2 delivered=0 waiting=0",
             "unsubscribe subscription=0 pattern=user.id.*.delete.>",
             "unsubscribe subscription=1 pattern=git.push.>",
             "bus closed",

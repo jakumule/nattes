@@ -121,6 +121,33 @@
 //! # fn main() {}
 //! ```
 //!
+//! Delivery defaults name an [`Overflow`] variant and a buffer of at least one
+//! message: `#[on_full(Wait)] jobs { … }` compiles, these don't:
+//!
+//! ```compile_fail,E0599
+//! # use nattes::topics;
+//! # pub struct Job;
+//! topics! { app { #[on_full(Wiat)] jobs { run: Job } } }
+//! # fn main() {}
+//! ```
+//!
+//! ```compile_fail
+//! # use nattes::topics;
+//! # pub struct Job;
+//! topics! { app { #[buffer(0)] jobs { run: Job } } }
+//! # fn main() {}
+//! ```
+//!
+//! ```
+//! # use nattes::{topics, Overflow, Topic};
+//! # pub struct Job;
+//! topics! { app { #[on_full(Wait)] #[buffer(8)] jobs { run: Job } } }
+//! # fn main() {
+//! assert_eq!(<app::jobs::RunLeaf as Topic>::ON_FULL, Overflow::Wait);
+//! assert_eq!(<app::jobs::RunLeaf as Topic>::BUFFER, 8);
+//! # }
+//! ```
+//!
 //! Queue groups are declared on a topic, with `[ … ]` right after its name and
 //! parameter: `git [Mailer] { … }`, `push [Indexer(u32)]: Msg`. Each message
 //! goes to one member per group, and each value is a group, so `Indexer(0)`

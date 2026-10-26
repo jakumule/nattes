@@ -20,7 +20,7 @@ use crate::log::{debug, instrument, warning};
 use crate::nav::{Key, KeyParam, Seg};
 use crate::tree::Topic;
 use crate::wire::{self, Wire, WireError};
-use crate::{Channel, DEFAULT_BUFFER, Overflow};
+use crate::{Channel, Overflow};
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use futures::future::{Either, select};
@@ -88,21 +88,22 @@ impl<T: Topic + Wire<C>, C: Send + Sync + 'static> Bridge<T, C> {
         Self {
             channel,
             codec,
-            buffer: DEFAULT_BUFFER,
-            overflow: Overflow::default(),
+            buffer: T::BUFFER,
+            overflow: T::ON_FULL,
             dropped: AtomicU64::new(0),
         }
     }
 
     /// How many messages to hold for the other side while the transport is
-    /// busy (default [`DEFAULT_BUFFER`]).
+    /// busy (default: the bridged topic's [`Topic::BUFFER`]).
     pub fn buffer(mut self, size: usize) -> Self {
         assert!(size > 0, "buffer size must be at least 1");
         self.buffer = size;
         self
     }
 
-    /// What to do when that buffer is full (default [`Overflow::DropNewest`]).
+    /// What to do when that buffer is full (default: the bridged topic's
+    /// [`Topic::ON_FULL`]).
     /// [`Overflow::Wait`] makes local publishers wait for the transport.
     pub fn on_full(mut self, overflow: Overflow) -> Self {
         self.overflow = overflow;

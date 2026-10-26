@@ -1747,3 +1747,67 @@ async fn concurrent_publishers_to_a_waiting_queue_group() {
             });
     }
 }
+
+crate::topics! {
+    #[allow(dead_code)]
+    delivery {
+        #[on_full(Wait)]
+        #[buffer(1)]
+        jobs {
+            run: U32Event,
+            #[on_full(DropOldest)]
+            progress: U32Event,
+            #[buffer(4)]
+            batch: U32Event,
+            ask: U32Event => FetchAck,
+        },
+        stats: U32Event,
+    }
+}
+use delivery::prelude::*;
+
+#[test]
+fn delivery_defaults_are_inherited_and_overridden() {
+    use delivery::{Topic as Root, jobs};
+    fn defaults<T: Topic>() -> (usize, Overflow) {
+        (T::BUFFER, T::ON_FULL)
+    }
+    assert_eq!(defaults::<Root>(), (DEFAULT_BUFFER, Overflow::DropNewest));
+    assert_eq!(defaults::<delivery::StatsLeaf>(), (DEFAULT_BUFFER, Overflow::DropNewest));
+    assert_eq!(defaults::<jobs::Topic>(), (1, Overflow::Wait));
+    assert_eq!(defaults::<jobs::RunLeaf>(), (1, Overflow::Wait));
+    assert_eq!(defaults::<jobs::ProgressLeaf>(), (1, Overflow::DropOldest));
+    assert_eq!(defaults::<jobs::BatchLeaf>(), (4, Overflow::Wait));
+
+    // Subscriptions start with the defaults of the topic they're on
+    let bus = Channel::<Root>::new();
+    let builder = bus.subscribe();
+    assert_eq!((builder.buffer, builder.overflow), (DEFAULT_BUFFER, Overflow::DropNewest));
+    let builder = bus.jobs().subscribe();
+    assert_eq!((builder.buffer, builder.overflow), (1, Overflow::Wait));
+    let builder = bus.jobs().ask().respond();
+    assert_eq!((builder.buffer, builder.overflow), (1, Overflow::Wait));
+}
+
+#[tokio::test]
+async fn delivery_defaults_apply_unless_the_subscription_overrides_them() {
+    let bus = Channel::<delivery::Topic>::new();
+    let runs = bus.jobs().run();
+    let mut sub = runs.subscribe().await;
+    assert_eq!(runs.publish(U32Event).await, 1);
+    assert!(runs.publish(U32Event).now_or_never().is_none(), "waits");
+    drop(sub.next().await);
+
+    let mut lossy = runs.subscribe().on_full(Overflow::DropNewest).buffer(2).await;
+    drop(sub);
+    for _ in 0..3 {
+        runs.publish(U32Event).await;
+    }
+    assert_eq!((drain(&mut lossy).len(), lossy.dropped()), (2, 1));
+
+    let progress = bus.jobs().progress();
+    let mut sub = progress.subscribe().await;
+    assert_eq!(progress.publish(U32Event).await, 1);
+    assert_eq!(progress.publish(U32Event).await, 1, "evicts the oldest");
+    assert_eq!((drain(&mut sub).len(), sub.dropped()), (1, 1));
+}

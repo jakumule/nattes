@@ -295,19 +295,27 @@ impl Buffer {
     }
 
     /// Deliver `events` under one lock, applying the overflow policy to each.
-    /// Returns how many were delivered; the ones a full `Overflow::Wait`
-    /// buffer can't take go to `full`, in order.
-    fn push_many(&self, events: impl Iterator<Item = Event>, full: &mut Vec<Event>) -> usize {
+    /// Returns how many were delivered and how many the overflow policy
+    /// dropped (an evicted message counts in both); the ones a full
+    /// `Overflow::Wait` buffer can't take go to `full`, in order.
+    fn push_many(
+        &self,
+        events: impl Iterator<Item = Event>,
+        full: &mut Vec<Event>,
+    ) -> (usize, usize) {
         if let Some(handler) = &self.handler {
             let pushed = events.map(|event| self.handle(handler, event));
-            return pushed.filter(|push| matches!(push, Push::Delivered)).count();
+            // a panicking handler logs its own drop
+            let delivered = pushed.filter(|push| matches!(push, Push::Delivered)).count();
+            return (delivered, 0);
         }
         let mut state = lock(&self.state);
         if state.closed {
-            return 0;
+            return (0, 0);
         }
         let mut dropped = Vec::new();
         let mut delivered = 0;
+        let mut lost = 0;
         for event in events {
             if state.events.len() < self.capacity {
                 state.events.push_back(event);
@@ -317,9 +325,13 @@ impl Buffer {
             let (push, old) = self.push_full::<true>(&mut state, event);
             dropped.extend(old);
             match push {
-                Push::Evicted => delivered += 1,
+                Push::Evicted => {
+                    delivered += 1;
+                    lost += 1;
+                }
+                Push::Dropped => lost += 1,
                 Push::Full(event) => full.push(event),
-                Push::Delivered | Push::Dropped | Push::Closed => {}
+                Push::Delivered | Push::Closed => {}
             }
         }
         drop(state);
@@ -327,7 +339,7 @@ impl Buffer {
         if delivered > 0 {
             self.wake();
         }
-        delivered
+        (delivered, lost)
     }
 
     /// Pass up to `max` events to `f`, under one lock. Returns how many.
@@ -1058,7 +1070,16 @@ impl Bus {
                 let accepted = (events.iter())
                     .filter(|event| sub.accepts(&***event, segs))
                     .cloned();
-                delivered += sub.buffer.push_many(accepted, &mut full);
+                let (pushed, dropped) = sub.buffer.push_many(accepted, &mut full);
+                delivered += pushed;
+                if dropped > 0 {
+                    warning!(
+                        subscription = sub.id,
+                        subject = %Subject(segs),
+                        dropped,
+                        "buffer full, dropped messages"
+                    );
+                }
                 waiting.extend(full.drain(..).map(|event| Waiting {
                     buffers: SmallVec::from_buf([sub.buffer.clone()]),
                     event,

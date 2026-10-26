@@ -2,6 +2,7 @@
 //! `Topic` enum and leaf type, and parameter values.
 
 use crate::nav::Seg;
+use crate::{DEFAULT_BUFFER, Overflow};
 use std::any::Any;
 use std::fmt::{self, Display};
 use std::hash::{Hash, Hasher};
@@ -19,6 +20,15 @@ pub trait Topic: Send + Sync + 'static {
     /// The view of an event, from the segments of its subject below this topic.
     #[doc(hidden)]
     fn view<'a>(below: &'a [Seg], payload: &'a dyn Any) -> Self::View<'a>;
+
+    /// The buffer size subscriptions on this topic start with: set with
+    /// `#[buffer(n)]` in [`topics!`](crate::topics), on it or a level above.
+    const BUFFER: usize = DEFAULT_BUFFER;
+
+    /// What subscriptions on this topic do when their buffer is full, unless
+    /// told otherwise: set with `#[on_full(…)]` in [`topics!`](crate::topics),
+    /// on it or a level above.
+    const ON_FULL: Overflow = Overflow::DropNewest;
 }
 
 /// A level: implemented by every `Topic` enum generated with

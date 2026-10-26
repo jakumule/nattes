@@ -9,7 +9,7 @@ use syn::parse::discouraged::Speculative;
 use syn::parse::{ParseStream, Parser};
 use syn::punctuated::Punctuated;
 use syn::{
-    Attribute, Error, Ident, Path, Result, Token, Type, Variant, braced, bracketed,
+    Attribute, Error, Ident, LitInt, Path, Result, Token, Type, Variant, braced, bracketed,
     parenthesized, token,
 };
 
@@ -29,9 +29,57 @@ pub struct GroupEnum {
     pub variants: Punctuated<Variant, Token![,]>,
 }
 
+/// The delivery defaults `#[buffer(n)]` and `#[on_full(Variant)]` of a topic,
+/// for it and the topics below it that don't set their own.
+#[derive(Clone, Default)]
+pub struct Delivery {
+    pub buffer: Option<LitInt>,
+    /// A variant of `Overflow`.
+    pub on_full: Option<Ident>,
+}
+
+impl Delivery {
+    fn is_empty(&self) -> bool {
+        self.buffer.is_none() && self.on_full.is_none()
+    }
+
+    /// Whether `attr` is one of these attributes.
+    fn is(attr: &Attribute) -> bool {
+        attr.path().is_ident("buffer") || attr.path().is_ident("on_full")
+    }
+
+    /// Reads `attr`, one of these attributes, into `self`.
+    fn set(&mut self, attr: &Attribute) -> Result<()> {
+        if attr.path().is_ident("buffer") {
+            let size: LitInt = attr.parse_args()?;
+            if size.base10_parse::<usize>()? == 0 {
+                return Err(Error::new(size.span(), "buffer size must be at least 1"));
+            }
+            if self.buffer.replace(size).is_some() {
+                return Err(Error::new_spanned(attr, "`buffer` is already set on this topic"));
+            }
+        } else {
+            let overflow: Ident = attr.parse_args()?;
+            if self.on_full.replace(overflow).is_some() {
+                return Err(Error::new_spanned(attr, "`on_full` is already set on this topic"));
+            }
+        }
+        Ok(())
+    }
+
+    /// These defaults, the unset ones taken from `outer`'s.
+    pub fn or(&self, outer: &Delivery) -> Delivery {
+        Delivery {
+            buffer: self.buffer.clone().or_else(|| outer.buffer.clone()),
+            on_full: self.on_full.clone().or_else(|| outer.on_full.clone()),
+        }
+    }
+}
+
 /// One topic: `name(Param) [A, B]` and what follows.
 pub struct Entry {
     pub docs: Vec<Attribute>,
+    pub delivery: Delivery,
     pub name: Ident,
     pub param: Option<Type>,
     pub groups: Option<GroupEnum>,
@@ -52,15 +100,23 @@ pub enum Kind {
 pub fn parse(tokens: TokenStream, errors: &mut Vec<Error>) -> Result<Input> {
     let parser = |input: ParseStream| {
         let krate = input.parse()?;
-        let (docs, attrs) = Attribute::parse_outer(input)?
+        let (docs, attrs): (Vec<_>, Vec<_>) = Attribute::parse_outer(input)?
             .into_iter()
             .partition(|attr| attr.path().is_ident("doc"));
+        let (defaults, attrs): (Vec<_>, Vec<_>) = attrs.into_iter().partition(Delivery::is);
+        let mut delivery = Delivery::default();
+        for attr in &defaults {
+            if let Err(error) = delivery.set(attr) {
+                errors.push(error);
+            }
+        }
         let name = input.parse()?;
         let groups = group_enum(input)?;
         let content;
         braced!(content in input);
         let root = Entry {
             docs,
+            delivery,
             name,
             param: None,
             groups,
@@ -156,18 +212,32 @@ fn entries(input: ParseStream, errors: &mut Vec<Error>) -> Vec<Entry> {
 
 fn entry(input: ParseStream, errors: &mut Vec<Error>) -> Result<Entry> {
     let mut docs = Vec::new();
+    let mut delivery = Delivery::default();
     for attr in Attribute::parse_outer(input)? {
         if attr.path().is_ident("doc") {
             docs.push(attr);
+        } else if Delivery::is(&attr) {
+            if let Err(error) = delivery.set(&attr) {
+                errors.push(error);
+            }
         } else {
-            errors.push(Error::new_spanned(attr, "only doc comments go on a topic"));
+            errors.push(Error::new_spanned(
+                attr,
+                "only doc comments, `#[buffer(n)]` and `#[on_full(…)]` go on a topic",
+            ));
         }
     }
-    topic(input, docs, errors)
+    topic(input, docs, delivery, errors)
 }
 
-/// A topic after its docs, which go on the last topic of a chain `a.b.c`.
-fn topic(input: ParseStream, docs: Vec<Attribute>, errors: &mut Vec<Error>) -> Result<Entry> {
+/// A topic after its docs and delivery defaults, which go on the last topic
+/// of a chain `a.b.c`.
+fn topic(
+    input: ParseStream,
+    docs: Vec<Attribute>,
+    delivery: Delivery,
+    errors: &mut Vec<Error>,
+) -> Result<Entry> {
     let name: Ident = input.parse()?;
     let param = if input.peek(token::Paren) {
         let content;
@@ -183,13 +253,14 @@ fn topic(input: ParseStream, docs: Vec<Attribute>, errors: &mut Vec<Error>) -> R
         None
     };
     let groups = group_enum(input)?;
-    let (docs, kind) = if input.peek(Token![.]) {
+    let (docs, delivery, kind) = if input.peek(Token![.]) {
         input.parse::<Token![.]>()?;
-        (Vec::new(), Kind::Level(vec![topic(input, docs, errors)?]))
+        let last = topic(input, docs, delivery, errors)?;
+        (Vec::new(), Delivery::default(), Kind::Level(vec![last]))
     } else if input.peek(token::Brace) {
         let content;
         braced!(content in input);
-        (docs, Kind::Level(entries(&content, errors)))
+        (docs, delivery, Kind::Level(entries(&content, errors)))
     } else if input.peek(Token![:]) {
         input.parse::<Token![:]>()?;
         let msg = input
@@ -204,10 +275,21 @@ fn topic(input: ParseStream, docs: Vec<Attribute>, errors: &mut Vec<Error>) -> R
         } else {
             None
         };
-        (docs, Kind::Leaf { msg, reply })
+        (docs, delivery, Kind::Leaf { msg, reply })
     } else if input.peek(Token![=]) && param.is_none() && groups.is_none() {
         input.parse::<Token![=]>()?;
-        (docs, Kind::Mount(Path::parse_mod_style(input)?))
+        if !delivery.is_empty() {
+            // every mount shares the mounted tree's types, and their defaults
+            errors.push(Error::new(
+                name.span(),
+                "`#[buffer]` and `#[on_full]` don't go on a mount: set them in the mounted tree",
+            ));
+        }
+        (
+            docs,
+            Delivery::default(),
+            Kind::Mount(Path::parse_mod_style(input)?),
+        )
     } else {
         return Err(input.error(
             "expected `{ … }`, `: Message`, `: Message => Reply`, `.name` or, without parameter and groups, `= module`",
@@ -215,6 +297,7 @@ fn topic(input: ParseStream, docs: Vec<Attribute>, errors: &mut Vec<Error>) -> R
     };
     Ok(Entry {
         docs,
+        delivery,
         name,
         param,
         groups,
@@ -405,13 +488,76 @@ mod tests {
         assert_eq!(names(&entries), ["c"]);
         assert_eq!(groups(&entries[0]), ["C", "D"]);
         assert_eq!(errors.len(), 2, "{errors:?}");
-        assert!(errors[1].contains("without parameter and groups"), "{errors:?}");
+        assert!(
+            errors[1].contains("without parameter and groups"),
+            "{errors:?}"
+        );
     }
 
     #[test]
     fn only_docs_go_on_a_topic() {
         let (entries, errors) = parse_tree(quote!(#[cfg(test)] a: A));
         assert_eq!(names(&entries), ["a"]);
-        assert_eq!(errors, ["only doc comments go on a topic"]);
+        assert_eq!(
+            errors,
+            ["only doc comments, `#[buffer(n)]` and `#[on_full(…)]` go on a topic"]
+        );
+    }
+
+    fn delivery(entry: &Entry) -> (Option<String>, Option<String>) {
+        let Delivery { buffer, on_full } = &entry.delivery;
+        (
+            buffer.as_ref().map(ToString::to_string),
+            on_full.as_ref().map(ToString::to_string),
+        )
+    }
+
+    #[test]
+    fn delivery_defaults_go_on_levels_leaves_and_the_root() {
+        let mut errors = Vec::new();
+        let body = quote! {
+            krate
+            #[buffer(8)]
+            #[derive(Debug)]
+            ev {
+                #[on_full(Wait)]
+                a { #[buffer(2)] b: B, c: C },
+                /// docs
+                #[on_full(DropOldest)]
+                d.e: E,
+                f: F,
+            }
+        };
+        let input = parse(body, &mut errors).unwrap();
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(delivery(&input.root), (Some("8".into()), None));
+        assert_eq!(input.attrs.len(), 1, "other attributes go on `TopicRef`");
+        let entries = children(&input.root);
+        assert_eq!(delivery(&entries[0]), (None, Some("Wait".into())));
+        let a = children(&entries[0]);
+        assert_eq!(delivery(&a[0]), (Some("2".into()), None));
+        assert_eq!(delivery(&a[1]), (None, None));
+        assert_eq!(delivery(&entries[1]), (None, None));
+        let e = &children(&entries[1])[0];
+        assert_eq!(delivery(e), (None, Some("DropOldest".into())));
+        assert_eq!(delivery(&entries[2]), (None, None));
+    }
+
+    #[test]
+    fn wrong_delivery_defaults_are_reported() {
+        let (entries, errors) = parse_tree(quote! {
+            #[buffer(0)] a: A,
+            #[on_full(Wait)] #[on_full(DropOldest)] b: B,
+            #[buffer(4)] c = other,
+            #[buffer(x)] d: D,
+            e: E,
+        });
+        assert_eq!(names(&entries), ["a", "b", "c", "d", "e"]);
+        assert_eq!(delivery(&entries[1]), (None, Some("DropOldest".into())));
+        assert_eq!(delivery(&entries[2]), (None, None));
+        assert_eq!(errors.len(), 4, "{errors:?}");
+        assert_eq!(errors[0], "buffer size must be at least 1");
+        assert_eq!(errors[1], "`on_full` is already set on this topic");
+        assert!(errors[2].contains("don't go on a mount"), "{errors:?}");
     }
 }

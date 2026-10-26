@@ -18,6 +18,8 @@
 ///                 delete: UserDeleteMsg,
 ///             },
 ///         },
+///         #[on_full(Wait)]            // delivery defaults of jobs and below
+///         jobs { run: JobMsg },
 ///         random.arrow.more: DeepMsg, // `a.x` is `a { x }`
 ///         other = other,              // mount the tree of another topics! module
 ///     }
@@ -42,6 +44,12 @@
 ///   brings every `Steps` trait of the tree, mounted trees included:
 ///   `use topics::prelude::*;`.
 ///
+/// `#[on_full(Variant)]` and `#[buffer(n)]` before a topic set the
+/// [`Overflow`](crate::Overflow) and buffer size its subscriptions, responders
+/// and bridges start with (`Topic::ON_FULL`, `Topic::BUFFER`), for it and the
+/// topics below it that don't set their own. Before the root, they apply to
+/// the whole tree; they can't go on a mount, which keeps its own tree's.
+///
 /// Doc comments on a topic document its `TopicRef` variant, its `Steps` method,
 /// and its module or leaf type, so editors show them when hovering a step. On
 /// a chain `a.b.c: Msg` they document `c`. Both also state the subject, such as
@@ -58,7 +66,8 @@
 ///
 /// The root is written like any level and becomes a `pub` module, like every
 /// level. Doc comments before its name document that module; other attributes
-/// before it are applied to every `TopicRef` enum. A wrong topic is
+/// before it are applied to every `TopicRef` enum, except the delivery
+/// defaults. A wrong topic is
 /// reported on its own and left out, so the rest of the tree still expands.
 /// Parameter types must implement `Clone + Eq + Hash + Display` (see
 /// [`ParamValue`](crate::ParamValue)); messages must be `Send + Sync + 'static`.
