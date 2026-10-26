@@ -15,7 +15,7 @@ members = ["macros"]
 resolver = "3"
 
 [workspace.package]
-version = "0.2.1"
+version = "0.3.1"
 edition = "2024"
 license = "MIT"
 readme = "README.md"
@@ -26,7 +26,7 @@ keywords = ["message-queue", "nats"]
 
 
 [dependencies]
-nattes-macros = { path = "macros", version = "0.2.1" }
+nattes-macros = { path = "macros", version = "0.3.1" }
 
 futures = "0.3"
 bytes = { version = "1", optional = true }
