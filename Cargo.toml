@@ -8,14 +8,14 @@ repository.workspace = true
 description.workspace = true
 categories.workspace = true
 keywords.workspace = true
-exclude = [".github/", ".gitignore", "benches/", "doc/", "CLAUDE.md", "TODO.md", "flake.nix", "flake.lock"]
+exclude = [".claude/", ".github/", ".gitignore", "benches/", "doc/", "CLAUDE.md", "TODO.md", "flake.nix", "flake.lock"]
 
 [workspace]
 members = ["macros"]
 resolver = "3"
 
 [workspace.package]
-version = "0.3.1"
+version = "0.3.2"
 edition = "2024"
 license = "MIT"
 readme = "README.md"
@@ -26,7 +26,7 @@ keywords = ["message-queue", "nats"]
 
 
 [dependencies]
-nattes-macros = { path = "macros", version = "0.3.1" }
+nattes-macros = { path = "macros", version = "0.3.2" }
 
 futures-core = { version = "0.3", default-features = false, features = ["std"] }
 futures-sink = { version = "0.3", default-features = false, optional = true }
