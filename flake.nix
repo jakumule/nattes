@@ -43,6 +43,9 @@
                 rust-analyzer
                 gnuplot
                 mdbook
+                nil
+                nixd
+                cargo-expand
               ]
               # Valgrind (for the `instructions` bench) is Linux only.
               ++ lib.optionals (lib.meta.availableOn stdenv.hostPlatform valgrind) [

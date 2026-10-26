@@ -34,6 +34,8 @@ CI (`.github/workflows/`) runs `cargo check`, `cargo build`, `cargo test --works
 
 The repo is also a jujutsu repo (`.jj/`), so git may show a detached `HEAD`.
 
+Project skills in `.claude/skills/`: `verify` (the full check matrix, beyond what CI runs), `perf-iterate` (the baseline workflow above), `api-change` (what to update with a public or compile-time change), `nattes-review` (the conventions below as a review pass), `macro-expand` (`topics!` output with `cargo expand`). `.claude/settings.json` enables the rust-analyzer LSP and context7 plugins.
+
 ## Architecture
 
 `src/lib.rs` holds the crate docs (including the `compile_fail` doctests) and re-exports the public API from private modules. Request/reply (and `BusError`) lives in `src/request.rs`, bridges in `src/bridge.rs` and `src/wire.rs`, and tests are in `src/tests.rs` (unit), `tests/bridge.rs` and `tests/tracing.rs`. Modules:
