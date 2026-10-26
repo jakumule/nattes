@@ -891,7 +891,7 @@ fn push_to<const REQUEST: bool>(
     match sub.buffer.try_push::<true>(pushed) {
         Push::Delivered => usize::from(counts),
         Push::Evicted => {
-            debug!(
+            warning!(
                 subscription = sub.id,
                 subject = %Subject(event.path()),
                 "buffer full, dropped the oldest message"
@@ -907,7 +907,7 @@ fn push_to<const REQUEST: bool>(
             0
         }
         Push::Dropped => {
-            debug!(
+            warning!(
                 subscription = sub.id,
                 subject = %Subject(event.path()),
                 "buffer full, dropped the message"

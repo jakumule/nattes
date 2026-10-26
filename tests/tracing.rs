@@ -21,30 +21,36 @@ topics! {
 }
 use topics::prelude::*;
 
-/// Records every log record as `message field=value …`.
+/// Records every log record as `message field=value …`, and every span as
+/// `span name field=value …`.
 #[derive(Clone, Default)]
 struct Recorder(Arc<Mutex<Vec<String>>>);
 
+struct Line(String);
+
+impl Visit for Line {
+    fn record_debug(&mut self, field: &Field, value: &dyn Debug) {
+        match field.name() {
+            "message" => self.0.insert_str(0, &format!("{value:?}")),
+            name => self.0.push_str(&format!(" {name}={value:?}")),
+        }
+    }
+}
+
 impl Subscriber for Recorder {
-    fn enabled(&self, _: &Metadata<'_>) -> bool {
+    fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+        assert!(metadata.target().starts_with("nattes::"), "{}", metadata.target());
         true
     }
-    fn new_span(&self, _: &Attributes<'_>) -> Id {
+    fn new_span(&self, span: &Attributes<'_>) -> Id {
+        let mut line = Line(format!("span {}", span.metadata().name()));
+        span.record(&mut line);
+        self.0.lock().unwrap().push(line.0);
         Id::from_u64(1)
     }
     fn record(&self, _: &Id, _: &Record<'_>) {}
     fn record_follows_from(&self, _: &Id, _: &Id) {}
     fn event(&self, event: &Event<'_>) {
-        struct Line(String);
-        impl Visit for Line {
-            fn record_debug(&mut self, field: &Field, value: &dyn Debug) {
-                match field.name() {
-                    "message" => self.0.insert_str(0, &format!("{value:?}")),
-                    name => self.0.push_str(&format!(" {name}={value:?}")),
-                }
-            }
-        }
-        assert_eq!(event.metadata().target(), "nattes");
         let mut line = Line(String::new());
         event.record(&mut line);
         self.0.lock().unwrap().push(line.0);
@@ -81,6 +87,47 @@ fn logs_subscriptions_publishes_drops_and_close() {
             "publish subject=user.id.7.delete delivered=0 waiting=0",
             "unsubscribe subscription=0 pattern=user.id.*.delete.>",
             "unsubscribe subscription=1 pattern=git.push.>",
+            "bus closed",
+        ]
+    );
+}
+
+#[cfg(feature = "bridge")]
+#[test]
+fn a_bridge_runs_in_a_span() {
+    use futures::stream;
+    use nattes::{Bridge, Codec, CodecError};
+    use std::convert::Infallible;
+
+    /// Never called: the bridge stops at the hello.
+    struct Nothing;
+    impl<M> Codec<M> for Nothing {
+        fn encode(&self, _: &M, _: &mut Vec<u8>) -> Result<(), CodecError> {
+            Ok(())
+        }
+        fn decode(&self, _: &[u8]) -> Result<M, CodecError> {
+            Err("nothing".into())
+        }
+    }
+
+    let recorder = Recorder::default();
+    tracing::subscriber::with_default(recorder.clone(), || {
+        futures::executor::block_on(async {
+            let bus = Channel::<topics::Topic>::new();
+            let bridge = Bridge::new(bus.user(), Nothing);
+            // A hello of another frame version
+            let hello = stream::iter([Ok::<_, Infallible>(vec![0u8, 99])]);
+            bridge.run(futures::sink::drain(), hello).await.unwrap_err();
+        })
+    });
+    assert_eq!(
+        *recorder.0.lock().unwrap(),
+        [
+            "span bridge channel=user.>",
+            "bridge started",
+            "subscribe subscription=0 pattern=user.> group=None responder=false filtered=true",
+            "unsubscribe subscription=0 pattern=user.>",
+            "bridge stopped error=the other side speaks frame format 99, this one 1",
             "bus closed",
         ]
     );

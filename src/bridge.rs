@@ -16,7 +16,7 @@
 
 use crate::bus::{Buffer, Bus, Change, Matcher};
 use crate::event::Envelope;
-use crate::log::{debug, warning};
+use crate::log::{debug, instrument, warning};
 use crate::nav::{Key, KeyParam, Seg};
 use crate::tree::Topic;
 use crate::wire::{self, Wire, WireError};
@@ -127,21 +127,29 @@ impl<T: Topic + Wire<C>, C: Send + Sync + 'static> Bridge<T, C> {
         B: AsRef<[u8]>,
         E: Into<Box<dyn Error + Send + Sync>>,
     {
-        let bus = &self.channel.bus.0;
         let base: Arc<[Key]> = self.channel.path.keys().into();
-        // What the other side wants, as patterns relative to the channel
-        let remote = Arc::new(ArcSwap::from_pointee(Patterns::default()));
-        let export = Export::new(bus, &base, &remote, self.buffer, self.overflow);
-        let changes = bus.watch();
+        let run = async {
+            debug!("bridge started");
+            let bus = &self.channel.bus.0;
+            // What the other side wants, as patterns relative to the channel
+            let remote = Arc::new(ArcSwap::from_pointee(Patterns::default()));
+            let export = Export::new(bus, &base, &remote, self.buffer, self.overflow);
+            let changes = bus.watch();
 
-        let writer = self.write(sink, changes, &export.buffer, &base);
-        let reader = self.read(stream, &remote);
-        let result = match select(pin!(writer), pin!(reader)).await {
-            Either::Left((result, _)) | Either::Right((result, _)) => result,
+            let writer = self.write(sink, changes, &export.buffer, &base);
+            let reader = self.read(stream, &remote);
+            let result = match select(pin!(writer), pin!(reader)).await {
+                Either::Left((result, _)) | Either::Right((result, _)) => result,
+            };
+            drop(export);
+            // The error is returned too: only `debug`
+            debug!(
+                error = result.as_ref().err().map(::tracing::field::display),
+                "bridge stopped"
+            );
+            result
         };
-        drop(export);
-        debug!("bridge stopped");
-        result
+        instrument!(run, "bridge", channel = %crate::nav::Pattern(&base)).await
     }
 
     /// Send the hello, then local interest and the messages the other side
