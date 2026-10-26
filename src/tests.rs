@@ -593,6 +593,142 @@ fn dropped_filter_can_unsubscribe_on_close() {
     });
 }
 
+#[tokio::test]
+async fn close_ends_a_worker_that_publishes() {
+    let bus = Channel::<topics::Topic>::new();
+    let mut pulls = bus.git().pull().subscribe().await;
+    let worker = tokio::spawn({
+        // The worker holds a channel: dropping the others wouldn't close the bus
+        let git = bus.git();
+        let mut pushes = git.push().subscribe().await;
+        async move {
+            while pushes.next().await.is_some() {
+                git.pull().publish(GitPullMsg).await;
+            }
+        }
+    });
+    bus.git().push().publish(GitPushMsg("main".into())).await;
+    bus.git().close();
+    tokio::time::timeout(std::time::Duration::from_secs(5), worker)
+        .await
+        .expect("the worker ended")
+        .unwrap();
+    // The worker read its push, but the bus was closed when it published
+    assert!(pulls.next().await.is_none());
+}
+
+#[tokio::test]
+async fn close_keeps_buffered_messages() {
+    let pushes = push_channel();
+    let mut sub = pushes.subscribe().await;
+    pushes.publish(GitPushMsg("a".into())).await;
+    pushes.publish(GitPushMsg("b".into())).await;
+    pushes.close();
+    let got: Vec<_> = sub.by_ref().map(|m| m.0.clone()).collect().await;
+    assert_eq!(got, ["a", "b"]);
+    assert!(sub.is_terminated());
+}
+
+#[tokio::test]
+async fn nothing_is_delivered_after_close() {
+    let pushes = push_channel();
+    let handled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let _handler = pushes.subscribe().handler({
+        let handled = handled.clone();
+        move |_| {
+            handled.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+    let fetches = fetch_channel();
+    let _responder = fetches.respond().await;
+    pushes.close();
+    fetches.close();
+    assert_eq!(pushes.publish(GitPushMsg("late".into())).await, 0);
+    assert_eq!(pushes.publish_many([GitPushMsg("late".into())]).await, 0);
+    assert_eq!(handled.load(std::sync::atomic::Ordering::Relaxed), 0);
+    assert!(matches!(
+        fetches.request(GitFetchMsg("main".into())).await,
+        Err(BusError::NoResponders)
+    ));
+}
+
+#[tokio::test]
+async fn subscribing_after_close_ends_at_once() {
+    let pushes = push_channel();
+    pushes.close();
+    let mut sub = pushes.subscribe().await;
+    let mut worker = pushes.subscribe().queue(PushQueue::Workers).await;
+    assert_eq!(pushes.publish(GitPushMsg("late".into())).await, 0);
+    assert!(sub.next().await.is_none());
+    assert!(worker.next().await.is_none());
+    assert_eq!(pushes.bus.group_count(), 0);
+    drop(worker);
+    assert_eq!(pushes.bus.group_count(), 0);
+}
+
+#[tokio::test]
+async fn close_forgets_queue_groups() {
+    let pushes = push_channel();
+    let worker = pushes.subscribe().queue(PushQueue::Workers).await;
+    pushes.close();
+    assert_eq!(pushes.bus.group_count(), 0);
+    // Its unsubscription finds no group to count down
+    drop(worker);
+    let _late = pushes.subscribe().queue(PushQueue::Workers).await;
+    assert_eq!(pushes.bus.group_count(), 0);
+}
+
+#[tokio::test]
+async fn close_releases_a_waiting_publisher() {
+    let pushes = push_channel();
+    let mut slow = pushes.subscribe().buffer(1).on_full(Overflow::Wait).await;
+    pushes.publish(GitPushMsg("0".into())).await;
+
+    let publisher = tokio::spawn({
+        let pushes = pushes.clone();
+        async move { pushes.publish(GitPushMsg("1".into())).await }
+    });
+    tokio::task::yield_now().await;
+    pushes.close();
+    assert_eq!(publisher.await.unwrap(), 0);
+    assert_eq!(slow.next().await.unwrap().0, "0");
+    assert!(slow.next().await.is_none());
+}
+
+#[tokio::test]
+async fn close_twice_then_drop() {
+    let pushes = push_channel();
+    let mut sub = pushes.subscribe().await;
+    pushes.close();
+    pushes.close();
+    drop(pushes);
+    assert!(sub.next().await.is_none());
+}
+
+#[test]
+fn dropped_filter_can_close_on_close() {
+    without_deadlock(|| {
+        struct CloseOnDrop(Channel<reentrant::EchoLeaf>);
+        impl Drop for CloseOnDrop {
+            fn drop(&mut self) {
+                self.0.close();
+            }
+        }
+        let echo = (Channel::<reentrant::Topic>::new()).echo();
+        let on_drop = CloseOnDrop(echo.clone());
+        let _sub = (echo.subscribe())
+            .filter(move |_, _| {
+                let _ = &on_drop;
+                true
+            })
+            .into_future()
+            .now_or_never()
+            .unwrap();
+        // Dropping the trie drops the filter, which closes again
+        echo.close();
+    });
+}
+
 fn push_channel() -> Channel<topics::git::PushLeaf> {
     (Channel::<topics::Topic>::new()).git().push()
 }

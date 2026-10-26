@@ -93,6 +93,7 @@ const RESERVED: &[&str] = &[
     "publish_many",
     "request",
     "scatter",
+    "close",
     "clone",
     "clone_from",
     "clone_into",
@@ -298,6 +299,19 @@ mod tests {
         let (entries, errors) = parse_tree(quote!(a: A, r#a: B));
         assert_eq!(names(&entries), ["a"]);
         assert_eq!(errors, ["`r#a` is already a topic of this level"]);
+    }
+
+    #[test]
+    fn channel_methods_are_reserved() {
+        let (entries, errors) = parse_tree(quote!(close: A, r#publish: B, c: C));
+        assert_eq!(names(&entries), ["c"]);
+        assert_eq!(
+            errors,
+            [
+                "`close` can't be a topic name: channels have a method `close`",
+                "`publish` can't be a topic name: channels have a method `publish`",
+            ]
+        );
     }
 
     #[test]

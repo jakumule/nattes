@@ -38,8 +38,9 @@ impl Drop for Handle {
 /// by `use topics::prelude::*`: `bus.git().push()`.
 ///
 /// Every channel of a bus, sub-channels included, keeps it open. Once the last
-/// one is dropped, nothing can publish anymore: each subscription yields its
-/// buffered messages, then ends.
+/// one is dropped, or [`close`](Self::close) is called on any of them, nothing
+/// can publish anymore: each subscription yields its buffered messages, then
+/// ends.
 ///
 /// A function taking `&Channel<T, P>` accepts any channel, root or not, with
 /// or without wildcards:
@@ -88,6 +89,48 @@ impl<T, P> fmt::Debug for Channel<T, P> {
         f.debug_tuple("Channel")
             .field(&format_args!("{}", Pattern(&self.path.keys())))
             .finish()
+    }
+}
+
+impl<T, P> Channel<T, P> {
+    /// Close the bus, whichever channel of it this is and whoever still holds
+    /// one: what dropping its last channel does.
+    ///
+    /// Each subscription, responder and handler yields what its buffer holds,
+    /// then ends, and publishers waiting for room are released. Later, publishing
+    /// reaches nobody, requests fail with
+    /// [`NoResponders`](crate::BusError::NoResponders), new subscriptions end
+    /// at once and bridges stop. Closing again does nothing.
+    ///
+    /// A worker that also publishes holds a channel, so dropping the others
+    /// doesn't end its subscription; closing does:
+    ///
+    /// ```
+    /// # use nattes::{topics, Channel};
+    /// # pub struct PushMsg(pub u32);
+    /// # topics! { topics { git { push: PushMsg, pushed: PushMsg } } }
+    /// use futures::StreamExt;
+    /// use topics::prelude::*;
+    ///
+    /// # #[tokio::main(flavor = "current_thread")]
+    /// # async fn main() {
+    /// let bus = Channel::<topics::Topic>::new();
+    /// let worker = tokio::spawn({
+    ///     let git = bus.git();
+    ///     let mut pushes = git.push().subscribe().await;
+    ///     async move {
+    ///         while let Some(push) = pushes.next().await {
+    ///             git.pushed().publish(PushMsg(push.0)).await;
+    ///         }
+    ///     }
+    /// });
+    /// bus.git().push().publish(PushMsg(1)).await;
+    /// bus.close();
+    /// worker.await.unwrap(); // handles the push, then ends
+    /// # }
+    /// ```
+    pub fn close(&self) {
+        self.bus.close();
     }
 }
 

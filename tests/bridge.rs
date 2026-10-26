@@ -214,6 +214,28 @@ async fn another_frame_version_is_refused() {
     assert!(matches!(error, BridgeError::Version { theirs: 99, .. }), "{error}");
 }
 
+#[tokio::test]
+async fn closing_the_bus_stops_its_bridge() {
+    let a = Channel::<v1::topics::Topic>::new();
+    let ((a_tx, a_rx), (_b_tx, _b_rx)) = link();
+    // The bridge holds a channel, so only closing stops it
+    let bridge = Bridge::new(a.clone(), Plain);
+    let mut run = Box::pin(bridge.run(a_tx, a_rx));
+    assert!((&mut run).now_or_never().is_none());
+    a.close();
+    tokio::time::timeout(Duration::from_secs(5), run)
+        .await
+        .expect("the bridge stopped")
+        .unwrap();
+
+    // On a closed bus, it stops at once
+    let ((a_tx, a_rx), (_b_tx, _b_rx)) = link();
+    tokio::time::timeout(Duration::from_secs(5), bridge.run(a_tx, a_rx))
+        .await
+        .expect("the bridge stopped")
+        .unwrap();
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn over_a_unix_socket() {

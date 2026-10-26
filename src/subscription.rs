@@ -227,7 +227,7 @@ impl Drop for Active {
 }
 
 /// Active subscription, a [`Stream`] of [`Msg`]. Unsubscribes on drop. Ends
-/// once every channel of the bus is dropped and the buffer read.
+/// once the bus is [closed](crate::Channel::close) and the buffer read.
 pub struct Subscription<T, P> {
     active: Active,
     topic: PhantomData<fn() -> (T, P)>,
@@ -316,7 +316,7 @@ impl<T, P> fmt::Debug for Handler<T, P> {
 
 /// Active responder on a request leaf, a [`Stream`] of [`Incoming`]
 /// requests. Unsubscribes on drop, which drops the requests it didn't read.
-/// Ends once every channel of the bus is dropped and the buffer read.
+/// Ends once the bus is [closed](crate::Channel::close) and the buffer read.
 pub struct Responder<L, P> {
     active: Active,
     leaf: PhantomData<fn() -> (L, P)>,

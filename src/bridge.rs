@@ -116,7 +116,8 @@ impl<T: Topic + Wire<C>, C: Send + Sync + 'static> Bridge<T, C> {
     }
 
     /// Exchange interest and messages with the other side through `sink` and
-    /// `stream`, until either ends or fails. Each item is one frame.
+    /// `stream`, until either ends or fails, or the bus is closed. Each item is
+    /// one frame.
     ///
     /// Bound it with your runtime: drop the future to disconnect.
     pub async fn run<Si, St, B, E>(&self, sink: Si, stream: St) -> Result<(), BridgeError>

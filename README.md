@@ -370,6 +370,17 @@ while let Some(msg) = sub.next().await {
   and responder yields what its buffer holds, then ends, so
   `while let Some(msg) = sub.next().await` returns. A task, a message or a
   filter holding a channel keeps the bus open, like an `mpsc` sender.
+  `close()` on any channel closes the bus whoever still holds one, which is how
+  to shut down workers that also publish: later publishes reach nobody,
+  requests fail with `NoResponders`, new subscriptions end at once and bridges
+  stop.
+
+  ```rust
+  bus.close();
+  for worker in workers {
+      worker.await?; // each one reads what it was sent, then its loop ends
+  }
+  ```
 - **Unsubscribing.** Drop the subscription. Publishers waiting on it are released.
 - **Subjects.** `msg.subject()` gives a NATS-style subject for logging, built from
   names and parameter values, e.g. `user.id.42.delete`. `%`, `.`, `*`, `>` and

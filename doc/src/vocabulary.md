@@ -58,7 +58,7 @@ topics! {
 |---|---|---|
 | **bus** | The shared state behind every channel that comes from one `Channel::new()`. Two `Channel::new()` are two buses. | core |
 | **channel** | A typed view `Channel<T, P>` on part of a tree, which publishes and subscribes relative to it. | — |
-| **closed** | A bus whose last channel was dropped. Its subscriptions end once they have read their buffers. | shut down, dead |
+| **closed** | A bus whose last channel was dropped, or that `Channel::close` closed. Its subscriptions end once they have read their buffers. | shut down, dead |
 | **sub-channel** | A channel taken from another one with steps: `bus.git()`. | — |
 | **path** | The steps from the root to a channel, `user().id(alice).delete()`: a `Node` (its `Seg`s, flat, and which are wildcards), and the keys it stands for in the interest trie (`[Key]`). An event's subject is the `Node` of the channel it was published on. | route |
 | **step** | One move down one level: a method of a `Steps` trait, which adds one `Seg`. `bus.git().push()` takes two steps. | hop |
@@ -118,7 +118,7 @@ The internal types, by term:
 
 | Term | Type |
 |---|---|
-| bus | `Bus` (`bus.rs`), held by channels through a `Handle` (`channel.rs`) that closes it on drop |
+| bus | `Bus` (`bus.rs`), held by channels through a `Handle` (`channel.rs`) that closes it on drop (or `Channel::close`) |
 | buffer | `Buffer`, or for a handler a `Buffer` with a `HandlerFn` |
 | subscription, in the trie | `Sub` |
 | queue group, at compile time | `QueueGroup`, `InScope<T>` (`group.rs`) |

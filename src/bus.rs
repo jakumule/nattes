@@ -957,6 +957,8 @@ struct State {
     /// their member count: a group is forgotten with its last member.
     groups: HashMap<GroupId, (Arc<RoundRobin>, usize)>,
     next_id: u64,
+    /// Set by `Bus::close`: subscriptions made later end at once.
+    closed: bool,
     /// Told about every watched subscription and unsubscription.
     #[cfg(feature = "bridge")]
     watchers: Vec<mpsc::UnboundedSender<Change>>,
@@ -1165,6 +1167,12 @@ impl Bus {
         let mut state = lock(&self.state);
         let id = state.next_id;
         state.next_id += 1;
+        if state.closed {
+            // Not in the trie: `unsubscribe` finds nothing to remove
+            drop(state);
+            buffer.end();
+            return id;
+        }
         let turn = group_key.map(|key| {
             let id = group_id(key, path, responder);
             let (turn, members) = state.groups.entry(id).or_default();
@@ -1245,6 +1253,10 @@ impl Bus {
     pub(crate) fn watch(&self) -> mpsc::UnboundedReceiver<Change> {
         let (tx, rx) = mpsc::unbounded();
         let mut state = lock(&self.state);
+        if state.closed {
+            // Dropping `tx` ends the stream
+            return rx;
+        }
         self.interest.load().for_each_sub(&mut |sub| {
             if let Some(path) = &sub.watched {
                 // The receiver is right here: this can't fail
@@ -1255,19 +1267,27 @@ impl Bus {
         rx
     }
 
-    /// The last channel is gone, so nothing can publish or subscribe anymore:
-    /// every subscription ends once it has read its buffer.
+    /// Closed by `Channel::close` or with the last channel: publishing reaches
+    /// nobody, subscribing ends at once, and every subscription ends once it
+    /// has read its buffer. Does nothing the second time.
     pub(crate) fn close(&self) {
-        #[cfg_attr(not(feature = "bridge"), allow(unused_mut))]
         let mut state = lock(&self.state);
+        if state.closed {
+            return;
+        }
+        state.closed = true;
         // Their streams end
         #[cfg(feature = "bridge")]
         state.watchers.clear();
+        // Unsubscribing finds no group to count down
+        let groups = std::mem::take(&mut state.groups);
         let old = self.interest.swap(Arc::default());
         drop(state);
         old.for_each_sub(&mut |sub| sub.buffer.end());
-        // Holds the filters, which are user code: dropped after unlocking
+        // They hold the filters and group values, which are user code:
+        // dropped after unlocking
         drop(old);
+        drop(groups);
         debug!("bus closed");
     }
 
