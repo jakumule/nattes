@@ -1,6 +1,6 @@
 # Vocabulary
 
-One term per concept, used everywhere: in the README, the API docs, the code
+One term per concept, used everywhere: in the README, the guide, the API docs, the code
 and its comments. Don't introduce synonyms. When a concept is added or renamed,
 update this page first.
 

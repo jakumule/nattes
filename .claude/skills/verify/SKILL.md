@@ -13,6 +13,8 @@ CI only runs `cargo test --workspace` and clippy. The `tracing` and `bridge` tes
 | tracing (own binary: tracing caches callsite interest globally) | `cargo test --features tracing --test tracing` |
 | bridges, in memory and on a Unix socket | `cargo test --features bridge --test bridge` |
 | all features together | `cargo test --workspace --all-features` |
+| every doctest: crate docs, the guide (bridges chapter included), the README | `cargo test --doc --all-features` |
+| API docs and their intra-doc links, with and without `bridge` | `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features` and the same without `--all-features` |
 | lint, as in CI | `cargo clippy --workspace --all-features --all-targets` |
 | docs book | `mdbook build doc` |
 

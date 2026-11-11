@@ -18,13 +18,13 @@ Review the current change (`jj diff`, or `git diff` against `main`) against the 
 
 ## API and types
 - Handles and futures stay `Send + Sync`, and messages stay `Send + Sync + 'static`.
-- A change to navigation or publishing comes with `compile_fail` doctests in `src/lib.rs` and an update to the README's "Compile-time checks" (see the `api-change` skill).
+- A change to navigation or publishing comes with `compile_fail` doctests in `src/guide/compile_time.md`, each quoting its error (see the `api-change` skill).
 - No backward-compat shims, deprecated aliases or re-exports kept for old names.
 - Generated names follow Rust conventions. Only clippy method-name lints are silenced.
 
 ## Words and scope
 - Terms match `doc/src/vocabulary.md`: no new synonyms, and new concepts are added there.
-- Scope rule: new code must need the trie, a buffer's lock or delivery counts, or avoid an extra buffer, wake or task. Otherwise it belongs in a README recipe. No async runtime in `[dependencies]`.
+- Scope rule: new code must need the trie, a buffer's lock or delivery counts, or avoid an extra buffer, wake or task. Otherwise it belongs in a recipe of the guide (`src/guide/recipes.md`). No async runtime in `[dependencies]`.
 
 ## Performance
 - On hot paths (`bus.rs` delivery, `nav.rs`, `channel.rs` steps), ask whether the change was measured. CLAUDE.md records several innocent-looking refactors that cost 2–50%. If it wasn't measured, suggest `perf-iterate`.

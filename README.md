@@ -1,15 +1,17 @@
 # nattes
 
+[![crates.io](https://img.shields.io/crates/v/nattes.svg)](https://crates.io/crates/nattes)
+[![docs.rs](https://img.shields.io/docsrs/nattes)](https://docs.rs/nattes)
+[![CI](https://github.com/jakumule/nattes/actions/workflows/rust.yaml/badge.svg)](https://github.com/jakumule/nattes/actions/workflows/rust.yaml)
+[![license](https://img.shields.io/crates/l/nattes.svg)](LICENSE)
+
 A typesafe, in-process message queue for Rust, inspired by [NATS](https://nats.io).
 
-Instead of string subjects like `user.*.delete`, you declare your topics as a tree of
-types. Then you walk down that tree to publish and subscribe. The compiler checks
-every subject, parameter and message type, so a typo is a build error rather than a
-subscription that silently never fires.
+With string subjects, a typo is a subscription that silently never fires. With
+nattes you declare your topics as a tree of types and walk down it, so the
+compiler checks every subject, parameter and message type:
 
-Terms used here are defined in the [vocabulary](doc/src/vocabulary.md).
-
-```rust
+```rust,ignore
 let mut deletes = bus.user().id(Wild).delete().subscribe().await; // user.id.*.delete
 while let Some(msg) = deletes.next().await {
     let (user_id,) = msg.params();
@@ -17,76 +19,77 @@ while let Some(msg) = deletes.next().await {
 }
 ```
 
+```text
+bus.user().id(Wild).delet()
+    error: no method named `delet` found for struct `Channel<T, P>`
+
+bus.git().push().publish(UserDeleteMsg)
+    error: mismatched types: expected `GitPushMsg`, found `UserDeleteMsg`
+
+bus.user().id(Wild).delete().publish(UserDeleteMsg)
+    error: no method named `publish` found for struct `Channel<DeleteLeaf, (u32,)>`
+```
+
+<p align="center">
+  <img src="assets/tree.svg" width="860" alt="A message published on user.id.42.delete reaches the subscriptions on everything, on user.id.*.delete and on user.id.42 and below, but not those on user.id.7 or on git.">
+</p>
+
+<!-- Editor demo: record rust-analyzer completing `bus.user().`, the hover on a
+     step (its docs and subject) and the error on a typo, save it as
+     assets/editor.gif, then uncomment:
+<p align="center"><img src="assets/editor.gif" width="760" alt="rust-analyzer completing the steps of a topic tree"></p>
+-->
+
+## Contents
+
+- [Features](#features)
+- [Install](#install)
+- [Quick start](#quick-start)
+- [A short tour](#a-short-tour)
+- [Coming from NATS](#coming-from-nats)
+- [When to use it](#when-to-use-it)
+- [Documentation](#documentation)
+- [Status](#status)
+- [Contributing](#contributing)
+- [License](#license)
+
 ## Features
 
-- **Typed subjects.** Topics, parameters and messages are Rust types. There's no
-  string parsing and no serialization; subscribers get the published value through
-  an `Arc`.
-- **NATS-style subscriptions.** Subscribe to everything below a topic (`>`), use
-  wildcard parameters (`*`) or fixed ones, join queue groups, and do request/reply
-  or scatter-gather.
-- **Sub-channels are roots.** A `Channel<topics::git::Topic>` behaves like a bus whose
-  root is `git`. Hand it to a component, and that component works the same whether
-  it's standalone or mounted inside a bigger tree.
-- **Async-friendly, runtime-agnostic.** Every handle and future is `Send + Sync`,
-  and a slow subscriber never blocks publishers unless you ask for backpressure.
-  Subscriptions are `futures::Stream`s that unsubscribe when dropped. It runs on
-  any executor and depends on none: timeouts come from your runtime's timer.
-- **Cheap batches and handlers.** `publish_many` and `recv_many` move many
-  messages per lock, and a handler receives on the publisher's thread, without a
-  buffer or a task.
-- **Bridges** (feature `bridge`). Extend a bus over any byte transport (Unix
-  socket, TCP, QUIC, …): each side sends only what the other subscribes to,
-  encoded by your codec.
-- **Editor-friendly.** Steps are plain methods, so rust-analyzer completes them,
-  hovering one shows the topic's docs and subject, and going to the definition of
-  a `TopicRef` variant or leaf type lands on its line in `topics!`.
+- **Typed subjects.** Topics, parameters and messages are Rust types. There's
+  no string parsing and no serialization: subscribers get the published value
+  through an `Arc`.
+- **NATS-style subscriptions.** Subscribe to everything below a topic (`>`),
+  use wildcard parameters (`*`) or fixed ones, join queue groups, and do
+  request/reply or scatter-gather.
+- **Sub-channels are roots.** A `Channel<topics::git::Topic>` behaves like a bus
+  whose root is `git`. A component that takes one works the same standalone or
+  mounted inside a bigger tree.
+- **Runtime-agnostic.** Every handle and future is `Send + Sync`, subscriptions
+  are `futures::Stream`s that unsubscribe when dropped, and nattes depends on
+  no executor. A slow subscriber never blocks publishers unless you ask for
+  backpressure.
+- **Fast paths.** `publish_many` and `recv_many` move many messages per lock,
+  and a handler receives on the publisher's thread, without a buffer or a task.
+- **Bridges.** Extend a bus over any byte transport (Unix socket, TCP, QUIC, …):
+  each side sends only what the other subscribes to, encoded by your codec.
+- **Editor-friendly.** Steps are plain methods, so rust-analyzer completes
+  them, hovering one shows the topic's docs and subject, and going to its
+  definition lands on its line in `topics!`.
 
-## Installation
+## Install
 
-```toml
-[dependencies]
-nattes = { git = "https://github.com/jakumule/nattes" }
+```sh
+cargo add nattes
 ```
 
-### Tracing
+| Feature | Adds |
+|---|---|
+| `tracing` | logs of subscriptions, publishes and lost messages, through [`tracing`](https://docs.rs/tracing) ([guide](https://docs.rs/nattes/latest/nattes/guide/tracing/)) |
+| `bridge` | `Bridge`, `Codec`: a bus extended over a byte transport ([guide](https://docs.rs/nattes/latest/nattes/guide/bridges/)) |
 
-Enable the `tracing` feature to log what the bus does with
-[`tracing`](https://docs.rs/tracing). Records keep their module as target
-(`nattes::bus`, `nattes::bridge`), so `nattes=debug` enables them all and
-`nattes::bridge=debug` only a bridge's:
-
-```toml
-nattes = { git = "https://github.com/jakumule/nattes", features = ["tracing"] }
-```
-
-| Level   | Logged                                                                |
-|---------|-----------------------------------------------------------------------|
-| `debug` | `subscribe` / `unsubscribe`, with the id, pattern (`user.id.*.>`) and queue group |
-| `trace` | `publish`, with the subject and how many subscriptions got the message |
-| `warn`  | a message dropped because a subscription's buffer is full (one record per subscription and `publish_many`, with the count), a filter or handler that panicked, a message a bridge couldn't encode or decode |
-
-A bridge runs in a `debug` span named `bridge`, with the bridged channel
-(`channel = user.>`), and logs at `debug` when it starts and stops (with the
-error it returns, if any).
-
-Subjects and patterns are only formatted when the log record is enabled. Without
-the feature, nothing is compiled in. nattes installs no subscriber: that's the
-application's choice. To get the records through [`log`](https://docs.rs/log)
-instead, enable `tracing`'s `log` feature in your own `Cargo.toml`:
-
-```toml
-tracing = { version = "0.1", features = ["log"] }
-```
-
-### Bridges
-
-The `bridge` feature adds [bridges](#bridges): `Bridge`, `Codec`, and a `Wire<C>`
-implementation on every topic generated by `topics!`.
-
-```toml
-nattes = { git = "https://github.com/jakumule/nattes", features = ["bridge"] }
-```
+Both are off by default. nattes needs Rust 1.85 or later (edition 2024). The
+examples here also use `futures` for `StreamExt` and tokio as the runtime; any
+executor works.
 
 ## Quick start
 
@@ -133,158 +136,73 @@ async fn main() {
 }
 ```
 
-## Declaring topics
+## A short tour
 
-`topics!` turns a tree into nested `pub` modules. The root is written like any
-level, `topics { … }`, and each topic is one subject segment:
+**Wildcards and levels.** A parameter is fixed, `id(42)`, or a wildcard,
+`id(Wild)`. Subscribing on a level gets everything below it, as a `TopicRef`
+enum to match on.
+[Navigating](https://docs.rs/nattes/latest/nattes/guide/navigating/),
+[subscribing](https://docs.rs/nattes/latest/nattes/guide/subscribing/).
 
-```rust
-topics! {
-    #[derive(Debug)]                    // applied to every `TopicRef` enum
-    topics {
-        git [Mailer] {                  // level, with its queue groups
-            /// Commits pushed.         // docs of this topic
-            push [Indexer(u32)]: GitPushMsg, // leaf message, with its queue groups
-            new(Uuid): GitNewMsg,       // parameter, then message
-            fetch: GitFetchMsg => FetchAck, // request leaf: message, then reply
-        },
-        user {
-            new: UserNewMsg,            // same name as in git: fine
-            id(Uuid) [Oncall] {         // parameter, queue groups, then level
-                update: UserUpdateMsg,
-                delete: UserDeleteMsg,
-            },
-        },
-        random.arrow.more: DeepMsg,     // `a.x` is `a { x }`
-        other = other,                  // mount the tree of another topics! module
-    }
+```rust,ignore
+let mut users = bus.user().id(Wild).subscribe().await; // user.id.*.>
+bus.user().id(42).delete().publish(DeleteMsg).await;
+
+let msg = users.next().await.unwrap();
+assert_eq!(msg.params(), (42,));
+match msg.view() {
+    topics::user::id::TopicRef::Delete(delete) => { /* &DeleteMsg */ }
 }
 ```
 
-Every level is a module with an empty `Topic` enum, the `T` of its channels, and a
-`TopicRef<'a>` enum, what a subscriber there sees: which child a message was
-published on, with references to its parameters and message. Every leaf gets a
-leaf type named after it, the `T` of its channels. Queue groups become a group
-enum: `Queue` in a level's module, `NameQueue` next to a leaf type. This example
-generates:
+**Queue groups.** Declared in the tree with `[ … ]`; each message goes to one
+member of the group.
+[Queue groups](https://docs.rs/nattes/latest/nattes/guide/queue_groups/).
 
-```text
-topics::Topic, topics::git::Topic, topics::user::Topic, topics::user::id::Topic, …
-topics::TopicRef<'a>     { Git(git::TopicRef<'a>), User(user::TopicRef<'a>), Random(…), Other(other::TopicRef<'a>) }
-topics::git::TopicRef<'a> { Push(&'a GitPushMsg), New(&'a Uuid, &'a GitNewMsg), Fetch(&'a GitFetchMsg) }
-topics::git::PushLeaf, NewLeaf, FetchLeaf
-topics::git::Queue        { Mailer }
-topics::git::PushQueue    { Indexer(u32) }
-topics::user::TopicRef<'a> { New(&'a UserNewMsg), Id(&'a Uuid, id::TopicRef<'a>) }
-topics::user::id::Queue   { Oncall }
-topics::prelude           the `Steps` trait of every level
+```rust,ignore
+topics! { topics { git { push [Indexer(u32)]: PushMsg } } }
+
+let a = pushes.subscribe().queue(PushQueue::Indexer(0)).await;
+let b = pushes.subscribe().queue(PushQueue::Indexer(0)).await;
+pushes.publish(PushMsg { branch: "main".into() }).await; // to a or to b
 ```
 
-So names only need to be unique among siblings: `git::new` and `user::new` don't
-clash.
+**Request/reply.** A leaf declared `name: Msg => Reply` takes requests, and
+`scatter` gathers a reply from every responder.
+[Request/reply](https://docs.rs/nattes/latest/nattes/guide/request_reply/).
 
-Names are written in snake case, like NATS subjects (`push`, `pull_request`).
-They become the subject segments, the module and method names, and, in camel case,
-the `TopicRef` variants and leaf types: `pull_request` is `TopicRef::PullRequest`
-and `PullRequestLeaf`. Rust keywords such as `type` or `match` are written as raw
-identifiers: `r#type` is the segment `type` and `TopicRef::Type`. A name can't be a
-method of `Channel` (`subscribe`, `publish`, `publish_many`, `respond`, `request`,
-`scatter`) or of the std prelude traits it implements (`clone`, `into`, …).
+```rust,ignore
+topics! { topics { git { fetch: FetchMsg => FetchAck } } }
 
-| Syntax | Meaning | Variant in the parent's `TopicRef<'a>` |
-|---|---|---|
-| `name { … }` | level, in module `name` | `Name(name::TopicRef<'a>)` |
-| `name: Msg` | leaf message, leaf type `NameLeaf` | `Name(&'a Msg)` |
-| `name(Type): Msg` | parameter, then message | `Name(&'a Type, &'a Msg)` |
-| `name: Msg => Reply` | request leaf (see [Request/reply](#requestreply)) | `Name(&'a Msg)` |
-| `name(Type) { … }` | parameter, then level, in module `name` | `Name(&'a Type, name::TopicRef<'a>)` |
-| `name(Type) [A, B(T)] …` | queue groups (see [Queue groups](#queue-groups)), after the name and parameter of a level, leaf, link of a chain or the root | unchanged |
-| `name.…` | chain: a level with a single child, no braces | same as `name { … }` |
-| `name = path::to::module` | mount the tree of another `topics!` | `Name(path::to::module::TopicRef<'a>)` |
-| `#[on_full(Wait)]`, `#[buffer(64)]` before a topic | delivery defaults (see [Delivery defaults](#delivery-defaults)) | unchanged |
-
-Each level also gets a `Steps` trait with one method per child, implemented on
-its channels. `topics::prelude` brings every `Steps` trait of the tree into scope,
-mounted trees included: `use topics::prelude::*;`.
-
-Doc comments (`/// …`) on a topic document its `TopicRef` variant, its `Steps`
-method, and its module or leaf type, so your editor shows them when you hover
-`push` in `bus.git().push()`. On a chain `a.b.c: Msg` they document `c`.
-Both also state the subject, such as `git.push` or `user.id.*.delete`. Doc
-comments before the root's name document its module, while other attributes
-there, except [delivery defaults](#delivery-defaults), are applied to every
-`TopicRef` enum. A wrong topic is reported
-on its own and left out, so the rest of the tree keeps working while you type.
-
-Each generated module does `use super::*`, so message and parameter types are
-resolved as in the code around `topics!`. For that reason, `topics!` must be used
-at module level, not inside a function.
-
-### Delivery defaults
-
-`#[on_full(…)]` and `#[buffer(n)]` before a topic set what its subscriptions
-start with, instead of `Overflow::DropNewest` and 1024 (see
-[Subscribing](#subscribing)). Declare `Wait` on work topics, and nobody
-subscribes to them with a lossy policy by mistake:
-
-```rust
-topics! {
-    app {
-        #[on_full(Wait)]
-        jobs {
-            #[buffer(64)]
-            resize: Resize,             // Wait, 64
-            thumbnail: Thumb,           // Wait, 1024
-            #[on_full(DropOldest)]
-            progress: Progress,         // DropOldest, 1024
-        },
-        metrics: Metric,                // DropNewest, 1024
+let mut responder = fetches.respond().await;
+tokio::spawn(async move {
+    while let Some(req) = responder.next().await {
+        req.respond(FetchAck { ok: true });
     }
-}
+});
+
+let ack = fetches.request(FetchMsg { branch: "main".into() }).await?;
 ```
 
-- **Inherited.** A default applies to the topic and every topic below it that
-  doesn't set its own. On the root, it applies to the whole tree; on a chain
-  `a.b.c`, to `c`.
-- **The topic you subscribe on.** `bus.jobs().resize().subscribe()` and
-  `bus.jobs().subscribe()` start with `Wait`; `bus.subscribe()` starts with the
-  root's defaults, even though it also gets the messages of `jobs`.
-- **Only defaults.** `.on_full(…)` and `.buffer(n)` on a subscription, a
-  responder or a [bridge](#bridges) still win. Handlers don't buffer, so neither
-  applies to them.
-- **Mounts.** Every mount of a tree shares its types, so a mounted tree keeps the
-  defaults declared in its own `topics!`, and a mount can't set any.
+**Backpressure, batches, handlers.** Each subscription picks its buffer and
+what happens when it's full; the tree can set the defaults.
+[Delivery guarantees](https://docs.rs/nattes/latest/nattes/guide/delivery/).
 
-## Navigating the tree
-
-`Channel::<topics::Topic>::new()` creates a bus rooted at the `topics` module.
-Each call creates a separate bus, so create it once and clone it or go down from it.
-
-Each step is a method, and a path reads like the subject:
-
-```rust
-use nattes::Wild;
-use topics::prelude::*;
-
-let bus = Channel::<topics::Topic>::new();
-
-let git           = bus.git();                          // git
-let pushes        = bus.git().push();                   // git.push
-let alice         = bus.user().id(alice_id);            // user.id.<alice>
-let alice_deletes = bus.user().id(alice_id).delete();   // user.id.<alice>.delete
-let any_user      = bus.user().id(Wild);                // user.id.*
-let all_deletes   = bus.user().id(Wild).delete();       // user.id.*.delete
-let any_delete    = any_user.delete();                  // user.id.*.delete, from any_user
+```rust,ignore
+let mut jobs = bus.jobs().subscribe().buffer(64).on_full(Overflow::Wait).await;
+let _count = bus.metrics().subscribe().handler(|msg| { /* on the publisher's thread */ });
 ```
 
-- **The channel is borrowed, not consumed,** so you can keep using `bus` and take
-  as many sub-channels from it as you like. They all share the same bus.
-- **Every step is checked by the compiler.** A typo such as `bus.user().push()`
-  fails with "no method named `push` found for struct `Channel<T, P>`".
-- **A parameter is fixed, `id(alice_id)`, or a wildcard, `id(Wild)`.** Each
-  wildcard adds its type to the channel: `all_deletes` is a
-  `Channel<topics::user::id::DeleteLeaf, (Uuid,)>`. Messages received on it
-  carry the actual values in `msg.params()`.
+**Bridges.** The same tree in two processes, joined by a transport and a codec
+of your choice. [Bridges](https://docs.rs/nattes/latest/nattes/guide/bridges/).
+
+```rust,ignore
+let socket = tokio::net::UnixStream::connect("/run/app.sock").await?;
+let (sink, stream) = Framed::new(socket, LengthDelimitedCodec::new()).split();
+Bridge::new(bus.clone(), Bincode).run(sink, stream).await?;
+```
+
+## Coming from NATS
 
 | NATS | nattes |
 |---|---|
@@ -297,520 +215,60 @@ let any_delete    = any_user.delete();                  // user.id.*.delete, fro
 | request/reply | `channel.request(msg)` / `channel.respond()`, then `req.respond(reply)` |
 | scatter-gather | `channel.scatter(msg)` (a stream of replies) |
 
-## Publishing
+## When to use it
 
-A leaf channel without wildcards can publish its message. Levels only subscribe,
-and request leaves take requests only (see [Request/reply](#requestreply)).
+nattes fits when the parts of one program talk through events and you want
+NATS's subject model with the compiler behind it: a subscriber on `user.>`, a
+worker pool on `jobs.resize`, a component that only knows its own subtree.
 
-```rust
-pushes.publish(GitPushMsg { branch: "main".into() }).await;
-alice_deletes.publish(UserDeleteMsg).await;
+It is not a broker:
+
+- **In memory, at most once.** Nothing is persisted, acknowledged or
+  redelivered. For durable queues, use a broker (NATS JetStream, Kafka, …).
+- **One tree, known at compile time.** Subjects can't be built from strings at
+  run time. If they must be, use a NATS client.
+- **Simpler needs have simpler tools.** For one message type and no subjects,
+  `tokio::sync::broadcast` or an `mpsc` channel is enough.
+
+Across processes, a [bridge](https://docs.rs/nattes/latest/nattes/guide/bridges/)
+joins buses that share a tree, but delivery stays at most once.
+
+## Documentation
+
+- **[The guide](https://docs.rs/nattes/latest/nattes/guide/)**, on docs.rs, with
+  tested examples:
+  [declaring topics](https://docs.rs/nattes/latest/nattes/guide/declaring/),
+  [navigating](https://docs.rs/nattes/latest/nattes/guide/navigating/),
+  [publishing](https://docs.rs/nattes/latest/nattes/guide/publishing/),
+  [subscribing](https://docs.rs/nattes/latest/nattes/guide/subscribing/),
+  [queue groups](https://docs.rs/nattes/latest/nattes/guide/queue_groups/),
+  [request/reply](https://docs.rs/nattes/latest/nattes/guide/request_reply/),
+  [bridges](https://docs.rs/nattes/latest/nattes/guide/bridges/),
+  [delivery guarantees](https://docs.rs/nattes/latest/nattes/guide/delivery/),
+  [tracing](https://docs.rs/nattes/latest/nattes/guide/tracing/),
+  [recipes](https://docs.rs/nattes/latest/nattes/guide/recipes/),
+  [compile-time checks](https://docs.rs/nattes/latest/nattes/guide/compile_time/),
+  [requirements](https://docs.rs/nattes/latest/nattes/guide/requirements/).
+- **[API reference](https://docs.rs/nattes)**.
+- **[Vocabulary](doc/src/vocabulary.md)**: the terms used in the docs and the code.
+
+## Status
+
+nattes is a preview: the API still changes between minor versions, without
+deprecation. Planned work is in [TODO.md](TODO.md).
+
+## Contributing
+
+Issues and pull requests are welcome. `nix develop` (or direnv) gives the
+toolchain; before sending a change, run:
+
+```sh
+cargo test --workspace --all-features
+cargo clippy --workspace --all-features
 ```
 
-`publish` returns the number of subscriptions the message was delivered to (a
-bridge counts as one). A channel with a wildcard has no `publish` method, because
-there would be no value to fill the `*` with.
-
-`publish` only waits if a matching subscriber chose `Overflow::Wait` and its buffer
-is full. Even then, every other subscriber has already received the message by the
-time it waits. See [Delivery guarantees](#delivery-guarantees) for when a message
-can be lost and in which order it arrives.
-
-`publish_many` publishes a batch, in order, for less than one `publish` per
-message: on a leaf, the subscriptions are looked up once and each buffer takes the
-whole batch under one lock.
-
-```rust
-pushes.publish_many(branches.into_iter().map(|branch| GitPushMsg { branch })).await;
-```
-
-## Subscribing
-
-`subscribe()` returns a builder; `.await` it to start receiving. The subscription is
-a `Stream` of messages:
-
-```rust
-let mut sub = any_user
-    .subscribe()
-    .filter(move |(id,), _view| *id != admin_id) // optional: filter on params and message
-    .queue(id::Queue::Oncall)                    // optional: share messages with other members
-    .buffer(256)                                 // optional: buffer size (default 1024, or the topic's)
-    .on_full(Overflow::DropOldest)               // optional: what to do when it's full (default DropNewest, or the topic's)
-    .await;
-
-while let Some(msg) = sub.next().await {
-    let (id,) = msg.params();
-    match msg.view() {
-        topics::user::id::TopicRef::Update(update) => { /* … */ }
-        topics::user::id::TopicRef::Delete(delete) => { /* … */ }
-    }
-}
-```
-
-- **Messages.** On a leaf, a message derefs to the leaf's message type
-  (`msg.branch`). On a level, `msg.view()` gives the level's `TopicRef`, which
-  tells which topic below it the message was published on. A filter gets the
-  same view, after the params.
-- **Owning a message.** A message is shared by every subscription it was
-  delivered to, so `msg` only gives references. `msg.try_into_inner()` moves the
-  message out of a leaf's `msg`, with no `Clone` needed, once
-  this `msg` is the last holder: no other subscription still holds it, no clone
-  of `msg` exists, and `publish` has returned. That is always the case with a
-  single subscriber or a queue group member. Otherwise it gives `msg` back as the
-  `Err`.
-- **Slow subscribers.** Each subscription has its own buffer. When it's full, the
-  `.on_full(...)` policy applies:
-
-  | `Overflow` | Effect |
-  |---|---|
-  | `DropNewest` (default) | The new message is dropped, like NATS does for slow consumers. |
-  | `DropOldest` | The oldest buffered message makes room, so you always see the latest. |
-  | `Wait` | `publish` waits for room, then resumes once the buffer has drained to half. Use it for work queues that must not lose messages. |
-
-  The tree can change the default per topic with `#[on_full(…)]` and
-  `#[buffer(n)]` (see [Delivery defaults](#delivery-defaults)).
-  `sub.dropped()` counts the messages lost so far, and with the `tracing`
-  feature each loss is logged at `warn`.
-
-  `Wait` has two pitfalls:
-
-  - **Head-of-line blocking.** The other subscribers get the message before
-    `publish` waits, but the publisher's next messages wait behind it: one slow
-    `Wait` subscriber holds back what that publisher sends to everyone. Publish
-    to `Wait` subscribers from a task of their own, or use a drop policy.
-  - **Self-deadlock.** A task that publishes to a subject it subscribes to with
-    `Wait` never returns from `publish` once its own buffer is full, since only
-    that task can make room.
-- **Batches.** `sub.recv_many(&mut buf, max).await` appends up to `max` buffered
-  messages to `buf`, taken under one lock, and waits only while the buffer is
-  empty. It returns how many it took, or 0 once the subscription ended.
-  `poll_recv_many` is the same as a poll function.
-- **Handlers.** `.handler(f)` instead of `.await` calls `f` with each message, on
-  the publisher's thread: no buffer, no task, no wake-up. It returns a `Handler`,
-  which unsubscribes on drop. `f` must not block, may run on several publisher
-  threads at once, and a panic counts the message as dropped. Use it for
-  counters, logs, or to forward into another library's channel.
-- **Throughput.** A subscriber that keeps up with its publisher finds its buffer
-  empty after nearly every message and parks, and waking it costs the
-  publisher. For high-rate fan-out to subscribers that do little per message,
-  use handlers, or `publish_many` and `recv_many`: in the `throughput` bench
-  they move 2–4× as many messages as one `publish` and `next()` each.
-- **Routing.** Subscriptions are indexed by pattern in an interest trie, like
-  the NATS sublist, so `publish` only looks at subscribers on its subject's path
-  (with wildcards). Its cost doesn't grow with subscribers on unrelated subjects.
-- **Filters.** Filters run inside `publish`, on the publisher's thread (outside
-  the bus's internal lock), so a slow filter slows every publish on its subject.
-  Keep them cheap and do heavy work after receiving the message. A filter that
-  panics counts as "no match" and doesn't affect other subscribers or publishers
-  (except with `panic = "abort"`, see [Requirements](#requirements)).
-- **Streams.** A subscription is a `FusedStream`, so every `StreamExt` adapter
-  applies and it goes straight into `futures::select!` without `.fuse()`.
-- **Closing.** Every channel of a bus, sub-channels included, keeps it open.
-  Once the last one is dropped, nothing can publish anymore: each subscription
-  and responder yields what its buffer holds, then ends, so
-  `while let Some(msg) = sub.next().await` returns. A task, a message or a
-  filter holding a channel keeps the bus open, like an `mpsc` sender.
-  `close()` on any channel closes the bus whoever still holds one, which is how
-  to shut down workers that also publish: later publishes reach nobody,
-  requests fail with `NoResponders`, new subscriptions end at once and bridges
-  stop.
-
-  ```rust
-  bus.close();
-  for worker in workers {
-      worker.await?; // each one reads what it was sent, then its loop ends
-  }
-  ```
-- **Unsubscribing.** Drop the subscription. Publishers waiting on it are released.
-- **Subjects.** `msg.subject()` gives a NATS-style subject for logging, built from
-  names and parameter values, e.g. `user.id.42.delete`. `%`, `.`, `*`, `>` and
-  whitespace in parameter values are escaped as `%XX` (`user.id.a%2Eb.delete`), so
-  each value stays one segment.
-
-## Queue groups
-
-Queue groups are declared on a topic in `topics!`, with `[ … ]` right after its
-name and parameter: `git [Mailer] { … }`, `push [Indexer(u32)]: GitPushMsg`,
-`fetch [Pool]: GitFetchMsg => FetchAck`, `repo.id(u64) [Workers].delete: Msg`, or
-on the root, `topics [Workers] { … }`. They become a group enum, `Queue` in a
-level's module and `PushQueue` for the leaf `push`, deriving `Clone`, `PartialEq`,
-`Eq` and `Hash`. Inner attributes go on the enum (`[#![derive(Debug)] Mailer]`),
-and doc comments on a variant document it. A mount takes no groups: its tree
-declares its own.
-
-Each value of a group enum is one queue group, so `Indexer(0)` and `Indexer(1)`
-are two groups. Subscribers that join the same group, with `.queue(group)`, share
-its messages: each one goes to a single member.
-
-```rust
-use topics::git::{PushQueue, Queue};
-
-let pushes = bus.git().push();
-let a = pushes.subscribe().queue(PushQueue::Indexer(0)).await; // shard 0
-let b = pushes.subscribe().queue(PushQueue::Indexer(0)).await; // shard 0
-let c = pushes.subscribe().queue(PushQueue::Indexer(1)).await; // shard 1
-let m = bus.git().subscribe().queue(Queue::Mailer).await;      // git.>
-
-pushes.publish(GitPushMsg { branch: "main".into() }).await;
-// one of a and b, then c, then m
-```
-
-- **Who gets it.** A member waiting in `next()` is picked first. If none is
-  waiting, members with room in their buffer take turns (round robin). When every
-  member's buffer is full, the group waits if any member has `Overflow::Wait`, and
-  the message goes to the first of them to have room. Otherwise the overflow
-  policy of the member whose turn it is applies.
-- **A group belongs to its topic.** It is joined only on the topic that declares
-  it, not above or below (checked at compile time), and each mount of a tree has
-  its own groups (with `a = other` and `b = other`, members on `a.x` and on `b.x`
-  don't share turns).
-- **Parameters don't change the topic.** Members on `user.id(alice)` and on
-  `user.id(Wild)` joining the same value form one group.
-- **Responders and subscribers** joining the same group form two separate groups.
-
-## Request/reply
-
-Make a leaf request-reply by declaring its reply type after the message,
-`name: Msg => Reply`:
-
-```rust
-topics! {
-    topics {
-        git { push: GitPushMsg => PushAck },
-    }
-}
-
-let pushes = bus.git().push();
-
-// responder: each `req` is an `Incoming`, which derefs to `GitPushMsg`
-let mut responder = pushes.respond().await;
-tokio::spawn(async move {
-    while let Some(req) = responder.next().await {
-        req.respond(PushAck { accepted: true });
-    }
-});
-
-// requester
-let ack: PushAck = pushes.request(GitPushMsg { branch: "main".into() }).await?;
-// bounded by your runtime's timer
-let request = pushes.request(GitPushMsg { branch: "main".into() });
-let ack = tokio::time::timeout(Duration::from_secs(1), request).await??;
-```
-
-Only responders, made with `respond()`, answer requests. `respond()` returns
-the same builder as `subscribe()` (`filter`, `queue`, `buffer`, `on_full`),
-and awaiting it gives a `Responder`, a stream of `Incoming` requests. Each
-responder gets its own reply token: `req.respond(reply)` takes `req` by value,
-so a responder answers each request at most once, and dropping `req` without
-answering counts as no reply from this responder. `req.is_pending()` tells
-whether anyone still waits for a reply, to skip work nobody needs.
-`req.try_into_inner()` takes the payload out, like `Msg::try_into_inner`, together
-with a `ReplyToken` that answers with `respond(reply)` in the same way.
-
-Subscribers of the leaf, or of anything above it (`bus.subscribe()` on `>`),
-see the requests as plain messages, but they don't count as responders and
-can't answer: a logger never delays or breaks a request. A request leaf takes
-requests only: it has no `publish`.
-
-The first reply wins. Possible errors:
-
-- `BusError::NoResponders`: no responder matches the request.
-- `BusError::NoReply`: every responder dropped the request without answering,
-  including when a full buffer dropped it.
-
-`request` waits for as long as some responder still holds the request, so wrap
-it in your runtime's timeout unless you know a responder will answer. The
-timeout covers both delivery and the reply.
-
-### Scatter-gather
-
-`scatter` sends the request to every responder and streams their replies, one per
-responder (a queue group counts as one responder). The stream ends once each of
-them answered or dropped the request; `replies.remaining()` tells how many are
-still expected. `Replies` is a `FusedStream`, so `StreamExt` adapters cover the
-rest, e.g. a deadline with `take_until` (delivery, the `scatter(..)` future
-itself, takes a timeout like `request`):
-
-```rust
-let mut replies = pushes.scatter(GitPushMsg { branch: "main".into() }).await?;
-while let Some(ack) = replies.next().await {
-    // one `PushAck` per responder
-}
-
-// What came back within a second
-let acks: Vec<PushAck> = pushes
-    .scatter(GitPushMsg { branch: "main".into() })
-    .await?
-    .take_until(tokio::time::sleep(Duration::from_secs(1)))
-    .collect()
-    .await;
-```
-
-Both fail with `BusError::NoResponders` when no responder matches; dropping the
-stream makes `respond` return `false` and `is_pending` turn `false`.
-
-## Bridges
-
-With the `bridge` feature, a `Bridge` extends a channel of a bus over a byte
-transport to the same channel of another bus, in another process or on another
-machine. A subscription on either side gets the messages published on both:
-
-```rust
-use tokio_util::codec::{Framed, LengthDelimitedCodec};
-
-let socket = tokio::net::UnixStream::connect("/run/app.sock").await?;
-let (sink, stream) = Framed::new(socket, LengthDelimitedCodec::new()).split();
-Bridge::new(bus.clone(), Bincode).run(sink, stream).await?;
-```
-
-- **Bring your transport and codec.** `run` takes any `futures` `Sink<Bytes>`
-  and `Stream` of frames, so framing, reconnection, encryption and compression
-  come from other crates. Messages and parameters are encoded by your
-  [`Codec`](https://docs.rs/nattes/latest/nattes/trait.Codec.html), typically one
-  generic implementation over serde.
-- **Only what's wanted crosses.** Each side tells the other the patterns of its
-  subscriptions, and sends a message only if the other side subscribes to it,
-  once, however many subscribers it has there. Fixed parameters widen to `*`
-  across the bridge; the receiving side's trie keeps the right values. Local
-  delivery never serializes anything.
-- **Versions.** Both sides exchange a frame format version, the only thing that
-  can refuse a connection. Topics are identified by a hash of their name, not
-  their position, so adding or reordering topics changes nothing. A topic only
-  one side has is never asked for by the other; a message whose topic is unknown
-  or whose payload doesn't decode is dropped and counted in `bridge.dropped()`.
-  Evolve messages within what your codec tolerates, or under a new topic name.
-- **Topology.** Messages received from a bridge are never sent on to another
-  bridge, like NATS routes: connect every pair of buses (a full mesh).
-- **Relative paths.** A bridge on `bus.user()` carries `user` and what's below
-  it, and each side can mount the shared tree anywhere.
-- **Limits.** Delivery stays at most once. Only messages cross: requests reach
-  the other side's subscribers but not its responders.
-- **Backpressure.** The messages for the other side wait in a buffer of their
-  own, `.buffer(n)` with `.on_full(…)` like a subscription, defaulting to the
-  bridged topic's [delivery defaults](#delivery-defaults): `Overflow::Wait`
-  makes local publishers wait for the transport.
-
-## Delivery guarantees
-
-nattes delivers **at most once**, in memory. A message only lives in subscriber
-buffers: nothing is persisted, acknowledged or redelivered. "Delivered" means
-pushed into a subscription's buffer (or passed to a handler), not handled.
-
-These hold for every way of sending:
-
-- **Nothing is sent until you await.** `publish`, `publish_many`, `request` and
-  `scatter` are lazy futures.
-- **Who gets it.** Every subscription that matches the subject and whose filters
-  accept the message, but only one member per queue group. A subscription
-  counts once its builder has been awaited (or turned into a handler). Messages
-  sent before that are not replayed.
-- **When it is lost.** A message is lost for a subscriber when:
-  - its buffer is full with `DropNewest` (the new message) or `DropOldest` (the
-    oldest one in the buffer). In a queue group, this only happens when every
-    member's buffer is full and none of them has `Overflow::Wait`: the message
-    goes to a member with room first;
-  - one of its filters rejects the message or panics, or its handler panics;
-  - it drops the subscription before reading the message: buffered messages
-    are discarded;
-  - the sending future is dropped while it waits for an `Overflow::Wait`
-    subscriber: the subscribers it waited for miss the message, the others
-    already have it.
-- **Order.** The messages of one publisher, awaiting each call before the next,
-  reach each subscriber in the order they were sent, minus the ones lost.
-  Concurrent publishers have no common order, so two subscribers can see their
-  messages in different orders. Consecutive messages to a queue group can go to
-  different members, which can handle them in any order.
-
-Per method:
-
-| Method | Returns | Waits for |
-|---|---|---|
-| `publish` | How many subscriptions the message was delivered to. Not on request leaves. | Room in full `Overflow::Wait` buffers. |
-| `publish_many` | How many deliveries were made, for every message. | Room in full `Overflow::Wait` buffers, once the others got every message. |
-| `request` | The first reply. `NoResponders` if no responder matches it, `NoReply` once every responder dropped it without answering. | Delivery, then a reply, with no time limit. |
-| `scatter` | A stream of replies, at most one per responder, or `NoResponders`. | Delivery. The stream ends once every responder answered or dropped the request. |
-
-A request goes to every matching subscriber and responder, and only the
-first reply counts. To have exactly one handler, respond through a queue group.
-A request that is lost from a responder's buffer counts as dropped without a reply. Once
-the requester gives up (drops the future, e.g. on a timeout), the request may still
-sit in buffers and be handled, but its reply is discarded: `respond` returns `false`.
-
-## Sub-channels as roots
-
-A channel's type only mentions the part of the tree it points to. A component that
-takes a `Channel<other::Topic>` doesn't know, and doesn't need to know, whether it's
-connected to its own bus or mounted inside a bigger one:
-
-```rust
-topics! {
-    #[derive(Debug)]
-    other {
-        text(String): StringEvent,
-    }
-}
-
-async fn other_service(other: Channel<other::Topic>) {
-    use other::prelude::*;
-    let mut texts = other.text(Wild).subscribe().await;
-    // …
-}
-
-// standalone
-other_service(Channel::<other::Topic>::new()).await;
-
-// mounted with `other = other` in topics
-other_service(bus.other()).await;
-```
-
-## Passing channels around
-
-To write a function that subscribes anywhere in the tree, take a `&Channel<T, P>`.
-The root channel and any sub-channel work the same:
-
-```rust
-async fn log_all<T: Topic, P: 'static>(ch: &Channel<T, P>) {
-    let mut sub = ch.subscribe().await;
-    while let Some(msg) = sub.next().await {
-        println!("{}", msg.subject());
-    }
-}
-
-log_all(&bus).await;                     // >
-log_all(&bus.git()).await;               // git.>
-log_all(&bus.user().id(Wild)).await;     // user.id.*.>
-```
-
-Fix `T` to accept only one part of the tree, for example
-`&Channel<topics::git::Topic>` or `&Channel<topics::git::PushLeaf>`. Leave `P`
-generic to also accept wildcard channels (add `P: Params` to read `msg.params()`),
-or leave it out (`P = ()`) to require a channel that can publish.
-
-Take the channel by value instead when the function keeps it, for example to move it
-into `tokio::spawn`. Clones are cheap.
-
-## Recipes
-
-nattes leaves out what other crates already do at no extra cost:
-
-| To | Use |
-|---|---|
-| Receive or publish without `async` | `sub.next().now_or_never()`, `chan.publish(m).now_or_never()` (completes on the first poll unless a `Wait` buffer is full), or `futures::executor::block_on` |
-| Feed a channel from a stream | `stream.for_each(\|m\| chan.publish(m))`, or `futures::sink::unfold` for a `Sink` |
-| Timeouts and deadlines | your runtime's timer: `tokio::time::timeout`, `StreamExt::take_until` |
-| Frame a byte stream for a bridge | `tokio_util::codec::LengthDelimitedCodec`, `asynchronous-codec` |
-| Reconnect, encrypt, compress a bridge | your transport crate (rustls, quinn, …) |
-| Serialize messages for a bridge | serde with bincode, postcard, …, behind your `Codec` |
-
-## Compile-time checks
-
-Each of these is a build error:
-
-```rust
-// publishing on a wildcard channel
-all_deletes.publish(UserDeleteMsg);
-// error: no method named `publish` found for struct `Channel<DeleteLeaf, (Uuid,)>`
-
-// a path that isn't below the channel (alice is on user.id.<alice>)
-alice.git();
-// error: no method named `git` found for struct `Channel<T, P>`
-
-// wrong message for the topic
-pushes.publish(UserDeleteMsg);
-// error: expected `GitPushMsg`, found `UserDeleteMsg`
-
-// typo in the path
-bus.user().push();
-// error: no method named `push` found for struct `Channel<T, P>`
-
-// wrong parameter type
-bus.user().id("alice");
-// error: `&str` can't select a `Uuid` parameter
-//        expected `Wild` or a `Uuid` value
-
-// two siblings with the same name
-topics! { topics { git { push: GitPushMsg, push: GitPushMsg } } }
-// error: `push` is already a topic of this level
-
-// a name that is a method of `Channel`
-topics! { topics { subscribe: Msg } }
-// error: `subscribe` can't be a topic name: channels have a method `subscribe`
-
-// a delivery default that isn't an `Overflow` variant, or an empty buffer
-topics! { app { #[on_full(Wiat)] jobs { run: Job } } }
-// error: no variant, associated function, or constant named `Wiat` found for enum `Overflow`
-topics! { app { #[buffer(0)] jobs { run: Job } } }
-// error: buffer size must be at least 1
-
-// a parameter type that can't be compared exactly
-topics! { sensors { reading(f64): Reading } }
-// error: `f64` can't be a parameter
-
-// a request on a leaf declared without a reply (`push: GitPushMsg`)
-pushes.request(GitPushMsg { branch: "main".into() });
-// error: the method `request` exists for struct `Channel<PushLeaf>`,
-//        but its trait bounds were not satisfied
-pushes.respond();
-// error: `PushLeaf` isn't a request leaf
-
-// answering twice (`req` is an `Incoming`)
-req.respond(ack);
-req.respond(ack);
-// error: use of moved value: `req`
-
-// answering from a subscription (`msg` is a `Msg`)
-msg.respond(ack);
-// error: no method named `respond` found for struct `Msg`
-
-// a handler on a request leaf: responders answer from their stream
-fetches.respond().handler(|req| req.respond(ack));
-// error: no method named `handler` found for struct `SubscriptionBuilder<FetchLeaf, (), Respond>`
-
-// publishing on a request leaf (`fetches` is on `fetch: GitFetchMsg => FetchAck`)
-fetches.publish(GitFetchMsg { branch: "main".into() });
-// error: can't publish on `FetchLeaf`
-
-// publishing on a level
-git.publish(GitPushMsg { branch: "main".into() });
-// error: can't publish on `git::Topic`
-
-// a queue group named with a string instead of declared
-pushes.subscribe().queue("indexers");
-// error: `&str` isn't a queue group
-//        declare queue groups in `topics!` with `[ … ]` after a topic's name
-
-// a queue group of another topic (`git [Mailer]`, joined on git.push)
-pushes.subscribe().queue(git::Queue::Mailer);
-// error: queue group `Queue` isn't declared on `PushLeaf`
-//        a queue group is joined on the topic that declares it
-
-// a wrong value in a queue group (`push [Indexer(u32)]`)
-pushes.subscribe().queue(PushQueue::Indexer("0"));
-// error: mismatched types: expected `u32`, found `&str`
-
-// bridging with a codec that misses a message type
-Bridge::new(bus, codec).run(sink, stream);
-// error: the trait bound `MyCodec: Codec<GitPushMsg>` is not satisfied
-```
-
-## Requirements
-
-- Messages must be `Send + Sync + 'static`. One published message is shared by
-  every subscriber that receives it, so it must be `Sync`: this rules out fields
-  like `Cell`, `RefCell` or `std::sync::mpsc::Receiver`. Wrap such a field in a
-  `Mutex`, or send something shareable instead (an `Arc`, a `futures::channel`
-  sender, …). `Msg::try_into_inner` gives the message back by value once no other
-  subscriber holds it.
-- Parameter types must implement `Clone + Eq + Hash + Display`. Messages are routed
-  by comparing parameter values with `Eq`, and `Display` is only used for
-  `subject()`, escaped as above. Floats aren't `Eq`, so they can't be parameters.
-- Fields of queue group variants must implement `Clone + Eq + Hash + Send + Sync +
-  'static`.
-- A channel has at most 6 wildcard parameters.
-- `topics!` must be used at module level, because its modules find your types
-  through `use super::*`.
-- Containing panicking filters and handlers relies on unwinding, so it doesn't
-  work with `panic = "abort"`.
+Benchmarks (`cargo bench`) and the layout of the code are described in
+[CLAUDE.md](CLAUDE.md).
 
 ## License
 
