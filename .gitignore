@@ -47,6 +47,3 @@ result-*
 
 # pre-commit
 .pre-commit-config.yaml
-
-# mdBook output
-doc/book/
