@@ -13,6 +13,8 @@ use syn::{
     parenthesized, token,
 };
 
+use crate::expand::camel;
+
 pub struct Input {
     /// Path of the nattes crate: `$crate`.
     pub krate: TokenTree,
@@ -114,13 +116,23 @@ pub fn parse(tokens: TokenStream, errors: &mut Vec<Error>) -> Result<Input> {
         let groups = group_enum(input)?;
         let content;
         braced!(content in input);
+        let mut children = entries(&content, errors);
+        // the root's module holds the generated `prelude` module
+        children.retain(|entry| {
+            let clash = entry.name.unraw() == "prelude" && matches!(entry.kind, Kind::Level(_));
+            if clash {
+                let msg = "`prelude` can't be a level of the root: its module holds the generated `prelude`";
+                errors.push(Error::new(entry.name.span(), msg));
+            }
+            !clash
+        });
         let root = Entry {
             docs,
             delivery,
             name,
             param: None,
             groups,
-            kind: Kind::Level(entries(&content, errors)),
+            kind: Kind::Level(children),
         };
         Ok(Input { krate, attrs, root })
     };
@@ -167,28 +179,42 @@ pub fn segment_id(name: &str) -> u32 {
     })
 }
 
+/// An error if `name` is a method of channels, which a step can't be named.
+fn reserved(name: &Ident) -> Option<Error> {
+    let name_str = name.unraw().to_string();
+    RESERVED.contains(&name_str.as_str()).then(|| {
+        let msg =
+            format!("`{name_str}` can't be a topic name: channels have a method `{name_str}`");
+        Error::new(name.span(), msg)
+    })
+}
+
 /// The entries of one level, up to the end of `input`.
 fn entries(input: ParseStream, errors: &mut Vec<Error>) -> Vec<Entry> {
     let mut out = Vec::new();
     let mut names = HashSet::new();
     let mut ids = HashMap::new();
+    let mut camels = HashMap::new();
     while !input.is_empty() {
         let fork = input.fork();
         match entry(&fork, errors) {
             Ok(entry) => {
                 input.advance_to(&fork);
                 let name = entry.name.unraw().to_string();
-                if RESERVED.contains(&name.as_str()) {
-                    let msg = format!(
-                        "`{name}` can't be a topic name: channels have a method `{name}`"
-                    );
-                    errors.push(Error::new(entry.name.span(), msg));
+                if let Some(error) = reserved(&entry.name) {
+                    errors.push(error);
                 } else if !names.insert(name.clone()) {
                     let msg = format!("`{}` is already a topic of this level", entry.name);
                     errors.push(Error::new(entry.name.span(), msg));
                 } else if let Some(other) = ids.insert(segment_id(&name), name.clone()) {
                     let msg = format!(
                         "`{name}` and `{other}` have the same segment id: rename one of them"
+                    );
+                    errors.push(Error::new(entry.name.span(), msg));
+                } else if let Some(other) = camels.insert(camel(&name), name.clone()) {
+                    let msg = format!(
+                        "`{name}` and `{other}` have the same type name `{}`: rename one of them",
+                        camel(&name)
                     );
                     errors.push(Error::new(entry.name.span(), msg));
                 } else {
@@ -256,6 +282,9 @@ fn topic(
     let (docs, delivery, kind) = if input.peek(Token![.]) {
         input.parse::<Token![.]>()?;
         let last = topic(input, docs, delivery, errors)?;
+        if let Some(error) = reserved(&last.name) {
+            return Err(error);
+        }
         (Vec::new(), Delivery::default(), Kind::Level(vec![last]))
     } else if input.peek(token::Brace) {
         let content;
@@ -394,6 +423,45 @@ mod tests {
                 "`close` can't be a topic name: channels have a method `close`",
                 "`publish` can't be a topic name: channels have a method `publish`",
             ]
+        );
+    }
+
+    #[test]
+    fn channel_methods_are_reserved_in_chains() {
+        let (entries, errors) = parse_tree(quote!(a.close: A, b.c.subscribe: B, d: D));
+        assert_eq!(names(&entries), ["d"]);
+        assert_eq!(
+            errors,
+            [
+                "`close` can't be a topic name: channels have a method `close`",
+                "`subscribe` can't be a topic name: channels have a method `subscribe`",
+            ]
+        );
+    }
+
+    #[test]
+    fn names_with_the_same_type_name_are_reported() {
+        let (entries, errors) = parse_tree(quote!(foo_bar: A, foo__bar: B, c: C));
+        assert_eq!(names(&entries), ["foo_bar", "c"]);
+        assert_eq!(
+            errors,
+            ["`foo__bar` and `foo_bar` have the same type name `FooBar`: rename one of them"]
+        );
+    }
+
+    #[test]
+    fn prelude_is_reserved_for_root_levels() {
+        let (entries, errors) = parse_tree(quote!(prelude { a: A }, b { prelude { c: C } }));
+        assert_eq!(names(&entries), ["b"]);
+        assert_eq!(names(children(&entries[0])), ["prelude"]);
+        assert_eq!(
+            errors,
+            ["`prelude` can't be a level of the root: its module holds the generated `prelude`"]
+        );
+        let (entries, errors) = parse_tree(quote!(prelude: A));
+        assert_eq!(
+            (names(&entries), errors.len()),
+            (vec!["prelude".to_string()], 0)
         );
     }
 

@@ -34,7 +34,7 @@ use std::future::poll_fn;
 use std::pin::pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::task::Poll;
+use std::task::{Context, Poll};
 use std::fmt;
 
 /// Version of the frame format. Both sides must have the same.
@@ -186,24 +186,40 @@ impl<T: Topic + Wire<C>, C: Send + Sync + 'static> Bridge<T, C> {
             .await
             .map_err(send)?;
         let mut events = Vec::new();
+        // Frames fed since the last flush
+        let mut fed = 1;
         loop {
-            sink.flush().await.map_err(send)?;
             enum Next {
                 Change(Option<Change>),
                 Events(usize),
             }
-            let next = poll_fn(|cx| {
+            let mut poll_next = |cx: &mut Context<'_>| {
                 if let Poll::Ready(change) = changes.poll_next_unpin(cx) {
                     return Poll::Ready(Next::Change(change));
                 }
                 buffer
                     .poll_many(cx, BATCH, |event| events.push(event))
                     .map(Next::Events)
-            })
-            .await;
+            };
+            // Flush once nothing more is ready, or every batch, not per frame
+            let next = match poll_fn(|cx| Poll::Ready(poll_next(cx))).await {
+                Poll::Ready(next) if fed < BATCH => next,
+                ready => {
+                    if fed > 0 {
+                        sink.flush().await.map_err(send)?;
+                        fed = 0;
+                    }
+                    match ready {
+                        Poll::Ready(next) => next,
+                        Poll::Pending => poll_fn(&mut poll_next).await,
+                    }
+                }
+            };
             match next {
                 // The bus closed
-                Next::Change(None) | Next::Events(0) => return Ok(()),
+                Next::Change(None) | Next::Events(0) => {
+                    return sink.flush().await.map_err(send);
+                }
                 Next::Change(Some(change)) => {
                     let (tag, keys) = match &change {
                         Change::Added(keys) => (SUB, keys),
@@ -213,13 +229,17 @@ impl<T: Topic + Wire<C>, C: Send + Sync + 'static> Bridge<T, C> {
                         let mut frame = vec![tag];
                         put_ids(&mut frame, &pattern);
                         sink.feed(Bytes::from(frame)).await.map_err(send)?;
+                        fed += 1;
                     }
                 }
                 Next::Events(_) => {
                     for event in events.drain(..) {
                         let mut frame = vec![MSG];
                         match wire::encode_event::<T, C>(&*event, base.len(), &self.codec, &mut frame) {
-                            Ok(()) => sink.feed(Bytes::from(frame)).await.map_err(send)?,
+                            Ok(()) => {
+                                sink.feed(Bytes::from(frame)).await.map_err(send)?;
+                                fed += 1;
+                            }
                             Err(error) => {
                                 warning!(%error, "message not encoded, not sent over the bridge");
                                 let _ = error;
@@ -263,7 +283,28 @@ impl<T: Topic + Wire<C>, C: Send + Sync + 'static> Bridge<T, C> {
         }
         let bus: &Bus = &self.channel.bus;
         let mut counts: HashMap<Vec<u32>, usize> = HashMap::new();
-        while let Some(frame) = next(stream.next().await)? {
+        // The patterns changed since `remote` was stored: it is rebuilt once
+        // per run of interest frames (at most `BATCH`), before waiting or
+        // delivering, not per frame
+        let mut changed = false;
+        let mut run = 0;
+        let store = |counts: &HashMap<Vec<u32>, usize>, changed: &mut bool| {
+            if std::mem::take(changed) {
+                remote.store(Arc::new(Patterns::of(counts.keys())));
+            }
+        };
+        loop {
+            let item = poll_fn(|cx| {
+                let poll = stream.poll_next_unpin(cx);
+                if poll.is_pending() {
+                    store(&counts, &mut changed);
+                }
+                poll
+            })
+            .await;
+            let Some(frame) = next(item)? else {
+                break;
+            };
             let Some((&tag, mut body)) = frame.as_ref().split_first() else {
                 return Err(BridgeError::Protocol("empty frame"));
             };
@@ -272,17 +313,26 @@ impl<T: Topic + Wire<C>, C: Send + Sync + 'static> Bridge<T, C> {
                     let pattern = wire::get_ids(&mut body)
                         .map_err(|_| BridgeError::Protocol("truncated pattern"))?;
                     if tag == SUB {
-                        *counts.entry(pattern).or_default() += 1;
+                        let count = counts.entry(pattern).or_default();
+                        *count += 1;
+                        changed |= *count == 1;
                     } else if let Some(count) = counts.get_mut(&pattern) {
                         *count -= 1;
                         if *count == 0 {
                             counts.remove(&pattern);
+                            changed = true;
                         }
                     }
-                    remote.store(Arc::new(Patterns::of(counts.keys())));
+                    run += 1;
+                    if run == BATCH {
+                        store(&counts, &mut changed);
+                        run = 0;
+                    }
                 }
                 MSG => match wire::decode_event::<T, C>(&self.channel.path, body, &self.codec) {
                     Ok(event) => {
+                        // delivering may wait on a full buffer
+                        store(&counts, &mut changed);
                         bus.deliver(event).await;
                     }
                     Err(error) => {

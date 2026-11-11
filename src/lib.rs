@@ -81,6 +81,32 @@
 //! # }
 //! ```
 //!
+//! with the names its tree declares:
+//!
+//! ```compile_fail,E0599
+//! # use nattes::{topics, Channel};
+//! # pub struct PushMsg;
+//! # topics! { topics { git { push: PushMsg }, user { new: PushMsg } } }
+//! # use topics::prelude::*;
+//! # fn main() {
+//! Channel::<topics::Topic>::new().user().push();
+//! # }
+//! ```
+//!
+//! A leaf takes its own message only:
+//!
+//! ```compile_fail,E0308
+//! # use nattes::{topics, Channel};
+//! # pub struct PushMsg;
+//! # pub struct NewMsg;
+//! # topics! { topics { git { push: PushMsg }, user { new: NewMsg } } }
+//! # use topics::prelude::*;
+//! # async fn f() {
+//! Channel::<topics::Topic>::new().git().push().publish(NewMsg).await;
+//! # }
+//! # fn main() {}
+//! ```
+//!
 //! and a parameter takes a value of its type, or [`Wild`]:
 //!
 //! ```compile_fail,E0277
@@ -328,6 +354,20 @@
 //! sub.next().await.unwrap().respond(FetchAck);
 //! # }
 //! # fn main() {}
+//! ```
+//!
+//! Responders take requests from their stream: a handler only subscribes.
+//!
+//! ```compile_fail,E0599
+//! # use nattes::{topics, Channel};
+//! # pub struct FetchMsg;
+//! # pub struct FetchAck;
+//! # topics! { topics { git { fetch: FetchMsg => FetchAck } } }
+//! # use topics::prelude::*;
+//! # fn main() {
+//! let bus = Channel::<topics::Topic>::new();
+//! let _handler = bus.git().fetch().respond().handler(|_| {});
+//! # }
 //! ```
 //!
 //! # Messages are shared

@@ -175,11 +175,12 @@ pub(crate) fn decode_event<T: Wire<C>, C>(
 
 /// Read a count-prefixed list of segment ids.
 pub(crate) fn get_ids(bytes: &mut &[u8]) -> Result<Vec<u32>, WireError> {
-    let n = get_varint(bytes).ok_or(WireError::Truncated)? as usize;
-    if bytes.len() < n * 4 {
-        return Err(WireError::Truncated);
-    }
-    let (ids, rest) = bytes.split_at(n * 4);
+    // a count from the other side: checked, not multiplied blindly
+    let len = get_varint(bytes)
+        .and_then(|n| usize::try_from(n).ok()?.checked_mul(4))
+        .filter(|&len| len <= bytes.len())
+        .ok_or(WireError::Truncated)?;
+    let (ids, rest) = bytes.split_at(len);
     *bytes = rest;
     Ok(ids.as_chunks::<4>().0.iter().map(|id| u32::from_le_bytes(*id)).collect())
 }

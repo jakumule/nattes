@@ -103,7 +103,9 @@ enum Push {
     Evicted,
     Dropped,
     Full(Event),
-    Closed,
+    /// The subscriber is gone: the event is handed back, so a waiting
+    /// publisher can try another member with it.
+    Closed(Event),
 }
 
 impl Buffer {
@@ -133,7 +135,7 @@ impl Buffer {
     #[inline(never)]
     fn handle(&self, handler: &HandlerFn, event: Event) -> Push {
         if !self.parked.load(Ordering::Acquire) {
-            return Push::Closed;
+            return Push::Closed(event);
         }
         match catch_unwind(AssertUnwindSafe(|| handler(event))) {
             Ok(()) => Push::Delivered,
@@ -160,7 +162,8 @@ impl Buffer {
         }
         let mut state = lock(&self.state);
         if state.closed {
-            return Push::Closed;
+            drop(state);
+            return Push::Closed(event);
         }
         if state.events.len() >= self.capacity {
             let (push, dropped) = self.push_full::<OVERFLOW>(&mut state, event);
@@ -228,7 +231,7 @@ impl Buffer {
             }
             match self.try_push::<true>(event.take().expect("not polled after completion")) {
                 Push::Delivered | Push::Evicted => Poll::Ready(true),
-                Push::Dropped | Push::Closed => Poll::Ready(false),
+                Push::Dropped | Push::Closed(_) => Poll::Ready(false),
                 Push::Full(back) => {
                     event = Some(back);
                     Poll::Pending
@@ -243,6 +246,7 @@ impl Buffer {
     async fn push_wait_any(buffers: &[Arc<Self>], event: Event) -> bool {
         let mut live: Vec<(&Self, Option<u64>)> =
             buffers.iter().map(|buffer| (&**buffer, None)).collect();
+        let mut event = Some(event);
         poll_fn(|cx| {
             // Every buffer registers, so any of them wakes this
             let mut woken = false;
@@ -252,13 +256,19 @@ impl Buffer {
             if !woken {
                 return Poll::Pending;
             }
-            // A clone, so a closed buffer doesn't take the event the others wait for
+            // Moved, not cloned: a responder's event must have one holder once
+            // pushed. Full and closed buffers hand it back for the next one
             let mut i = 0;
             while i < live.len() {
-                match live[i].0.try_push::<true>(event.clone()) {
+                match live[i].0.try_push::<true>(event.take().expect("not polled after completion")) {
                     Push::Delivered | Push::Evicted => return Poll::Ready(true),
-                    Push::Full(_) => i += 1,
-                    Push::Dropped | Push::Closed => {
+                    Push::Dropped => return Poll::Ready(false),
+                    Push::Full(back) => {
+                        event = Some(back);
+                        i += 1;
+                    }
+                    Push::Closed(back) => {
+                        event = Some(back);
                         live.remove(i);
                     }
                 }
@@ -332,7 +342,7 @@ impl Buffer {
                 }
                 Push::Dropped => lost += 1,
                 Push::Full(event) => full.push(event),
-                Push::Delivered | Push::Closed => {}
+                Push::Delivered | Push::Closed(_) => {}
             }
         }
         drop(state);
@@ -812,7 +822,8 @@ fn pick<'e>(
 ) -> Picked<'e> {
     let any = &**event;
     let start = turn.next.fetch_add(1, Ordering::Relaxed);
-    let at = |i| member((start + i) % len);
+    // `start` wraps around: so must the sum
+    let at = |i| member(start.wrapping_add(i) % len);
     // An idle member waits in `next()`, so its buffer is empty
     for i in 0..len {
         let sub = at(i);
@@ -836,7 +847,7 @@ fn pick<'e>(
                         wait.push(sub);
                     }
                 }
-                Push::Evicted | Push::Dropped | Push::Closed => {}
+                Push::Evicted | Push::Dropped | Push::Closed(_) => {}
             }
         }
     }
@@ -927,7 +938,7 @@ fn push_to<const REQUEST: bool>(
             );
             usize::from(REQUEST && counts)
         }
-        Push::Closed => 0,
+        Push::Closed(_) => 0,
     }
 }
 

@@ -762,6 +762,10 @@ req.respond(ack);
 msg.respond(ack);
 // error: no method named `respond` found for struct `Msg`
 
+// a handler on a request leaf: responders answer from their stream
+fetches.respond().handler(|req| req.respond(ack));
+// error: no method named `handler` found for struct `SubscriptionBuilder<FetchLeaf, (), Respond>`
+
 // publishing on a request leaf (`fetches` is on `fetch: GitFetchMsg => FetchAck`)
 fetches.publish(GitFetchMsg { branch: "main".into() });
 // error: can't publish on `FetchLeaf`

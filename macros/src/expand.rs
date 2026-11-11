@@ -260,11 +260,24 @@ impl Cx<'_> {
                 let first = module.segments.first().map(|s| s.ident.to_string());
                 let absolute = module.leading_colon.is_some()
                     || matches!(first.as_deref(), Some("crate" | "$crate"));
+                // `self::` is the module around `topics!`, which the plain
+                // path reaches too; `super::` doesn't go through the globs, so
+                // from this level it goes up to that module first
+                let mut module = module.clone();
+                if first.as_deref() == Some("self") {
+                    module.segments = module.segments.into_iter().skip(1).collect();
+                }
+                let up = (first.as_deref() == Some("super")).then(|| {
+                    (0..=path.len())
+                        .map(|_| quote!(super::))
+                        .collect::<TokenStream>()
+                });
                 let around = (!absolute).then(|| quote!(super::super::));
                 self.prelude.push(quote! {
                     #[allow(unused_imports)]
                     pub use #around #module::prelude::*;
                 });
+                let module = quote!(#up #module);
                 (
                     quote!(#module::Topic),
                     quote!(#module::TopicRef<'a>),
@@ -445,7 +458,7 @@ impl Cx<'_> {
 }
 
 /// `pull_request` is `PullRequest`.
-fn camel(name: &str) -> String {
+pub fn camel(name: &str) -> String {
     name.split('_')
         .flat_map(|word| {
             let mut chars = word.chars();

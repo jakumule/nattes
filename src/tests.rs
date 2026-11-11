@@ -1748,6 +1748,57 @@ async fn concurrent_publishers_to_a_waiting_queue_group() {
     }
 }
 
+/// A responder group whose members are all full waits for room, then hands
+/// the request to one of them: it must be that responder's only reference.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_requests_to_a_waiting_responder_group() {
+    use std::sync::atomic::{AtomicUsize, Ordering::*};
+    const PUBS: usize = 4;
+    const EACH: usize = 2_000;
+    let bus = Channel::<topics::Topic>::new();
+    let lookups = bus.git().lookup(1);
+    let left = Arc::new(AtomicUsize::new(PUBS * EACH));
+    let mut responders = Vec::new();
+    for _ in 0..2 {
+        let mut responder = (lookups.respond().queue(topics::git::LookupQueue::Workers))
+            .buffer(1)
+            .on_full(Overflow::Wait)
+            .await;
+        let left = left.clone();
+        responders.push(tokio::spawn(async move {
+            while left.load(Acquire) > 0 {
+                let next =
+                    tokio::time::timeout(std::time::Duration::from_millis(100), responder.next());
+                if let Ok(Some(request)) = next.await {
+                    request.respond(FetchAck(0));
+                    left.fetch_sub(1, AcqRel);
+                }
+            }
+        }));
+    }
+    let requesters: Vec<_> = (0..PUBS)
+        .map(|_| {
+            let lookups = lookups.clone();
+            tokio::spawn(async move {
+                for _ in 0..EACH {
+                    assert_eq!(
+                        lookups.request(GitFetchMsg("a".into())).await,
+                        Ok(FetchAck(0))
+                    );
+                }
+            })
+        })
+        .collect();
+    let all = async {
+        for task in requesters.into_iter().chain(responders) {
+            task.await.unwrap();
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(20), all)
+        .await
+        .expect("stuck");
+}
+
 crate::topics! {
     #[allow(dead_code)]
     delivery {
@@ -1810,4 +1861,46 @@ async fn delivery_defaults_apply_unless_the_subscription_overrides_them() {
     assert_eq!(progress.publish(U32Event).await, 1);
     assert_eq!(progress.publish(U32Event).await, 1, "evicts the oldest");
     assert_eq!((drain(&mut sub).len(), sub.dropped()), (1, 1));
+}
+
+/// Mounts through `self::` and `super::`, from the root and from a nested level.
+mod mount_paths {
+    #[allow(unused_imports)]
+    use super::*;
+
+    crate::topics! {
+        local {
+            n: U32Event,
+        }
+    }
+
+    crate::topics! {
+        paths {
+            up = super::other,
+            here = self::local,
+            deep {
+                up = super::other,
+                here = self::local,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn mount_paths_resolve_from_every_level() {
+        use paths::prelude::*;
+        let bus = Channel::<paths::Topic>::new();
+        let mut all = bus.subscribe().await;
+        bus.up().num(1).publish(U32Event).await;
+        bus.here().n().publish(U32Event).await;
+        bus.deep().up().num(1).publish(U32Event).await;
+        bus.deep().here().n().publish(U32Event).await;
+        let subjects: Vec<_> = drain(&mut all)
+            .iter()
+            .map(|msg| msg.subject().to_string())
+            .collect();
+        assert_eq!(
+            subjects,
+            ["up.num.1", "here.n", "deep.up.num.1", "deep.here.n"]
+        );
+    }
 }

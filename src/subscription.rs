@@ -102,31 +102,6 @@ impl<T: Topic, P, K> SubscriptionBuilder<T, P, K> {
         self
     }
 
-    /// Deliver to `f`, called with each message on the publisher's thread,
-    /// instead of buffering: the cheapest way to receive, and one that needs no
-    /// task. Returns a [`Handler`], which unsubscribes on drop.
-    ///
-    /// `f` must not block: it delays the publisher. Publishers on several
-    /// threads may call it at the same time. A panic in `f` counts the message
-    /// as dropped. [`buffer`](Self::buffer) and [`on_full`](Self::on_full) don't
-    /// apply: a handler takes every message. A publish that started before the
-    /// [`Handler`] is dropped may still call `f`.
-    pub fn handler(self, f: impl Fn(Msg<T, P>) + Send + Sync + 'static) -> Handler<T, P> {
-        let shape = self.channel.path.shape();
-        let handler = move |event| {
-            f(Msg {
-                event,
-                shape,
-                topic: PhantomData,
-            })
-        };
-        let buffer = Arc::new(Buffer::handler(Box::new(handler)));
-        Handler {
-            active: self.start_with(buffer, false),
-            topic: PhantomData,
-        }
-    }
-
     fn start(self, responder: bool) -> Active {
         let buffer = Arc::new(Buffer::new(self.buffer, self.overflow));
         self.start_with(buffer, responder)
@@ -160,6 +135,33 @@ impl<T: Topic, P, K> SubscriptionBuilder<T, P, K> {
             keys,
             group: self.group,
             responder,
+        }
+    }
+}
+
+impl<T: Topic, P> SubscriptionBuilder<T, P, Subscribe> {
+    /// Deliver to `f`, called with each message on the publisher's thread,
+    /// instead of buffering: the cheapest way to receive, and one that needs no
+    /// task. Returns a [`Handler`], which unsubscribes on drop.
+    ///
+    /// `f` must not block: it delays the publisher. Publishers on several
+    /// threads may call it at the same time. A panic in `f` counts the message
+    /// as dropped. [`buffer`](Self::buffer) and [`on_full`](Self::on_full) don't
+    /// apply: a handler takes every message. A publish that started before the
+    /// [`Handler`] is dropped may still call `f`.
+    pub fn handler(self, f: impl Fn(Msg<T, P>) + Send + Sync + 'static) -> Handler<T, P> {
+        let shape = self.channel.path.shape();
+        let handler = move |event| {
+            f(Msg {
+                event,
+                shape,
+                topic: PhantomData,
+            })
+        };
+        let buffer = Arc::new(Buffer::handler(Box::new(handler)));
+        Handler {
+            active: self.start_with(buffer, false),
+            topic: PhantomData,
         }
     }
 }

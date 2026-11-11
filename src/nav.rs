@@ -133,7 +133,7 @@ impl Node {
                 id: seg.info.id,
                 name: seg.info.name,
                 param: match &seg.value {
-                    _ if self.wild & (1 << i) != 0 => KeyParam::Wild,
+                    _ if is_wild(self.wild, i) => KeyParam::Wild,
                     Some(value) => KeyParam::Is(ParamKey(value.clone())),
                     None => KeyParam::None,
                 },
@@ -148,6 +148,13 @@ impl Node {
             wild: self.wild,
         }
     }
+}
+
+/// Whether bit `i` of the wildcard mask `wild` is set. Segments past 64 are
+/// never wildcards (`Node::step` refuses them), but a path may be deeper.
+#[inline]
+fn is_wild(wild: u64, i: usize) -> bool {
+    i < 64 && wild & (1 << i) != 0
 }
 
 /// What a received message needs of its channel's path: its depth and where
@@ -169,8 +176,11 @@ impl Shape {
     /// channel has wildcards.
     pub(crate) fn params<P: Params>(self, path: &[Seg]) -> P {
         let mut values = (path.iter().enumerate())
-            .filter(|(i, _)| self.wild & (1 << i) != 0)
-            .map(|(_, seg)| seg.param().expect("events have the parameter values of their topics"));
+            .filter(|&(i, _)| is_wild(self.wild, i))
+            .map(|(_, seg)| {
+                seg.param()
+                    .expect("events have the parameter values of their topics")
+            });
         P::from_values(&mut values)
     }
 }
