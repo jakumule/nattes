@@ -15,7 +15,7 @@ members = ["macros"]
 resolver = "3"
 
 [workspace.package]
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 license = "MIT"
 readme = "README.md"
@@ -26,7 +26,7 @@ keywords = ["message-queue", "nats", "pubsub", "event-bus", "async"]
 
 
 [dependencies]
-nattes-macros = { path = "macros", version = "0.4.0" }
+nattes-macros = { path = "macros", version = "0.4.1" }
 
 futures-core = { version = "0.3", default-features = false, features = ["std"] }
 futures-sink = { version = "0.3", default-features = false, optional = true }
